@@ -87,7 +87,7 @@ class RunnerSlotMambaManager(MambaManager):
     ) -> None:
         super().__init__(kv_cache_spec, block_pool, **kwargs)
         logger.info_once(
-            "[runner_slot_mamba] GDN groups take no scheduler blocks: the "
+            "[runner_slot_mamba] GDN/Mamba-2 groups take no scheduler blocks: the "
             "runner owns their state slots. TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 "
             "restores vLLM's accounting."
         )
@@ -116,15 +116,18 @@ def _ineligible_reason(
 ) -> str | None:
     if not runner_owns_slots:
         return (
-            "the runner does not own the GDN slots (the unified KV pool, or "
+            "the runner does not own the Mamba slots (the unified KV pool, or "
             "compact-mamba sizing did not apply)"
         )
     # Exact class only: a subclass may carry fields RunnerSlotMambaSpec cannot
     # take, or be registered to a manager of its own.
     if type(spec) is not MambaSpec:
         return f"its spec is {type(spec).__name__}, not MambaSpec"
-    if spec.mamba_type != MambaAttentionBackendEnum.GDN_ATTN:
-        return f"it applies to GDN layers only, not {spec.mamba_type.name}"
+    if spec.mamba_type not in (
+        MambaAttentionBackendEnum.GDN_ATTN,
+        MambaAttentionBackendEnum.MAMBA2,
+    ):
+        return f"it applies to GDN/Mamba-2 layers only, not {spec.mamba_type.name}"
     # The spec's own mamba_cache_mode is copied from this config. The mode
     # tracks prefix caching: vLLM sets "align" for hybrid models whenever
     # caching is on and "none" when it is off (MambaModelConfig), and

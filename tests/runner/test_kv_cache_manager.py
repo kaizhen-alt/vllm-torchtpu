@@ -104,6 +104,16 @@ class DummyGdn(DummyMamba):
         )
 
 
+class DummyMamba2(DummyMamba):
+    """DummyMamba reporting the MAMBA2 backend, as Mamba-2 and Mamba-3 layers do."""
+
+    def get_kv_cache_spec(self, vllm_config):
+        return dataclasses.replace(
+            super().get_kv_cache_spec(vllm_config),
+            mamba_type=MambaAttentionBackendEnum.MAMBA2,
+        )
+
+
 class _FakeReserveSpec:
     """Offloading-spec stand-in resolved via kv_connector_extra_config by
     utils.estimate_kv_connector_hbm_reserve (same lookup as vLLM's
@@ -947,6 +957,120 @@ class TestKVCacheManager:
             expected = RunnerSlotMambaSpec if expect_runner_slot else MambaSpec
             assert type(spec) is expected
             assert spec.page_size_padded == 203776
+
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_attention_free_compact_mamba_sizing_and_post_profile_override(
+        self, mock_mem_info, mock_get_layers, monkeypatch
+    ):
+        """Attention-free Mamba-2/Mamba-3 caps both `_mamba_num_blocks` and
+        post-profile `num_gpu_blocks_override` at `max_num_reqs * stride + 1`
+        and swaps `MambaSpec` to `RunnerSlotMambaSpec`."""
+        monkeypatch.delenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
+        mock_get_layers.return_value = {f"mamba_{i}": DummyMamba2() for i in range(4)}
+
+        kv_cache_specs = self.runner.get_kv_cache_spec()
+
+        # Pre-profile: compact slots selected; override stays None for profile_run.
+        assert self.runner._mamba_num_blocks == 17
+        assert self.runner.cache_config.num_gpu_blocks_override is None
+        for i in range(4):
+            assert type(kv_cache_specs[f"mamba_{i}"]) is RunnerSlotMambaSpec
+
+        # Post-profile: override caps vLLM's num_blocks at 17 instead of millions.
+        km = self.runner.kv_cache_manager
+        km.size_compact_mamba_kv_cache(8 * 1024 * 1024 * 1024)
+        assert self.runner._mamba_num_blocks == 17
+        assert self.runner.cache_config.num_gpu_blocks_override == 17
+
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    def test_attention_free_compact_mamba_pinned_override_and_uniform_fallback(
+        self, mock_get_layers, monkeypatch
+    ):
+        """User-pinned `num_gpu_blocks_override` is preserved (warning when over
+        budget), while `_uniform_mamba_layout=True` skips compact sizing."""
+        monkeypatch.delenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
+        mock_get_layers.return_value = {f"mamba_{i}": DummyMamba2() for i in range(4)}
+        mem = "vllm_torchtpu.utils.torch.accelerator.get_memory_info"
+
+        # Case 1: User-pinned blocks + small budget -> pin preserved, warning emitted.
+        # 4 layers * 17 slots * 66,560 B = 4,526,080 B > 1 MiB.
+        self.runner.cache_config.num_gpu_blocks_override = 32
+        with (
+            patch(mem, return_value=(1 * 1024 * 1024, 1 * 1024 * 1024)),
+            patch("vllm_torchtpu.runner.kv_cache_manager.logger") as log,
+        ):
+            specs_pinned = self.runner.get_kv_cache_spec()
+            self.runner.kv_cache_manager.size_compact_mamba_kv_cache(1 * 1024 * 1024)
+        assert self.runner._mamba_num_blocks == 17
+        assert self.runner.cache_config.num_gpu_blocks_override == 32
+        assert log.warning.called
+        assert all(type(s) is RunnerSlotMambaSpec for s in specs_pinned.values())
+
+        # Case 2: Uniform layout skips compact sizing and keeps stock MambaSpec.
+        self.runner._mamba_num_blocks = None
+        self.runner.kv_cache_manager._compact_mamba_sizing = None
+        self.runner.cache_config.num_gpu_blocks_override = None
+        self.runner._uniform_mamba_layout = True
+        with patch(mem, return_value=(10 * 1024**3, 10 * 1024**3)):
+            specs_uniform = self.runner.get_kv_cache_spec()
+        assert self.runner._mamba_num_blocks is None
+        assert self.runner.cache_config.num_gpu_blocks_override is None
+        assert all(type(s) is MambaSpec for s in specs_uniform.values())
+
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    def test_attention_free_compact_mamba_raises_when_budget_too_small(
+        self, mock_get_layers
+    ):
+        """Raise ValueError both pre-profile and post-profile when compact Mamba
+        slots exceed the KV budget."""
+        mock_get_layers.return_value = {f"mamba_{i}": DummyMamba2() for i in range(4)}
+        mem = "vllm_torchtpu.utils.torch.accelerator.get_memory_info"
+        # 4 layers * 17 slots * 66,560 B = 4,526,080 B > 2 MiB -> fails pre-profile.
+        with (
+            patch(mem, return_value=(2 * 1024 * 1024, 2 * 1024 * 1024)),
+            pytest.raises(ValueError, match="does not fit"),
+        ):
+            self.runner.get_kv_cache_spec()
+
+        # Pre-profile fits (10 GiB), but post-profile budget shrinks below 4.5 MiB.
+        with patch(mem, return_value=(10 * 1024**3, 10 * 1024**3)):
+            self.runner.get_kv_cache_spec()
+        with pytest.raises(ValueError, match="does not fit"):
+            self.runner.kv_cache_manager.size_compact_mamba_kv_cache(2 * 1024 * 1024)
+
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_get_kv_cache_spec_hybrid_mamba2_gets_runner_slot_spec(
+        self, mock_mem_info, mock_get_page_size, mock_get_layers, monkeypatch
+    ):
+        """Hybrid Attention + MAMBA2 models swap MAMBA2 specs to RunnerSlotMambaSpec."""
+        monkeypatch.delenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
+        mock_attn = _attention_layer_mock()
+        mock_attn.attn_type = AttentionType.DECODER
+        mock_attn.num_kv_heads = 2
+        mock_attn.head_size = 128
+        mock_attn.kv_sharing_target_layer_name = None
+        mock_attn.sliding_window = None
+        layers = {"attn_0": mock_attn}
+        layers.update({f"mamba_{i}": DummyMamba2() for i in range(3)})
+        mock_get_layers.return_value = layers
+
+        kv_cache_specs = self.runner.get_kv_cache_spec()
+        assert self.runner._mamba_num_blocks == 17
+        assert type(kv_cache_specs["attn_0"]) is FullAttentionSpec
+        for i in range(3):
+            assert type(kv_cache_specs[f"mamba_{i}"]) is RunnerSlotMambaSpec
 
     @patch.object(
         TpuPlatform, "_find_non_ssm_backend", return_value=PallasMLAttentionBackend
