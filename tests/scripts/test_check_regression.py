@@ -843,6 +843,14 @@ _MODE_ARGS = {
     "--mode eval --calibrate": ["--results-dir", "RESULTS"],
 }
 _RESULT_MODES = [mode for mode in _MODE_ARGS if mode != _UPDATE]
+_NOT_PERF_CHECK = [mode for mode in _MODE_ARGS if mode != "--mode perf"]
+_ROOFLINE_FLAGS = [
+    ["--roofline-targets", "targets.json"],
+    ["--config-name", "some-config"],
+    ["--chips", "4"],
+    ["--prefill-chips", "2"],
+    ["--decode-chips", "2"],
+]
 
 
 @pytest.mark.parametrize(
@@ -877,7 +885,7 @@ _NOT_VALID_CASES = [
         (mode, ["--previous-baseline", "BASELINE"], "--previous-baseline")
         for mode in _RESULT_MODES
     ],
-    (_UPDATE, ["--chips", "4"], "--chips"),
+    *[(mode, flag, flag[0]) for flag in _ROOFLINE_FLAGS for mode in _NOT_PERF_CHECK],
 ]
 
 
