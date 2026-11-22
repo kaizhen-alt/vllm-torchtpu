@@ -906,6 +906,14 @@ def test_cli_rejects_flags_the_mode_does_not_take(
     _assert_usage_error(monkeypatch, capsys, argv, f"{named}: not valid with {mode}")
 
 
+def test_cli_help_renders(monkeypatch, capsys):
+    """argparse %-formats each help string, so a bare % in one breaks --help."""
+    with pytest.raises(SystemExit) as exc_info:
+        _run_cli(monkeypatch, "--help")
+    assert exc_info.value.code == 0
+    assert "--roofline-targets ROOFLINE_TARGETS" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     ("content", "error"),
     [

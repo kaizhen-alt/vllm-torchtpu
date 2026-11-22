@@ -879,7 +879,8 @@ def main() -> int:
     parser.add_argument(
         "--roofline-targets",
         type=Path,
-        help="Perf mode: roofline_targets.json for % of roofline reporting.",
+        help="Perf check mode: roofline_targets.json, to print each measured "
+        "cell as a percentage of its roofline. Needs --config-name.",
     )
     parser.add_argument(
         "--config-name",
