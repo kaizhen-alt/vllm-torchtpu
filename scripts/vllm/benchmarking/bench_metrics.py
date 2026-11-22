@@ -108,3 +108,17 @@ def bench_derived_metrics(data: dict, chips=None) -> dict:
             "p99": data.get("p99_tpot_ms"),
         },
     )
+
+
+def agentx_derived_metrics(export: dict) -> dict:
+    """derived_metrics for an aiperf export of an AgentX replay. aiperf
+    reports the time per output token as inter_token_latency, in
+    milliseconds."""
+    latency = export.get("inter_token_latency", {})
+    return derived_metrics(
+        tpot_ms={
+            "median": latency.get("p50"),
+            "p90": latency.get("p90"),
+            "p99": latency.get("p99"),
+        },
+    )
