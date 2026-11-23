@@ -15,7 +15,13 @@
 
 from __future__ import annotations
 
+import json
+from typing import TYPE_CHECKING
+
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.roofline as rf
@@ -27,6 +33,7 @@ from vllm_torchtpu.roofline import (
     Parallel,
     SpecShape,
     StepShape,
+    cli,
     from_hf_config,
     pass_costs,
     spec_cycle_floor,
@@ -601,3 +608,93 @@ def test_unpadded_strict_and_crossover_preserve_five_matmul_buckets() -> None:
     assert moe_even.fp4_flops > 0.0
     assert moe_ep.fp4_flops > moe_even.fp4_flops
     assert moe_ep.fp4_flops_min == pytest.approx(moe_even.strict_fp4_flops)
+
+
+_SMALL_CANONICAL_QWEN_CFG: dict[str, object] = {
+    "model_type": "qwen3_5_moe",
+    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+    "text_config": {
+        "model_type": "qwen3_5_moe_text",
+        "hidden_size": 512,
+        "num_hidden_layers": 2,
+        "layer_types": ["full_attention", "full_attention"],
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+        "intermediate_size": 1024,
+        "vocab_size": 8192,
+        "dtype": "bfloat16",
+    },
+}
+
+
+_SYNTH_INT8_FLOPS = 1.5e15
+
+
+def _write_json(path: Path, payload: object) -> Path:
+    """Serialize payload as JSON and return the written path."""
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_load_chip_spec_1core_2d_torus_and_cli_assumptions(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify 1-core 2D torus spec end-to-end across solve, explain, plan, and CLI."""
+    spec_payload = _make_base_spec_payload()
+    spec_payload["int8_flops"] = _SYNTH_INT8_FLOPS
+    custom_smem = 262_144
+    spec_payload["smem_page_table_bytes"] = custom_smem
+    spec_path = _write_json(tmp_path / "synth_1core.json", spec_payload)
+    cfg_path = _write_json(tmp_path / "small_qwen.json", _SMALL_CANONICAL_QWEN_CFG)
+
+    rc_assump = cli.main(["--chip-spec", str(spec_path), "--assumptions", "--json"])
+    assert rc_assump == 0
+    assump_json = json.loads(capsys.readouterr().out)
+    assert assump_json["catalog"]["page_table_byte_budget"]["value"] == custom_smem
+    cli_smem = next(
+        entry
+        for entry in assump_json["solver_assumptions"]
+        if entry["name"] == "smem_page_table_budget"
+    )
+    assert cli_smem["value"] == custom_smem
+
+    rc_explain = cli.main(
+        [
+            "explain",
+            "--chip-spec",
+            str(spec_path),
+            "--config",
+            str(cfg_path),
+            "--tp",
+            "1",
+        ]
+    )
+    assert rc_explain == 0
+    explain_out = capsys.readouterr().out
+    for col in ("int8_gflops", "fp4_gflops", "int4_gflops", "vector_gflops"):
+        assert col in explain_out
+
+    rc_solve = cli.main(
+        [
+            "solve",
+            "--chip-spec",
+            str(spec_path),
+            "--config",
+            str(cfg_path),
+            "--max-chips",
+            "4",
+            "--example-scenario",
+            "chat-8k1k",
+            "--reference-layout",
+            "TP1",
+            "--json",
+        ]
+    )
+    assert rc_solve == 0
+    solve_out = json.loads(capsys.readouterr().out)
+    assert solve_out["chip"] == "synth_1core_2d"
+    assert solve_out["single_host_fit"]["feasible"] is True
+    assert solve_out["single_host_fit"]["topology"] == "2x2"
+    assert solve_out["reference"]["found"] is True

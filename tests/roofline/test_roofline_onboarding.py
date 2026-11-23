@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -25,15 +26,20 @@ from tests.roofline.conftest import (
     load_qwen3_8_bringup_config,
 )
 from vllm_torchtpu.roofline import (
+    CHIPS,
     Dtypes,
     KeyTracker,
     Parallel,
     SeqKvLayout,
+    UnpaddedFloorOptions,
     audit_hf_config,
+    cli,
     count_layer_types,
     from_hf_config,
     param_counts,
     pass_costs,
+    pp_stage_breakdowns,
+    unpadded_strict_resource_times,
 )
 from vllm_torchtpu.roofline.constants import (
     GLU_MATMUL_COUNT,
@@ -562,3 +568,104 @@ def test_dsa_layer_selection_masks_aliases_and_errors() -> None:
     ):
         with pytest.raises(ValueError, match="dsa_layers"):
             from_hf_config({**base_mla, "dsa_layers": bad_dsa_layers})
+
+
+def test_cli_inspect_text_output_and_fail_closed_tier2_blocker(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify inspect text output for canonical CDK configs and fail-closed unlisted."""
+    expected_error_rc = 2
+    fixtures_dir = Path(__file__).resolve().parent / "fixtures"
+    q35_path = fixtures_dir / "qwen3_5_397b_fp8.json"
+    rc_ok = cli.main(["inspect", "--config", str(q35_path)])
+    assert rc_ok == 0
+    out_ok = capsys.readouterr().out
+    assert "onboarding_tier: tier0_ready" in out_ok
+    assert "canonical_id: qwen3_5_moe" in out_ok
+    assert "param_counts:" in out_ok
+
+    unlisted_path = fixtures_dir / "deepseek_v4_pro.json"
+    rc_blocked = cli.main(["inspect", "--config", str(unlisted_path)])
+    assert rc_blocked == expected_error_rc
+    out_blocked = capsys.readouterr().out
+    assert "onboarding_tier: tier2_primitive_needed" in out_blocked
+    assert "model_type_status: unlisted_blocked" in out_blocked
+
+
+def test_pp_tied_embeddings_preserves_layer_weights_and_chip_alignment() -> None:
+    """Verify PP tied-embedding stage weights conserve layers and chip KV alignment."""
+    geom = from_hf_config({**_dense_qwen_cfg(), "tie_word_embeddings": True})
+    dt = Dtypes()
+    par_single = Parallel(tp=1, pp=1)
+    pp_two = 2
+    par_pp = Parallel(tp=1, pp=pp_two)
+    layout = SeqKvLayout(seqs_per_dp=1, context=_CONTEXT_1024)
+    wide_align = 256
+    wide_chip = replace(
+        CHIPS["tpu7x"],
+        name="wide_align_chip",
+        physical_alignment_elems=wide_align,
+    )
+
+    bd_single = hbm_breakdown_per_core_bytes(
+        geom, dt, par_single, layout, chip=wide_chip
+    )
+    _part_base, bd_base, _, ok_base = pp_stage_breakdowns(
+        geom, dt, par_pp, (_CONTEXT_1024, 1), chip=CHIPS["tpu7x"]
+    )
+    part_wide, bd_wide, _, ok_wide = pp_stage_breakdowns(
+        geom, dt, par_pp, (_CONTEXT_1024, 1), chip=wide_chip
+    )
+    assert ok_base is True
+    assert ok_wide is True
+    assert sum(part_wide) == geom.num_layers
+    assert bd_wide.kv > bd_base.kv
+    assert float(pp_two) * bd_wide.weights >= bd_single.weights
+
+
+def test_unpadded_zero_weights_strips_two_matrix_moe_sub_byte_unpack() -> None:
+    """Verify zero_weights strips exact 2-matrix MoE unpack vector FLOPs."""
+    non_gated_moe_geom = replace(
+        from_hf_config(_glm_mla_moe_cfg()),
+        ffn_num_matrices=NON_GATED_MATMUL_COUNT,
+    )
+    parallel = Parallel(tp=1, moe="tp_slice")
+    step_shape = StepShape(batch=1, rows_per_seq=1, context=_CONTEXT_1024)
+    bf16_dtypes = Dtypes(
+        w_dense=2.0,
+        w_expert=2.0,
+        kv=2.0,
+        act="a16",
+        w_dense_dtype="bfloat16",
+        w_expert_dtype="bfloat16",
+        kv_dtype="bfloat16",
+    )
+    int4_expert_dtypes = replace(
+        bf16_dtypes,
+        w_expert=0.5,
+        w_expert_dtype="int4",
+    )
+    _, _, vector_bf16_zero_w, _ = unpadded_strict_resource_times(
+        non_gated_moe_geom,
+        CHIPS["tpu7x"],
+        parallel,
+        step_shape,
+        UnpaddedFloorOptions(dt=bf16_dtypes, zero_weights=True),
+    )
+    _, _, vector_int4_zero_w, _ = unpadded_strict_resource_times(
+        non_gated_moe_geom,
+        CHIPS["tpu7x"],
+        parallel,
+        step_shape,
+        UnpaddedFloorOptions(dt=int4_expert_dtypes, zero_weights=True),
+    )
+    _, _, vector_int4_with_w, _ = unpadded_strict_resource_times(
+        non_gated_moe_geom,
+        CHIPS["tpu7x"],
+        parallel,
+        step_shape,
+        UnpaddedFloorOptions(dt=int4_expert_dtypes, zero_weights=False),
+    )
+    assert vector_bf16_zero_w > 0.0
+    assert vector_int4_with_w > vector_int4_zero_w
+    assert vector_int4_zero_w == pytest.approx(vector_bf16_zero_w, rel=1e-9)

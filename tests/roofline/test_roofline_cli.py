@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.roofline.conftest import SMALL_HYBRID_MOE_CFG
 from vllm_torchtpu.roofline import (
     CHIPS,
     Dtypes,
@@ -31,6 +32,8 @@ from vllm_torchtpu.roofline import (
     from_hf_config,
     plan,
 )
+from vllm_torchtpu.roofline.cli import _has_quantization_config, _parse_serve_cmd
+from vllm_torchtpu.roofline.constants import UNIT_GIBI
 
 QWEN35_CFG: dict[str, object] = {
     "model_type": "qwen3_5_moe",
@@ -399,7 +402,7 @@ def test_cli_chip_spec_hf_overrides_clean_error_and_dtype_label_preservation(
         ["plan", "--config", str(tmp_path / "missing.json"), "--tp", "8"]
     )
     assert rc_missing == expected_error_rc
-    assert "ERROR:" in capsys.readouterr().err
+    assert "error:" in capsys.readouterr().err.lower()
 
     # With --hf-overrides and --chip-spec, plan succeeds end-to-end.
     spec_path = tmp_path / "custom_chip.json"
@@ -529,3 +532,757 @@ def test_cli_solve_and_emit_support_chip_spec_hf_overrides_and_dtype_overrides(
     assert (
         payload["cli_args"][payload["cli_args"].index("--kv-cache-dtype") + 1] == "fp8"
     )
+
+
+def _iter_subcommand_options(
+    parser: argparse.ArgumentParser,
+) -> list[tuple[str, tuple[str, ...], str | None]]:
+    """Collect (subcommand, option_strings, help) tuples across parser."""
+    out: list[tuple[str, tuple[str, ...], str | None]] = []
+    actions: Sequence[argparse.Action] = getattr(parser, "_actions", ())
+    for action in actions:
+        choices = getattr(action, "choices", None)
+        if isinstance(choices, Mapping) and all(
+            isinstance(val, argparse.ArgumentParser) for val in choices.values()
+        ):
+            for sub_name, sub_parser in choices.items():
+                sub_actions: Sequence[argparse.Action] = getattr(
+                    sub_parser, "_actions", ()
+                )
+                out.extend(
+                    (str(sub_name), tuple(sub_act.option_strings), sub_act.help)
+                    for sub_act in sub_actions
+                )
+        else:
+            out.append(("root", tuple(action.option_strings), action.help))
+    return out
+
+
+def test_cli_from_serve_and_bench_cmd_roundtrip(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify CLI solve roundtrip from serve and bench command strings."""
+    expected_isl = 4096
+    expected_osl = 512
+    max_chips = 4
+    offload_gib = 32
+    offload_bytes = offload_gib * int(UNIT_GIBI)
+    raiden_offload_cfg = json.dumps(
+        {
+            "kv_connector": "TPURaidenOffloadingConnector",
+            "kv_connector_module_path": "vllm_torchtpu.offload.raiden_connector",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {"cpu_bytes_to_use": offload_bytes},
+        }
+    )
+    bf16_cfg_path = tmp_path / "synth_bf16_config.json"
+    bf16_cfg_path.write_text(json.dumps(QWEN35_CFG), encoding="utf-8")
+    cfg_path = tmp_path / "synth_config.json"
+    cfg_path.write_text(
+        json.dumps({**QWEN35_CFG, "quantization_config": {"quant_method": "fp8"}}),
+        encoding="utf-8",
+    )
+    html_path = tmp_path / "roundtrip.html"
+    rc = cli.main(
+        [
+            "solve",
+            "--from-serve-cmd",
+            (
+                f"vllm serve {bf16_cfg_path} --quantization fp8 "
+                "--kv-cache-dtype fp8 --tensor-parallel-size 8 "
+                "--data-parallel-size 1 --enable-expert-parallel "
+                "--gpu-memory-utilization 0.90 "
+                f"--kv-transfer-config '{raiden_offload_cfg}'"
+            ),
+            "--from-bench-cmd",
+            (
+                "vllm bench serve --dataset-name random "
+                "--random-prefix-len 3072 --random-input-len 1024 "
+                "--random-output-len 512 --max-concurrency 16"
+            ),
+            "--dcn-gbit-per-s",
+            "200",
+            "--html",
+            str(html_path),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scenario"]["isl"] == expected_isl
+    assert payload["scenario"]["osl"] == expected_osl
+    assert payload["scenario"]["prefix_hit_rate"] == pytest.approx(0.75)
+    assert payload["scenario"]["concurrencies"] == [16]
+    assert payload["scenario"]["kv_offload_gb"] == pytest.approx(float(offload_gib))
+    assert payload["gpu_memory_utilization"] == pytest.approx(0.90)
+    assert payload["chip_spec"]["dcn_bw"] == pytest.approx(25.0e9)
+    assert payload["recommended"]["total_chips"] <= max_chips
+    assert payload["winner_prefix_hit_range"] is not None
+    assert "sweep_candidates" not in payload
+    top_cmd = payload["top_k"][0]["launch"]["commands"][0]
+    assert "--kv-offloading-size" not in top_cmd
+    assert "TPURaidenOffloadingConnector" in top_cmd
+    assert str(offload_bytes) in top_cmd
+    html_text = html_path.read_text(encoding="utf-8")
+    assert "sweep_candidates" not in html_text
+    assert "Prefix-Hit Regime" in html_text
+    assert ("crossover=" in html_text) or ("stable" in html_text)
+
+    sonnet_isl = 550
+    rc_sonnet = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--from-bench-cmd",
+            (
+                "vllm bench serve --dataset-name sonnet "
+                "--sonnet-input-len 550 --sonnet-prefix-len 200 "
+                "--sonnet-output-len 150 --max-concurrency 4"
+            ),
+            "--kv-offload-gb",
+            "16",
+            "--max-chips",
+            "4",
+            "--mode",
+            "mixed",
+            "--json",
+        ]
+    )
+    assert rc_sonnet == 0
+    sonnet_payload = json.loads(capsys.readouterr().out)
+    assert sonnet_payload["scenario"]["isl"] == sonnet_isl
+    assert sonnet_payload["scenario"]["prefix_hit_rate"] == pytest.approx(200.0 / 550.0)
+    assert sonnet_payload["scenario"]["kv_offload_gb"] == pytest.approx(16.0)
+
+
+def test_cli_forwards_spec_tokens_and_token_caps(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify CLI forwards spec_tokens and token caps from serve cmd."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(QWEN35_CFG), encoding="utf-8")
+    expected_spec_tokens = 3
+    expected_prefill_chunk = 2048
+    spec_json = json.dumps({"method": "mtp", "num_speculative_tokens": 3})
+    cmd = [
+        "solve",
+        "--config",
+        str(cfg_path),
+        "--from-serve-cmd",
+        (
+            f"vllm serve {cfg_path} --tensor-parallel-size 8 --quantization fp8 "
+            "--max-model-len 16384 --max-num-batched-tokens 2048 "
+            f"--speculative-config '{spec_json}'"
+        ),
+        "--json",
+    ]
+    rc = cli.main(cmd)
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["scenario"]["spec_tokens"] == expected_spec_tokens
+    assert payload["scenario"]["prefill_chunk"] == expected_prefill_chunk
+    launch_args = payload["top_k"][0]["launch"]["cli_args"]
+    assert "--max-model-len" in launch_args
+    assert "16384" in launch_args
+    assert "--speculative-config" in launch_args
+
+
+def test_every_cli_flag_has_help(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify every CLI flag has help text with unit/scope, aliases, and assumptions."""
+    parser = cli.build_parser()
+    sub_opts = _iter_subcommand_options(parser)
+    assert len(sub_opts) > 0
+    for sub_name, option_strings, raw_help in sub_opts:
+        if not option_strings or "-h" in option_strings:
+            continue
+        assert raw_help is not None, f"{sub_name} {option_strings} missing help"
+        help_str = raw_help.strip()
+        assert bool(help_str), f"{sub_name} {option_strings} empty help"
+        assert help_str != "==SUPPRESS=="
+        assert "scope:" in help_str.lower()
+        assert "unit:" in help_str.lower()
+
+    rc_assump = cli.main(["--dcn-gbps", "200", "--assumptions", "--json"])
+    assert rc_assump == 0
+    assump_payload = json.loads(capsys.readouterr().out)
+    assert "catalog" in assump_payload
+    assert assump_payload["catalog"]["dcn_bw"]["value"] == pytest.approx(25.0e9)
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(QWEN35_CFG), encoding="utf-8")
+    rc_alias = cli.main(
+        [
+            "explain",
+            "--config",
+            str(cfg_path),
+            "--tp",
+            "8",
+            "--ici-bw-gbytes-per-s",
+            "250",
+            "--json",
+        ]
+    )
+    assert rc_alias == 0
+    _ = capsys.readouterr()
+
+
+def test_solve_exits_nonzero_on_empty_frontier(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify solve exits 1 on empty frontier and 2 on invalid subhost or loader err."""
+    expected_error_exit = 2
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(QWEN35_CFG), encoding="utf-8")
+
+    rc_empty = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--max-chips",
+            "4",
+            "--example-scenario",
+            "chat-8k1k",
+        ]
+    )
+    captured_empty = capsys.readouterr()
+    assert rc_empty == 1
+    assert "WARNING:" in captured_empty.err
+
+    rc_subhost = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--max-chips",
+            "1",
+            "--example-scenario",
+            "chat-8k1k",
+        ]
+    )
+    captured_subhost = capsys.readouterr()
+    assert rc_subhost == expected_error_exit
+    assert "error:" in captured_subhost.err
+
+    rc_err = cli.main(
+        [
+            "solve",
+            "--config",
+            str(tmp_path / "missing_config.json"),
+            "--max-chips",
+            "4",
+            "--example-scenario",
+            "chat-8k1k",
+        ]
+    )
+    captured_err = capsys.readouterr()
+    assert rc_err == expected_error_exit
+    err_lines = captured_err.err.strip().splitlines()
+    assert len(err_lines) == 1
+    assert err_lines[0].startswith("error:")
+
+
+def test_cli_solve_top_k_ascii_table_and_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify --top-k defaults to 5, drives JSON and ASCII tables, and rejects <=0."""
+    expected_default_k = 5
+    expected_k_2 = 2
+    expected_err_code = 2
+    cfg_path = tmp_path / "small_qwen35_fp8.json"
+    raw_text_cfg = SMALL_HYBRID_MOE_CFG["text_config"]
+    assert isinstance(raw_text_cfg, dict)
+    cfg_path.write_text(
+        json.dumps(
+            {
+                **SMALL_HYBRID_MOE_CFG,
+                "text_config": {
+                    **raw_text_cfg,
+                    "quantization_config": {"quant_method": "fp8"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rc_5 = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "coding-agent",
+            "--mode",
+            "disagg",
+            "--max-chips",
+            "8",
+            "--kv-offload-gb",
+            "64",
+            "--json",
+        ]
+    )
+    assert rc_5 == 0
+    payload_5 = json.loads(capsys.readouterr().out)
+    assert 1 <= len(payload_5["top_k"]) <= expected_default_k
+    assert all(
+        entry["frontier_role"] != "off_frontier_alt" for entry in payload_5["top_k"]
+    )
+
+    rc_2_txt = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "coding-agent",
+            "--max-chips",
+            "8",
+            "--top-k",
+            "2",
+        ]
+    )
+    assert rc_2_txt == 0
+    out_lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    assert "rank" in out_lines[0]
+    assert "role" in out_lines[0]
+    assert len(out_lines) == 1 + expected_k_2
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            [
+                "solve",
+                "--config",
+                str(cfg_path),
+                "--example-scenario",
+                "coding-agent",
+                "--max-chips",
+                "8",
+                "--top-k",
+                "0",
+            ]
+        )
+    assert excinfo.value.code == expected_err_code
+    _ = capsys.readouterr()
+
+
+def test_cli_solve_rejects_nonpositive_max_instances(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify solve rejects --max-instances <= 0 with parser error exit code."""
+    expected_err_code = 2
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(SMALL_HYBRID_MOE_CFG), encoding="utf-8")
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            [
+                "solve",
+                "--config",
+                str(cfg_path),
+                "--chip",
+                "tpu7x",
+                "--example-scenario",
+                "coding-agent",
+                "--max-instances",
+                "0",
+            ]
+        )
+    assert excinfo.value.code == expected_err_code
+    assert "--max-instances" in capsys.readouterr().err
+
+
+def test_cli_solve_ascii_and_html_and_reference_layout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify ASCII table, HTML report, and --reference-layout ranking."""
+    config_path = tmp_path / "qwen35_fp8.json"
+    raw_text_config = QWEN35_CFG["text_config"]
+    assert isinstance(raw_text_config, dict)
+    config_path.write_text(
+        json.dumps(
+            {
+                **QWEN35_CFG,
+                "text_config": {
+                    **raw_text_config,
+                    "quantization_config": {"quant_method": "fp8"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    html_path = tmp_path / "report.html"
+    rc_match = cli.main(
+        [
+            "solve",
+            "--config",
+            str(config_path),
+            "--isl",
+            "105000",
+            "--osl",
+            "1000",
+            "--prefix-hit-rate",
+            "0.95",
+            "--accept-len",
+            "3.39",
+            "--think-time-s",
+            "0.0",
+            "--concurrency",
+            "8",
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "4",
+            "--top-k",
+            "1",
+            "--reference-layout",
+            "TP8 x EP8",
+            "--html",
+            str(html_path),
+            "--json",
+        ]
+    )
+    assert rc_match == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reference"]["found"] is True
+    assert "Search Budget:" in html_path.read_text(encoding="utf-8")
+
+    rc_rej = cli.main(
+        [
+            "solve",
+            "--config",
+            str(config_path),
+            "--isl",
+            "105000",
+            "--osl",
+            "1000",
+            "--prefix-hit-rate",
+            "0.95",
+            "--accept-len",
+            "3.39",
+            "--think-time-s",
+            "0.0",
+            "--concurrency",
+            "8",
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "4",
+            "--reference-layout",
+            "TP3",
+            "--json",
+        ]
+    )
+    assert rc_rej == 0
+    rej_payload = json.loads(capsys.readouterr().out)
+    assert rej_payload["reference"]["found"] is False
+    assert "TP3" in rej_payload["reference"]["rejected_by"]
+
+
+def test_assumptions_catalog_and_collective_latency_calibration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify --assumptions catalog and --collective-latency-us calibration scope."""
+    rc_json = cli.main(["--assumptions", "--json"])
+    assert rc_json == 0
+    assump_json = json.loads(capsys.readouterr().out)
+    assert assump_json["catalog"]
+    assert assump_json["solver_assumptions"]
+
+    rc_text = cli.main(["--assumptions"])
+    assert rc_text == 0
+    assert "Solver assumptions" in capsys.readouterr().out
+
+    raw_text = SMALL_HYBRID_MOE_CFG["text_config"]
+    assert isinstance(raw_text, dict)
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                **SMALL_HYBRID_MOE_CFG,
+                "text_config": {
+                    **raw_text,
+                    "quantization_config": {"quant_method": "fp8"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    base_argv = [
+        "solve",
+        "--config",
+        str(cfg_path),
+        "--example-scenario",
+        "chat-8k1k",
+        "--mode",
+        "mixed",
+        "--max-chips",
+        "4",
+        "--concurrency",
+        "4",
+        "--json",
+    ]
+    assert cli.main(base_argv) == 0
+    base_payload = json.loads(capsys.readouterr().out)
+    assert base_payload["provenance"]["calibrated"] is False
+    assert base_payload["provenance"]["supplied_values"] == []
+
+    cal_us = 50.0
+    assert (
+        cli.main([*base_argv[:-1], "--collective-latency-us", str(cal_us), "--json"])
+        == 0
+    )
+    cal_payload = json.loads(capsys.readouterr().out)
+    assert cal_payload["provenance"]["calibrated"] is True
+    base_rec = base_payload["recommended"]
+    base_pool = base_rec["decode_pool"]
+    cal_peer = next(
+        cand
+        for cand in cal_payload["candidates"]
+        if cand["concurrency"] == base_rec["concurrency"]
+        and cand["decode_pool"]["tp"] == base_pool["tp"]
+        and cand["decode_pool"]["dp"] == base_pool["dp"]
+        and cand["decode_pool"]["ep"] == base_pool["ep"]
+        and cand["decode_pool"]["kv_split"] == base_pool["kv_split"]
+        and cand["decode_pool"]["moe_dispatch"] == base_pool["moe_dispatch"]
+    )
+    assert cal_peer["bound_tpot_ms"] == pytest.approx(
+        base_rec["bound_tpot_ms"], rel=1e-12
+    )
+    assert cal_peer["est_tpot_ms"] >= base_rec["est_tpot_ms"]
+
+
+def test_cli_invalid_scenario_and_overrides_exit_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Invalid --concurrency or --hf-overrides exit 2 cleanly without tracebacks."""
+    expected_error_rc = 2
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(SMALL_HYBRID_MOE_CFG), encoding="utf-8")
+
+    rc_bad_conc = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "chat-8k1k",
+            "--max-chips",
+            "4",
+            "--concurrency",
+            "abc",
+        ]
+    )
+    assert rc_bad_conc == expected_error_rc
+    assert "error:" in capsys.readouterr().err.lower()
+
+    rc_zero_conc = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "chat-8k1k",
+            "--max-chips",
+            "4",
+            "--concurrency",
+            "0",
+        ]
+    )
+    assert rc_zero_conc == expected_error_rc
+    assert "error:" in capsys.readouterr().err.lower()
+
+    rc_bad_ovr = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--hf-overrides",
+            "123",
+            "--example-scenario",
+            "chat-8k1k",
+            "--max-chips",
+            "4",
+        ]
+    )
+    assert rc_bad_ovr == expected_error_rc
+    assert "error:" in capsys.readouterr().err.lower()
+
+
+def test_cli_emit_uses_from_bench_cmd_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Emit uses --from-bench-cmd --model instead of falling back to <MODEL>."""
+    model_dir = tmp_path / "qwen35_local"
+    model_dir.mkdir()
+    raw_text = SMALL_HYBRID_MOE_CFG["text_config"]
+    assert isinstance(raw_text, dict)
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                **SMALL_HYBRID_MOE_CFG,
+                "text_config": {
+                    **raw_text,
+                    "quantization_config": {"quant_method": "fp8"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc = cli.main(
+        [
+            "emit",
+            "--from-bench-cmd",
+            (
+                f"vllm bench serve --model {model_dir} "
+                "--random-input-len 1024 --random-output-len 128 --max-concurrency 8"
+            ),
+            "--max-chips",
+            "4",
+            "--mode",
+            "mixed",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["commands"]
+    assert all("<MODEL>" not in cmd for cmd in payload["commands"])
+    assert any(str(model_dir) in cmd for cmd in payload["commands"])
+
+
+def test_cli_parse_serve_cmd_roundtrips_tpu_flags_and_raiden_offload() -> None:
+    """_parse_serve_cmd parses TPU flags, Raiden offload, and TPUMultiConnector."""
+    offload_gib = 10
+    offload_bytes = offload_gib * int(UNIT_GIBI)
+    expected_tp = 8
+    expected_pcp = 2
+    expected_dcp = 4
+    expected_interleave = 128
+    expected_nnodes = 2
+
+    standalone_kv = json.dumps(
+        {
+            "kv_connector": "TPURaidenOffloadingConnector",
+            "kv_connector_module_path": "vllm_torchtpu.offload.raiden_connector",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {"cpu_bytes_to_use": offload_bytes},
+        }
+    )
+    standalone_cmd = (
+        "vllm serve Qwen/Qwen3.5-397B-A17B-FP8 -tp 8 -ep -pcp 2 "
+        "--decode-context-parallel-size 4 --cp-kv-cache-interleave-size 128 "
+        "--no-async-scheduling --nnodes 2 --headless "
+        f"--kv-transfer-config '{standalone_kv}'"
+    )
+    parsed = _parse_serve_cmd(standalone_cmd)
+    assert parsed["tp"] == expected_tp
+    assert parsed["enable_expert_parallel"] is True
+    assert parsed["pcp"] == expected_pcp
+    assert parsed["dcp"] == expected_dcp
+    assert parsed["cp_kv_cache_interleave_size"] == expected_interleave
+    assert parsed["async_scheduling"] is False
+    assert parsed["nnodes"] == expected_nnodes
+    assert parsed["headless"] is True
+    assert parsed["kv_offload_gb"] == pytest.approx(float(offload_gib))
+
+    multi_gib = 24
+    multi_bytes = multi_gib * int(UNIT_GIBI)
+    multi_kv = json.dumps(
+        {
+            "kv_connector": "TPUMultiConnector",
+            "kv_connector_module_path": (
+                "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector"
+            ),
+            "kv_role": "kv_producer",
+            "kv_connector_extra_config": {
+                "connectors": [
+                    {
+                        "kv_connector": "TPURaidenConnector",
+                        "kv_connector_module_path": (
+                            "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
+                        ),
+                        "kv_role": "kv_producer",
+                    },
+                    {
+                        "kv_connector": "TPURaidenOffloadingConnector",
+                        "kv_connector_module_path": (
+                            "vllm_torchtpu.offload.raiden_connector"
+                        ),
+                        "kv_role": "kv_both",
+                        "kv_connector_extra_config": {"cpu_bytes_to_use": multi_bytes},
+                    },
+                ]
+            },
+        }
+    )
+    multi_cmd = (
+        "vllm serve Qwen/Qwen3.5-397B-A17B-FP8 -tp 8 --enable-expert-parallel "
+        f"--kv-transfer-config '{multi_kv}'"
+    )
+    parsed_multi = _parse_serve_cmd(multi_cmd)
+    assert parsed_multi["kv_connector"] == "TPUMultiConnector"
+    assert parsed_multi["kv_role"] == "kv_producer"
+    assert parsed_multi["kv_offload_gb"] == pytest.approx(float(multi_gib))
+
+
+def test_cli_inspect_fail_closed_and_canonical_identity(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Inspect emits canonical identity, supports ModelOpt + overrides, fails closed."""
+    expected_error_rc = 2
+    fixtures_dir = Path(__file__).resolve().parent / "fixtures"
+    glm_nvfp4 = fixtures_dir / "glm_5_2_nvfp4.json"
+    qwen38_path = fixtures_dir / "qwen3_8_flash_next_fp8.json"
+    dsv4_path = fixtures_dir / "deepseek_v4_pro.json"
+
+    # Canonical ModelOpt NVFP4 fixture passes tier0_ready with canonical_id.
+    rc_glm = cli.main(["inspect", "--config", str(glm_nvfp4), "--json"])
+    assert rc_glm == 0
+    glm_payload = json.loads(capsys.readouterr().out)
+    assert glm_payload["onboarding_tier"] == "tier0_ready"
+    assert glm_payload["canonical_id"] == "glm_moe_dsa"
+    assert glm_payload["unmapped_structural_keys"] == []
+    assert _has_quantization_config(json.loads(glm_nvfp4.read_text()))
+
+    # Qwen3.8 fails closed unmodified and becomes tier0_ready with --hf-overrides.
+    rc_q38_raw = cli.main(["inspect", "--config", str(qwen38_path), "--json"])
+    assert rc_q38_raw == expected_error_rc
+    q38_raw = json.loads(capsys.readouterr().out)
+    assert q38_raw["onboarding_tier"] != "tier0_ready"
+
+    rc_q38_ovr = cli.main(
+        [
+            "inspect",
+            "--config",
+            str(qwen38_path),
+            "--hf-overrides",
+            '{"text_config": {"ple_layer_ids": []}}',
+            "--json",
+        ]
+    )
+    assert rc_q38_ovr == 0
+    q38_ovr = json.loads(capsys.readouterr().out)
+    assert q38_ovr["onboarding_tier"] == "tier0_ready"
+    assert q38_ovr["canonical_id"] == "qwen4_exp"
+
+    # Unlisted / unsupported model fails closed with exit 2 and zero bypass flag.
+    rc_dsv4 = cli.main(["inspect", "--config", str(dsv4_path), "--json"])
+    assert rc_dsv4 == expected_error_rc
+    dsv4_payload = json.loads(capsys.readouterr().out)
+    assert dsv4_payload["onboarding_tier"] != "tier0_ready"
+    assert dsv4_payload["canonical_id"] is None
+
+    parser = cli.build_parser()
+    all_opts = {
+        opt
+        for _sub, opt_strs, _help in _iter_subcommand_options(parser)
+        for opt in opt_strs
+    }
+    assert "--allow-unlisted-model-type" not in all_opts
