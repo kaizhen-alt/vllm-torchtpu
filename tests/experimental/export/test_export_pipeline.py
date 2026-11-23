@@ -40,6 +40,7 @@ from vllm_torchtpu.experimental.export import (
     validator,
     weight_mapper,
 )
+from vllm_torchtpu.layers.adapter.gate_linear import BF16X3_WEIGHT_BUFFER
 
 
 @pytest.fixture(autouse=True)
@@ -1366,6 +1367,22 @@ def test_build_export_config_req_buckets_cover_speculative_verify_rows(
         128,
         256,
     )
+
+
+def test_a_gate_weight_split_is_a_weight_not_a_constant() -> None:
+    """TpuGateLinear's [3, E, H] split is laid out as a weight: as a constant it
+    would exceed the constant size limit."""
+    model = nn.Module()
+    model.gate = nn.Linear(8, 4, bias=False)
+    model.gate.register_buffer(
+        BF16X3_WEIGHT_BUFFER,
+        torch.zeros(3, 4, 8, dtype=torch.bfloat16),
+        persistent=False,
+    )
+    model.register_buffer("rank", torch.zeros(1, dtype=torch.int32))
+    adapter = object.__new__(universal_adapter.UniversalVllmExportableLLM)
+    adapter._model = model
+    assert adapter.constant_names() == {"rank"}
 
 
 def _adapter_without_model(cfg: api.TextOnlyLLMExportConfig) -> Any:
