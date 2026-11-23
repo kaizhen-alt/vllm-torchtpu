@@ -38,10 +38,18 @@ from .constants import (
     WEIGHT_DTYPE_BYTES,
 )
 from .emit import (
+    LaunchOptions,
     build_solve_payload,
     emit_ceiling_rows,
     emit_launch_args,
     format_solve_json,
+    point_launch_args,
+    top_layouts,
+)
+from .families import (
+    attach_reference_report,
+    parse_layout,
+    reference_layout_report,
 )
 from .geometry import UnsupportedArchitectureError, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config_with_identity
@@ -54,7 +62,9 @@ from .solver import (
     ServingPlan,
     SolveOptions,
     TrafficScenario,
+    _resolve_solve_topologies,
     build_example_scenario,
+    explain_layout_rejection,
     solve_serving_plan,
 )
 from .step import FloorOptions, SpecShape, spec_cycle_floor, step_floor
@@ -185,6 +195,14 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Write an offline HTML report to PATH.",
+    )
+    p_solve.add_argument(
+        "--reference-layout",
+        default=None,
+        help=(
+            "Compare a reference layout (e.g. 'TP8 x EP8' or "
+            "'P: PP4 / D: TP8') against solver candidates."
+        ),
     )
 
     p_emit = sub.add_parser(
@@ -347,35 +365,23 @@ def _dispatch_solve(
         parser.error("Either --max-chips or --max-instances is required.")
     dt_resolved = resolve_dtypes_from_args(args, cfg)
     chip, custom_topos = _resolve_chip_and_topos(args)
-    splan = solve_serving_plan(
-        from_hf_config(cfg, model_ref=model_ref),
-        dt_resolved,
-        chip,
-        scen,
-        SolveOptions(
-            mode=args.mode,
-            max_chips=args.max_chips,
-            max_instances=args.max_instances,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            topologies=tuple(custom_topos.values()) if custom_topos else None,
-        ),
+    geom = from_hf_config(cfg, model_ref=model_ref)
+    solve_opts = SolveOptions(
+        mode=args.mode,
+        max_chips=args.max_chips,
+        max_instances=args.max_instances,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        topologies=tuple(custom_topos.values()) if custom_topos else None,
     )
+    splan = solve_serving_plan(geom, dt_resolved, chip, scen, solve_opts)
     if args.cmd == "ceiling":
         return _dispatch_ceiling(args, splan)
     if args.cmd == "emit":
         return _dispatch_emit(args, splan, dt_resolved, chip)
     src = args.model if args.model is not None else (model_ref or args.config)
-    if args.html is not None:
-        payload_html = build_solve_payload(
-            splan,
-            chip=chip,
-            dtypes=dt_resolved,
-            model=src,
-            top_k=args.top_k,
-            topologies=custom_topos,
-        )
-        write_html(payload_html, args.html)
-    if args.json:
+    ref_layout = getattr(args, "reference_layout", None)
+    payload = None
+    if args.html is not None or args.json:
         payload = build_solve_payload(
             splan,
             chip=chip,
@@ -384,6 +390,41 @@ def _dispatch_solve(
             top_k=args.top_k,
             topologies=custom_topos,
         )
+        if ref_layout is not None:
+            parsed_ref = parse_layout(ref_layout)
+            topos = _resolve_solve_topologies(solve_opts, chip=chip)
+            rejected_by = explain_layout_rejection(
+                geom,
+                parsed_ref,
+                topos,
+                solve_opts,
+                chip=chip,
+                spec_k=splan.spec_k,
+            )
+            ref_report = reference_layout_report(
+                splan,
+                top_layouts(splan, args.top_k),
+                ref_layout,
+                rejected_by,
+            )
+            kv_str = "fp8" if dt_resolved.kv <= KV_DTYPE_BYTES["fp8"] else "auto"
+            launch_opts = LaunchOptions(
+                kv_dtype=kv_str,
+                gpu_memory_utilization=splan.gpu_memory_utilization,
+                model=src,
+                chip=chip,
+                model_id=splan.model_id,
+                spec_k=splan.spec_k,
+            )
+            payload = attach_reference_report(
+                payload,
+                splan,
+                ref_report,
+                launch_fn=lambda pt: point_launch_args(pt, launch_opts),
+            )
+    if args.html is not None and payload is not None:
+        write_html(payload, args.html)
+    if args.json and payload is not None:
         sys.stdout.write(format_solve_json(payload) + "\n")
         return 0
     for warning in splan.warnings:

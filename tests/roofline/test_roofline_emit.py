@@ -38,12 +38,16 @@ from vllm_torchtpu.roofline import (
     cli,
     emit_ceiling_rows,
     emit_launch_args,
+    explain_layout_rejection,
     format_parallelism,
     format_submodule_parallelism,
     from_hf_config,
+    pareto_skyline_by_concurrency,
+    parse_layout,
     point_launch_args,
     pool_cli_args,
     pool_label,
+    reference_layout_report,
     solve_serving_plan,
     top_layouts,
 )
@@ -52,6 +56,7 @@ from vllm_torchtpu.roofline.emit import (
     _MODEL_PLACEHOLDER,
     _UNKNOWN_MODEL_WARNING,
 )
+from vllm_torchtpu.roofline.families import _decode_group_key
 from vllm_torchtpu.roofline.hf_loader import dtypes_from_hf_config as _dtypes_from_cfg
 from vllm_torchtpu.roofline.memory import (
     SeqKvLayout as _SeqKvLayout,
@@ -1229,3 +1234,194 @@ def test_format_submodule_parallelism_splits_attn_and_moe() -> None:
 
     dense_tp_pool = {"tp": 8, "dp": 1, "ep": 1, "pp": 1, "pcp": 1, "kv_split": 1}
     assert format_submodule_parallelism(dense_tp_pool, has_moe=False) == "TP8"
+
+
+def test_decode_group_key_distinguishes_prefill_mesh_families() -> None:
+    """Disagg layouts with distinct prefill meshes must not collide in decode groups."""
+    scen = TrafficScenario(
+        name="disagg-prefill-diversity",
+        isl=4096,
+        osl=512,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(16,),
+        kv_working_set_turns=1.0,
+    )
+    decode_pool = _sample_pool(
+        role="decode",
+        cfg=_PoolConfig(topology="2x2x1", chips=4, tp=8, dp=1, ep=8),
+    )
+    prefill_pp = _sample_pool(
+        role="prefill",
+        cfg=_PoolConfig(topology="2x2x1", chips=4, tp=1, dp=1, ep=2, pp=4, pcp=2),
+    )
+    prefill_pcp = _sample_pool(
+        role="prefill",
+        cfg=_PoolConfig(topology="2x2x1", chips=4, tp=1, dp=1, ep=8, pp=1, pcp=8),
+    )
+    pt_pp = ParetoPoint(
+        mode="disagg",
+        concurrency=16,
+        total_chips=8,
+        prefill_pool=prefill_pp,
+        decode_pool=decode_pool,
+        p90_ttft_ms=120.0,
+        p90_tpot_ms=10.0,
+        p90_interactivity_tok_s=100.0,
+        output_throughput_per_chip=180.0,
+        token_throughput_per_chip=1600.0,
+        p_mixed=0.0,
+        binding="hbm",
+        slo_met=True,
+    )
+    pt_pcp = ParetoPoint(
+        mode="disagg",
+        concurrency=16,
+        total_chips=8,
+        prefill_pool=prefill_pcp,
+        decode_pool=decode_pool,
+        p90_ttft_ms=110.0,
+        p90_tpot_ms=10.0,
+        p90_interactivity_tok_s=100.0,
+        output_throughput_per_chip=175.0,
+        token_throughput_per_chip=1550.0,
+        p_mixed=0.0,
+        binding="hbm",
+        slo_met=True,
+    )
+    assert _decode_group_key(pt_pp) != _decode_group_key(pt_pcp)
+
+    splan = ServingPlan(
+        model_layers=16,
+        chip="tpu7x",
+        scenario=scen,
+        mode="disagg",
+        recommended=pt_pp,
+        frontier=(pt_pp, pt_pcp),
+        warnings=(),
+        candidates=(pt_pp, pt_pcp),
+        has_moe=True,
+        budget=8,
+    )
+    skyline = pareto_skyline_by_concurrency(splan, k=3)
+    expected_surviving = 2
+    assert len(skyline[16]) == expected_surviving
+    assert set(skyline[16]) == {pt_pp, pt_pcp}
+
+
+def test_reference_layout_rank_compares_same_concurrency_peers() -> None:
+    """Reference layout ranking compares strictly against same-concurrency peers."""
+    scen = TrafficScenario(
+        name="ref-rank-same-conc",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(1, 128),
+        kv_working_set_turns=1.0,
+    )
+    pool_a = _sample_pool(
+        role="mixed",
+        cfg=_PoolConfig(topology="2x2x1", chips=4, tp=8, dp=1, ep=8),
+    )
+    pool_b = _sample_pool(
+        role="mixed",
+        cfg=_PoolConfig(topology="2x2x1", chips=4, tp=4, dp=2, ep=8),
+    )
+
+    def _pt(pool: PoolMeshPlan, conc: int, tput: float, tpot_ms: float) -> ParetoPoint:
+        """Create a synthetic mixed ParetoPoint at one concurrency level."""
+        return ParetoPoint(
+            mode="mixed",
+            concurrency=conc,
+            total_chips=4,
+            prefill_pool=None,
+            decode_pool=pool,
+            p90_ttft_ms=50.0,
+            p90_tpot_ms=tpot_ms,
+            p90_interactivity_tok_s=1000.0 / tpot_ms,
+            output_throughput_per_chip=tput * 0.2,
+            token_throughput_per_chip=tput,
+            p_mixed=0.0,
+            binding="hbm",
+            slo_met=True,
+        )
+
+    # Layout A only exists at c=1 and beats Layout B at c=1 on both throughput and TPOT,
+    # even though Layout B achieves much higher throughput at c=128.
+    pt_a_c1 = _pt(pool_a, 1, tput=400.0, tpot_ms=5.0)
+    pt_b_c1 = _pt(pool_b, 1, tput=300.0, tpot_ms=8.0)
+    pt_b_c128 = _pt(pool_b, 128, tput=9000.0, tpot_ms=12.0)
+
+    splan = ServingPlan(
+        model_layers=8,
+        chip="tpu7x",
+        scenario=scen,
+        mode="mixed",
+        recommended=pt_b_c128,
+        frontier=(pt_a_c1, pt_b_c128),
+        warnings=(),
+        candidates=(pt_a_c1, pt_b_c1, pt_b_c128),
+        has_moe=True,
+        budget=4,
+    )
+    report = reference_layout_report(splan, (pt_b_c128, pt_a_c1), "TP8 x EP8", "")
+    assert report["found"] is True
+    expected_peer_layouts = 2
+    assert report["candidates"] == expected_peer_layouts
+    assert report["rank_by_estimated_throughput"] == 1
+    assert report["rank_by_tpot_bound"] == 1
+    assert report["in_top_k"] is True
+
+
+def test_families_and_cli_reference_layout_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify parse_layout, bound families, explain_layout_rejection, and CLI flag."""
+    parsed = parse_layout("P: PP4 x EP1 / D: TP8 x EP8 x DCP2")
+    expected_pp = 4
+    expected_tp = 8
+    expected_dcp = 2
+    assert parsed["prefill"]["pp"] == expected_pp
+    assert parsed["decode"]["tp"] == expected_tp
+    assert parsed["decode"]["kv_split"] == expected_dcp
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(SMALL_HYBRID_MOE_CFG), encoding="utf-8")
+    rc = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "chat-8k1k",
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "4",
+            "--concurrency",
+            "1,4",
+            "--reference-layout",
+            "TP8 x EP8",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert "bound_families_by_concurrency" in out
+    assert "1" in out["bound_families_by_concurrency"]
+    assert "concurrency_top_k" in out
+    assert out["reference"]["layout"] == "TP8 x EP8"
+    assert out["reference"]["found"] is True
+    assert out["reference"]["launch"] is not None
+
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    reason = explain_layout_rejection(
+        geom,
+        parse_layout("P: PP4 / D: TP8 x EP8"),
+        tuple(CHIPS["tpu7x"] and []),
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    assert "disaggregated mode" in reason

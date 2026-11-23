@@ -37,6 +37,14 @@ from .constants import (
     SOLVE_SCHEMA,
     UNIT_GIGA,
 )
+from .families import (
+    attach_reference_report,
+    build_bound_families_by_concurrency,
+    pareto_skyline_by_concurrency,
+    parse_layout,
+    reference_layout_report,
+    strict_rank,
+)
 from .schema import (
     CeilingRow,
     LaunchPayload,
@@ -89,6 +97,8 @@ __all__ = [
     "ProvenancePayload",
     "SolvePayload",
     "TopKEntry",
+    "attach_reference_report",
+    "build_bound_families_by_concurrency",
     "build_solve_payload",
     "emit_ceiling_rows",
     "emit_launch_args",
@@ -96,10 +106,14 @@ __all__ = [
     "format_parallelism",
     "format_solve_json",
     "format_submodule_parallelism",
+    "pareto_skyline_by_concurrency",
+    "parse_layout",
     "point_launch_args",
     "pool_cli_args",
     "pool_label",
     "pool_slice_summary",
+    "reference_layout_report",
+    "strict_rank",
     "top_layout_roles",
     "top_layouts",
 ]
@@ -799,6 +813,23 @@ def build_solve_payload(
             "pd_ratio": pins_map.get("pd_ratio", pins_map.get("pd")),
         },
     }
+    skyline_by_conc = pareto_skyline_by_concurrency(plan, top_k)
+    payload["concurrency_top_k"] = {
+        str(conc): [
+            {
+                "frontier_role": role,
+                "margin_vs_rank1_pct": margin,
+                "point": asdict(pt),
+                "launch": point_launch_args(pt, launch_opts),
+            }
+            for pt, role, margin in top_layout_roles(conc_pts)
+        ]
+        for conc, conc_pts in skyline_by_conc.items()
+    }
+    payload["bound_families_by_concurrency"] = build_bound_families_by_concurrency(
+        plan,
+        launch_fn=lambda pt: point_launch_args(pt, launch_opts),
+    )
     if dtypes is not None:
         payload["dtypes"] = asdict(dtypes)
     return payload

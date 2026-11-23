@@ -47,6 +47,7 @@ from vllm_torchtpu.roofline.geometry import (
     from_hf_config,
     supports,
 )
+from vllm_torchtpu.roofline.partition import count_full_attn_layers
 
 QWEN35_CFG: dict[str, object] = {
     "model_type": "qwen3_5_moe",
@@ -515,3 +516,76 @@ def test_slice_topology_validates_axes_and_chip_overrides_decouples_ici() -> Non
     )
     for fp8_alias in ("float8_e8m0fnu", "e8m0", "float8_e5m2"):
         assert BASE_DTYPE_BYTES[fp8_alias] == FP8_BYTES
+
+
+def test_supports_validator_fails_closed_on_unknown_arch() -> None:
+    """Verify supports and from_hf_config reject unsupported or invalid configs."""
+    for bad_cfg in (
+        {},
+        {
+            "model_type": "mamba2",
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "vocab_size": 32000,
+        },
+        {
+            "model_type": "rwkv",
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 16,
+            "vocab_size": 32000,
+        },
+        {
+            "model_type": "bert",
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 12,
+            "vocab_size": 30522,
+        },
+        {
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "ssm_cfg": {"d_state": 16},
+            "vocab_size": 32000,
+        },
+        {
+            "hidden_size": 2048,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 16,
+            "layer_types": ["retnet_retention", "full_attention"],
+            "vocab_size": 32000,
+        },
+        {"vision_config": {"hidden_size": 1024}, "text_config": None},
+        {"vision_config": {"hidden_size": 1024}},
+    ):
+        with pytest.raises(UnsupportedArchitectureError):
+            supports(bad_cfg)
+        with pytest.raises(UnsupportedArchitectureError):
+            from_hf_config(bad_cfg)
+
+
+def test_ffn_only_hybrid_override_excluded_from_full_attn_count() -> None:
+    """Verify ffn_only layers from hybrid_override are excluded from full-attn count."""
+    hybrid_override_cfg = {
+        "model_type": "qwen3_5_moe",
+        "hidden_size": 4096,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "mamba_num_heads": 64,
+        "mamba_head_dim": 64,
+        "conv_kernel": 4,
+        "hybrid_override_pattern": "M-M*ME",
+        "n_routed_experts": 16,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 2048,
+        "intermediate_size": 8192,
+        "vocab_size": 131072,
+    }
+    geom = _from_hf_config_dry_run(hybrid_override_cfg)
+    exp_ffn_count = 2
+    assert geom.layer_types.count("ffn_only") == exp_ffn_count
+    assert geom.ffn_layer_counts() == (1, 1)
+    assert geom.ffn_kinds == ("none", "dense", "none", "none", "none", "moe")
+    assert count_full_attn_layers(geom) == 1

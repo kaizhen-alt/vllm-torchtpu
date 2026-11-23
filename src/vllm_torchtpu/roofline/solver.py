@@ -18,7 +18,7 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
 from .chips import TOPOLOGIES, ChipSpec, SliceTopology, topologies_for_chip
 from .collectives import submesh_for_group
@@ -65,7 +65,7 @@ from .schema import (
 from .step import FloorOptions, SpecShape, StepFloor, spec_cycle_floor, step_floor
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from .geometry import ModelGeometry
 
@@ -1731,6 +1731,226 @@ def _qwen4_scenario_warnings(
             f"(spec_tokens={spec_k})."
         )
     return tuple(msgs)
+
+
+def _explain_mode_rejection(
+    layout: Mapping[str, Mapping[str, int]],
+    mode: str,
+) -> str | None:
+    """Return rejection reason if layout contradicts solver mode."""
+    if mode == "mixed" and "prefill" in layout:
+        return "a prefill and decode layout is only searched in disaggregated mode"
+    if mode == "disagg" and "prefill" not in layout:
+        return "a single-pool layout is only searched in mixed mode"
+    return None
+
+
+def _explain_decode_tp_rejection(
+    geom: ModelGeometry,
+    decode_tp: int,
+    *,
+    ep_degree: int = 1,
+) -> str | None:
+    """Return rejection reason if decode tensor-parallel degree is invalid."""
+    if not _valid_moe_block_quant_hidden(geom):
+        return "model hidden size does not divide FP8 weight_block_size"
+    if not _valid_head_tp(geom, decode_tp):
+        return f"TP{decode_tp} does not divide the attention heads"
+    if not _valid_gdn_degree(geom, decode_tp):
+        return f"TP{decode_tp} is not a valid linear-attention shard degree"
+    if ep_degree <= 1 and not _valid_moe_tp_slice(geom, decode_tp):
+        return f"TP{decode_tp} does not satisfy MoE TP-slice divisibility rules"
+    return None
+
+
+def _explain_decode_rejection(
+    geom: ModelGeometry,
+    decode_axes: Mapping[str, int],
+    decode_topologies: Sequence[SliceTopology],
+    *,
+    chip: ChipSpec | None = None,
+) -> str | None:
+    """Return rejection reason if decode layout is invalid or not enumerated."""
+    reason: str | None = None
+    if decode_axes.get("pp", 1) > 1 or decode_axes.get("pcp", 1) > 1:
+        reason = "decode pools are enumerated with PP1 and PCP1"
+    elif geom.model_id == "qwen4_exp" and decode_axes.get("kv_split", 1) > 1:
+        reason = "qwen4_exp bring-up path does not support DCP > 1"
+    if reason is not None:
+        return reason
+
+    decode_tp = decode_axes.get("tp", 1)
+    reference_ep = decode_axes.get("ep", 1)
+    tp_reason = _explain_decode_tp_rejection(geom, decode_tp, ep_degree=reference_ep)
+    if tp_reason is not None:
+        return tp_reason
+
+    decode_dp = decode_axes.get("dp", 1)
+    needed_cores = decode_tp * decode_dp
+    core_matching_topologies = [
+        topology for topology in decode_topologies if topology.num_cores == needed_cores
+    ]
+    if not core_matching_topologies:
+        return (
+            f"TP{decode_tp} x DP{decode_dp} needs {needed_cores} cores and no searched"
+            " slice has that many"
+        )
+
+    if not any(
+        _valid_multihost_mp_layout(
+            slice_topology, (decode_tp, decode_dp, 1, 1), chip=chip
+        )
+        for slice_topology in core_matching_topologies
+    ):
+        return "multi-host multiprocessing requires Mode A (DP1) or Mode B"
+
+    reference_dcp = decode_axes.get("kv_split", 1)
+    decode_found = any(
+        parallel_candidate.tp == decode_tp
+        and parallel_candidate.dp == decode_dp
+        and parallel_candidate.ep == reference_ep
+        and parallel_candidate.kv_split == reference_dcp
+        for slice_topology in core_matching_topologies
+        for parallel_candidate in _candidate_decode_parallels(
+            geom, slice_topology, chip=chip
+        )
+    )
+    return (
+        None
+        if decode_found
+        else f"this decode layout is not enumerated on a {needed_cores}-core slice"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefillExplainSpec:
+    """Grouped runtime inputs for prefill layout rejection diagnosis."""
+
+    topologies: Sequence[SliceTopology]
+    chip: ChipSpec | None = None
+    spec_k: int = 0
+
+
+def _explain_prefill_rejection(
+    geom: ModelGeometry,
+    prefill_axes: Mapping[str, int],
+    decode_axes: Mapping[str, int],
+    spec: _PrefillExplainSpec,
+) -> str | None:
+    """Return rejection reason if prefill layout is invalid or not enumerated."""
+    prefill_tp = prefill_axes.get("tp", 1)
+    prefill_pp = prefill_axes.get("pp", 1)
+    prefill_pcp = prefill_axes.get("pcp", 1)
+    prefill_ep = prefill_axes.get("ep", 1)
+    if not _pcp_allowed(geom, prefill_pp, prefill_pcp, spec.spec_k):
+        return "PCP > 1 is not permitted with PP > 1, qwen4_exp, or spec_k > 1"
+    n_full_attn = count_full_attn_layers(geom)
+    if not _prefill_pp_allowed(
+        geom, prefill_pp, n_full_attn, for_disagg=True, spec_k=spec.spec_k
+    ):
+        return f"PP{prefill_pp} is not permitted for this model and scenario"
+    prefill_found = any(
+        parallel_candidate.tp == prefill_tp
+        and parallel_candidate.pp == prefill_pp
+        and parallel_candidate.pcp == prefill_pcp
+        and parallel_candidate.ep == prefill_ep
+        for slice_topology in spec.topologies
+        for parallel_candidate in _candidate_prefill_parallels(
+            geom,
+            slice_topology,
+            for_disagg=True,
+            spec_k=spec.spec_k,
+            chip=spec.chip,
+        )
+    )
+    if not prefill_found:
+        return "this prefill layout is not enumerated on any searched slice"
+
+    prefill_parallel = Parallel(
+        tp=prefill_tp,
+        dp=prefill_axes.get("dp", 1),
+        ep=prefill_ep,
+        pp=prefill_pp,
+        pcp=prefill_pcp,
+        kv_split=prefill_axes.get("kv_split", 1),
+    )
+    decode_parallel = Parallel(
+        tp=decode_axes.get("tp", 1),
+        dp=decode_axes.get("dp", 1),
+        ep=decode_axes.get("ep", 1),
+        pp=decode_axes.get("pp", 1),
+        pcp=decode_axes.get("pcp", 1),
+        kv_split=decode_axes.get("kv_split", 1),
+    )
+    if not (
+        _valid_raiden_gdn_pair(geom, prefill_parallel, decode_parallel)
+        and _valid_raiden_kv_pair(geom, prefill_parallel, decode_parallel)
+    ):
+        return "prefill and decode degrees do not form a legal KV handoff pair"
+    return None
+
+
+class _ExplainOptions(TypedDict, total=False):
+    """Optional chip and speculative decode overrides for rejection checks."""
+
+    chip: ChipSpec | None
+    spec_k: int
+
+
+def explain_layout_rejection(
+    geom: ModelGeometry,
+    layout: Mapping[str, Mapping[str, int]],
+    topologies: Sequence[SliceTopology],
+    opts: SolveOptions | None = None,
+    **explain_opts: Unpack[_ExplainOptions],
+) -> str:
+    """Name the first search rule that leaves a reference layout without candidates."""
+    chip = explain_opts.get("chip")
+    spec_k = explain_opts.get("spec_k", 0)
+    options = opts or SolveOptions()
+    decode_topologies = [
+        topology
+        for topology in topologies
+        if options.decode_topology is None or topology.name == options.decode_topology
+    ]
+    prefill_topologies = [
+        topology
+        for topology in topologies
+        if options.prefill_topology is None or topology.name == options.prefill_topology
+    ]
+    mode_reason = _explain_mode_rejection(layout, options.mode)
+    if mode_reason is not None:
+        return mode_reason
+
+    if "prefill" in layout:
+        prefill_axes = layout["prefill"]
+        if prefill_axes.get("dp", 1) > 1 or prefill_axes.get("kv_split", 1) > 1:
+            return "prefill pools are enumerated with DP1 and DCP1"
+
+    decode_reason = _explain_decode_rejection(
+        geom, layout["decode"], decode_topologies, chip=chip
+    )
+    if decode_reason is not None:
+        return decode_reason
+
+    if "prefill" in layout:
+        prefill_reason = _explain_prefill_rejection(
+            geom,
+            layout["prefill"],
+            layout["decode"],
+            _PrefillExplainSpec(
+                topologies=prefill_topologies,
+                chip=chip,
+                spec_k=spec_k,
+            ),
+        )
+        if prefill_reason is not None:
+            return prefill_reason
+
+    return (
+        "enumerated, but no searched point with this layout passed the "
+        "memory fit, the chip budget, and the latency targets"
+    )
 
 
 def _build_pins(opts: SolveOptions) -> dict[str, object] | None:
