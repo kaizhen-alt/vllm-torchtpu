@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Analytical TPU serving roofline, step floor, and mesh solver."""
+"""Analytical TPU serving roofline, step floor, mesh solver, and CLI emitter."""
 
 from __future__ import annotations
 
@@ -40,6 +40,13 @@ from .constants import (
     SUPPORTED_MODEL_TYPES,
     SUPPORTED_MODELS,
     ModelSpec,
+)
+from .emit import (
+    CeilingRow,
+    LaunchPayload,
+    emit_ceiling_rows,
+    emit_launch_args,
+    pool_cli_args,
 )
 from .geometry import (
     KeyTracker,
@@ -123,6 +130,7 @@ __all__ = [
     "SUPPORTED_MODEL_TYPES",
     "TOPOLOGIES",
     "ActivationRegime",
+    "CeilingRow",
     "ChipOverrides",
     "ChipSpec",
     "Collective",
@@ -136,6 +144,7 @@ __all__ = [
     "HbmBreakdown",
     "KeyTracker",
     "KvFitInput",
+    "LaunchPayload",
     "LayerCounts",
     "ModelGeometry",
     "ModelIdentity",
@@ -166,6 +175,8 @@ __all__ = [
     "default_rpa_page_size",
     "dsa_indexer_layer_weight_elems",
     "dtypes_from_hf_config",
+    "emit_ceiling_rows",
+    "emit_launch_args",
     "from_hf_config",
     "hbm_breakdown_per_core_bytes",
     "hbm_footprint_per_core_bytes",
@@ -178,6 +189,7 @@ __all__ = [
     "parse_activation_spec",
     "pass_costs",
     "plan",
+    "pool_cli_args",
     "pp_stage_layer_scale",
     "register_chip",
     "resolve_model_identity",

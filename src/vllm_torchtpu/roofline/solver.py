@@ -29,6 +29,7 @@ from .constants import (
     EXAMPLE_CONCURRENCIES,
     EXAMPLE_SLO_TIERS,
     LINEAR_ATTENTION_LAYER_TOKENS,
+    NO_FEASIBLE_LAYOUT_WARNING,
     UNIT_GIGA,
     UNIT_MICRO,
     UNIT_MILLIS_PER_SECOND,
@@ -307,6 +308,7 @@ class ServingPlan:
     gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION
     collective_latency_s: float = 0.0
     spec_k: int = 0
+    model_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1657,6 +1659,19 @@ def _qwen4_scenario_warnings(
     return tuple(msgs)
 
 
+def _active_mode_min_ttft(
+    mode: str,
+    min_prefill_ttft_ms: float,
+    min_mixed_ttft_ms: float,
+) -> float:
+    """Return the single-request prefill floor for the active solver mode."""
+    if mode == "mixed":
+        return min_mixed_ttft_ms
+    if mode == "disagg":
+        return min_prefill_ttft_ms
+    return min(min_prefill_ttft_ms, min_mixed_ttft_ms)
+
+
 def solve_serving_plan(
     geom: ModelGeometry,
     dtypes: Dtypes,
@@ -1728,6 +1743,7 @@ def solve_serving_plan(
             gpu_memory_utilization=opts.gpu_memory_utilization,
             collective_latency_s=opts.collective_latency_s,
             spec_k=spec_k,
+            model_id=geom.model_id,
         )
     prefill_options, min_prefill_ttft_ms = _find_prefill_options(eval_context, topos)
     mixed_candidates, min_c1_tpot_ms, min_mixed_ttft_ms = _evaluate_mixed_candidates(
@@ -1745,7 +1761,9 @@ def solve_serving_plan(
             f"CONTEXT_EXCEEDS_MAX_POSITION_EMBEDDINGS: ctx_full={ctx_full} > "
             f"max_position_embeddings={geom.max_position_embeddings}"
         )
-    min_req_ttft_ms = min(min_prefill_ttft_ms, min_mixed_ttft_ms)
+    min_req_ttft_ms = _active_mode_min_ttft(
+        opts.mode, min_prefill_ttft_ms, min_mixed_ttft_ms
+    )
     if (
         scenario.tpot_slo_ms is not None
         and math.isfinite(min_c1_tpot_ms)
@@ -1767,12 +1785,17 @@ def solve_serving_plan(
 
     slo_candidates = [p for p in candidates if p.slo_met]
     pool_for_frontier = slo_candidates if slo_candidates else candidates
-    if candidates and not slo_candidates and not warnings:
+    if not candidates:
+        warnings.append(NO_FEASIBLE_LAYOUT_WARNING)
+    elif not slo_candidates:
         warnings.append("SLO_UNMET: no feasible topology met both TTFT and TPOT bounds")
 
     frontier = _pareto_filter(pool_for_frontier)
+    slo_frontier = [p for p in frontier if p.slo_met]
     recommended = (
-        max(frontier, key=lambda p: p.token_throughput_per_chip) if frontier else None
+        max(slo_frontier, key=lambda p: p.token_throughput_per_chip)
+        if slo_frontier
+        else None
     )
     return ServingPlan(
         model_layers=geom.num_layers,
@@ -1786,4 +1809,5 @@ def solve_serving_plan(
         gpu_memory_utilization=opts.gpu_memory_utilization,
         collective_latency_s=opts.collective_latency_s,
         spec_k=spec_k,
+        model_id=geom.model_id,
     )

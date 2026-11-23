@@ -448,3 +448,84 @@ def test_cli_chip_spec_hf_overrides_clean_error_and_dtype_label_preservation(
     assert dt_resolved.w_expert_dtype == "nvfp4"
     assert dt_resolved.kv_dtype == "bf16"
     assert dt_resolved.act == "a16"
+
+
+def test_cli_help_clarifies_l1_pruning_vs_uncalibrated_shortlisting(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify CLI help strings distinguish L1 pruning from uncalibrated shortlists."""
+    for argv, expected_substrings in (
+        (["--help"], ("L1 physical lower bounds", "uncalibrated serial-phase")),
+        (
+            ["solve", "--help"],
+            ("Prune parallel layouts via L1 HBM bounds", "uncalibrated"),
+        ),
+        (["ceiling", "--help"], ("uncalibrated", "L1 candidate")),
+        (["plan", "--help"], ("hard L1 physical step floors", "uncalibrated")),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(argv)
+        assert exc_info.value.code == 0
+        help_text = capsys.readouterr().out
+        assert "winning" not in help_text.lower()
+        for expected in expected_substrings:
+            assert expected in help_text
+
+
+def test_cli_solve_and_emit_support_chip_spec_hf_overrides_and_dtype_overrides(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify solve and emit honor --chip-spec, --hf-overrides, and dtype flags."""
+    fixtures_dir = Path(__file__).resolve().parent / "fixtures"
+    qwen38_path = fixtures_dir / "qwen3_8_flash_next_fp8.json"
+    spec_path = tmp_path / "custom_chip.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "vllm_torchtpu.roofline.chip_spec/v1",
+                "provenance": "projected",
+                "base": "tpu7x",
+                "name": "tpu7x_override_test",
+            }
+        )
+    )
+    rc_emit = cli.main(
+        [
+            "emit",
+            "--config",
+            str(qwen38_path),
+            "--hf-overrides",
+            '{"text_config": {"ple_layer_ids": []}}',
+            "--chip-spec",
+            str(spec_path),
+            "--kv-dtype",
+            "fp8",
+            "--act",
+            "a16",
+            "--isl",
+            "1024",
+            "--osl",
+            "128",
+            "--prefix-hit-rate",
+            "0.0",
+            "--accept-len",
+            "1.0",
+            "--think-time-s",
+            "0.0",
+            "--concurrency",
+            "4",
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "4",
+            "--json",
+        ]
+    )
+    assert rc_emit == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["serving_plan"]["chip"] == "tpu7x_override_test"
+    assert "--hf-overrides" in payload["cli_args"]
+    assert (
+        payload["cli_args"][payload["cli_args"].index("--kv-cache-dtype") + 1] == "fp8"
+    )

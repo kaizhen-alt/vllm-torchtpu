@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,11 +26,16 @@ from tests.roofline.conftest import load_qwen3_8_bringup_config
 from vllm_torchtpu.roofline import (
     CHIPS,
     TOPOLOGIES,
+    ParetoPoint,
+    PoolMeshPlan,
+    ServingPlan,
     SolveOptions,
     TrafficScenario,
     default_rpa_page_size,
     dtypes_from_hf_config,
+    emit_launch_args,
     from_hf_config,
+    pool_cli_args,
     solve_serving_plan,
     tpu_min_page_size,
 )
@@ -380,3 +386,159 @@ def test_qwen4_exp_config_parity_with_live_runtime_guards() -> None:
         )
         == []
     )
+
+
+def test_emitted_pcp_pp_and_raiden_flags_match_live_runtime_validators() -> None:
+    """Assert emitted PCP, PP, MTP, and Raiden connector flags pass live validators."""
+    _require_runtime()
+    assert PcpStaticSupportValidator is not None
+    assert validate_pipeline_parallel_config is not None
+
+    pcp_pool = PoolMeshPlan(
+        role="prefill",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=4,
+        dp=1,
+        ep=8,
+        pp=1,
+        pcp=2,
+        kv_split=1,
+        mesh_axes=(2, 2, 1),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="ag_ep",
+    )
+    pcp_flags = pool_cli_args(pcp_pool, kv_dtype="fp8", spec_k=1)
+    interleave = int(pcp_flags[pcp_flags.index("--cp-kv-cache-interleave-size") + 1])
+    spec_cfg = json.loads(pcp_flags[pcp_flags.index("--speculative-config") + 1])
+    PcpStaticSupportValidator.validate_platform_config(
+        _make_vllm_config(
+            pcp=2,
+            ep=True,
+            interleave=interleave,
+            speculative_config=SimpleNamespace(**spec_cfg),
+        ),
+        kv_cache_layout="HND",
+    )
+
+    pp_pool = PoolMeshPlan(
+        role="prefill",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=1,
+        dp=1,
+        ep=1,
+        pp=8,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(1,),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="allreduce",
+    )
+    pp_flags = pool_cli_args(pp_pool, kv_dtype="fp8")
+    assert "--no-async-scheduling" in pp_flags
+    kv_cfg = json.loads(pp_flags[pp_flags.index("--kv-transfer-config") + 1])
+    conn_mod = importlib.import_module(kv_cfg["kv_connector_module_path"])
+    assert kv_cfg["kv_connector"] in vars(conn_mod)
+    validate_pipeline_parallel_config(
+        _make_vllm_config(
+            pp=8,
+            tp=1,
+            async_scheduling=False,
+            kv_transfer_config=SimpleNamespace(
+                is_kv_producer=True, kv_connector=kv_cfg["kv_connector"]
+            ),
+        )
+    )
+    with pytest.raises(NotImplementedError, match="TPURaidenConnector"):
+        validate_pipeline_parallel_config(
+            _make_vllm_config(
+                pp=8,
+                tp=1,
+                async_scheduling=False,
+                kv_transfer_config=SimpleNamespace(
+                    is_kv_producer=True, kv_connector="TpuRaidenConnector"
+                ),
+            )
+        )
+
+
+def test_qwen4_exp_moe_sp_rejected_by_live_config_and_emit() -> None:
+    """Verify MoE sequence parallel is rejected on qwen4_exp by runtime and emit."""
+    _require_runtime()
+    assert TPUQwen4ExpConfig is not None
+    bringup_cfg = load_qwen3_8_bringup_config()
+    relabelled = [
+        "indexed_attention" if lt == "full_attention" else lt
+        for lt in bringup_cfg["text_config"]["layer_types"]
+    ]
+    vcfg_sp = _make_vllm_config(
+        architecture="Qwen4ExpForConditionalGeneration",
+        text_cfg=bringup_cfg["text_config"],
+        layer_types=relabelled,
+        ple_layer_ids=[],
+        indexer_budget=2048,
+        max_model_len=1024,
+        use_sequence_parallel_moe=True,
+    )
+    with pytest.raises(NotImplementedError, match="TPU_MOE_SEQUENCE_PARALLEL"):
+        TPUQwen4ExpConfig.verify_and_update_config(vcfg_sp)
+    fused_pool = PoolMeshPlan(
+        role="mixed",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=8,
+        dp=1,
+        ep=8,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 1),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="fused_rs",
+    )
+    sp_pt = ParetoPoint(
+        mode="mixed",
+        concurrency=4,
+        total_chips=4,
+        prefill_pool=None,
+        decode_pool=fused_pool,
+        p90_ttft_ms=50.0,
+        p90_tpot_ms=5.0,
+        p90_interactivity_tok_s=200.0,
+        output_throughput_per_chip=100.0,
+        token_throughput_per_chip=500.0,
+        p_mixed=0.0,
+        binding="hbm",
+        slo_met=True,
+    )
+    sp_scen = TrafficScenario(
+        name="sp-parity",
+        isl=512,
+        osl=64,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(4,),
+        kv_working_set_turns=1.0,
+    )
+    with pytest.raises(ValueError, match="TPU_MOE_SEQUENCE_PARALLEL"):
+        emit_launch_args(
+            ServingPlan(
+                model_layers=48,
+                chip="tpu7x",
+                scenario=sp_scen,
+                mode="mixed",
+                recommended=sp_pt,
+                frontier=(sp_pt,),
+                warnings=(),
+                model_id="qwen4_exp",
+            ),
+            model="Qwen/Qwen3.8-Flash-Next-FP8",
+        )
