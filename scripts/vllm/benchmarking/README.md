@@ -75,15 +75,38 @@ python3 scripts/vllm/benchmarking/check_regression.py \
   --baseline scripts/vllm/benchmarking/baselines/perf/<config>.baseline.json
 ```
 
-#### Roofline reporting (`--roofline-targets`)
+#### Roofline report (`--roofline-targets`)
 
-Pass `--roofline-targets` and `--config-name` in `--mode perf` to report
-physical-chip output throughput against `baselines/perf/roofline_targets.json`.
-State the physical chip count with `--chips <N>`, or `--prefill-chips <P>` and
-`--decode-chips <D>` for disaggregated serving; when omitted, the config's
-modeled `num_chips` is used. Entries with `status == "unverified"` are marked
-in the table, configs listed under `not_modeled` print a note, and the check is
-advisory (`exit 0`).
+`baselines/perf/roofline_targets.json` holds modeled output throughput per
+physical chip. Its `targets` map has one entry per modeled config: the
+`num_chips` it was modeled on, and for each cell an
+`output_token_throughput_per_chip` and a `status` (`ok`, `unverified` or `oom`;
+`ok` when absent). Its `not_modeled` map names the configs that the model does
+not cover, each with a `reason` and a `detail`. The other fields describe the
+model run and are not read.
+
+Pass `--roofline-targets <file>` and `--config-name <config>` in perf check mode
+to print each measured cell as a percentage of its target. `--baseline` is then
+optional, so one run can check the baseline, print the report, or do both. The
+report is advisory: a ratio never changes the exit code.
+
+- The measured value is the cell's `output_throughput` divided by the physical
+  chip count. That count is `--chips <N>`, or `--prefill-chips <P>` plus
+  `--decode-chips <D>` for disaggregated serving, or else the config's
+  `num_chips`.
+- A cell whose target has `status` `unverified` is marked
+  `ADVISORY (unverified)`.
+- A measured cell is listed as `SKIP` when the config has no target for it,
+  when its target has `status` `oom`, or when its result has no
+  `output_throughput`. A target cell that was not measured is not listed.
+- A config under `not_modeled` prints its reason instead of a table. Such a
+  run needs no result files unless `--baseline` is also given.
+
+The run exits `2` when the targets file is malformed, when the config is in
+neither map, when a chip flag is invalid, or when no chip count is known.
+`--roofline-targets` needs `--config-name`, and `--config-name` and the chip
+flags need `--roofline-targets`. All five flags are usage errors outside perf
+check mode.
 
 ```bash
 python3 scripts/vllm/benchmarking/check_regression.py \

@@ -16,6 +16,7 @@
 
 Usage:
     check_regression.py --mode <perf|eval> --results-dir <dir> --baseline <baseline.json> [--tolerance 0.05]
+    check_regression.py --mode perf --results-dir <dir> --roofline-targets <targets.json> --config-name <config> [--chips <N>]
     check_regression.py --mode <perf|eval> --calibrate --results-dir <dir> [<dir2> ...]
     check_regression.py --mode update --baseline <new.json> [--previous-baseline <old.json>]
 """  # noqa: E501
@@ -197,7 +198,7 @@ ROOFLINE_CELL_STATUSES = ("ok", "unverified", "oom")
 
 class RooflineCellTarget(NamedTuple):
     output_token_throughput_per_chip: float
-    status: str = "ok"
+    status: str
 
 
 class RooflineConfigTarget(NamedTuple):
@@ -215,26 +216,6 @@ class RooflineTargets(NamedTuple):
     not_modeled: dict[str, NotModeledEntry]
 
 
-class RooflineRow(NamedTuple):
-    cell: str
-    metric: str
-    actual_per_chip: float
-    target_per_chip: float
-    ratio: float
-    target_status: str
-    status: str
-
-
-@dataclasses.dataclass(frozen=True)
-class RooflineCheckResult:
-    """Advisory % of roofline report for one config."""
-
-    config_name: str
-    num_chips: int | None
-    rows: list[RooflineRow]
-    not_modeled: NotModeledEntry | None = None
-
-
 def _finite_number(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -249,17 +230,15 @@ def _positive_int(value: Any, name: str) -> int:
 
 
 def resolve_physical_chips(
-    chips: int | None = None,
-    prefill_chips: int | None = None,
-    decode_chips: int | None = None,
+    chips: int | None, prefill_chips: int | None, decode_chips: int | None
 ) -> int | None:
-    """Resolve total physical chips from single-pool or disaggregated flags."""
+    """Total physical chips from --chips or --prefill-chips plus --decode-chips."""
     if chips is not None:
-        _positive_int(chips, "chips")
+        _positive_int(chips, "--chips")
     if prefill_chips is not None:
-        _positive_int(prefill_chips, "prefill_chips")
+        _positive_int(prefill_chips, "--prefill-chips")
     if decode_chips is not None:
-        _positive_int(decode_chips, "decode_chips")
+        _positive_int(decode_chips, "--decode-chips")
     if (prefill_chips is None) != (decode_chips is None):
         raise ValueError("--prefill-chips and --decode-chips must be provided together")
     if chips is not None and prefill_chips is not None:
@@ -330,94 +309,38 @@ def load_roofline_targets(path: Path) -> RooflineTargets:
 
 def check_roofline(
     results: dict[str, dict],
-    roofline_targets: RooflineTargets,
+    cells: dict[str, RooflineCellTarget],
     config_name: str,
-    chips: int | None = None,
-) -> RooflineCheckResult:
-    """Compare measured output throughput per physical chip against roofline."""
-    if config_name in roofline_targets.not_modeled:
-        note = roofline_targets.not_modeled[config_name]
-        print(f"\n## Roofline speed check (`{config_name}`: not modeled)\n")
-        print(
-            f"NOTE: `{config_name}` is not modeled in roofline targets "
-            f"({note.reason}: {note.detail})\n"
-        )
-        return RooflineCheckResult(config_name, chips, [], not_modeled=note)
-
-    config_target = roofline_targets.targets[config_name]
-    num_chips = chips if chips is not None else config_target.num_chips
-    if num_chips is None or num_chips <= 0:
-        raise ValueError(f"chip count required for roofline check of {config_name!r}")
-
-    rows: list[RooflineRow] = []
-    for key in sorted(results):
-        if key not in config_target.cells:
-            rows.append(
-                RooflineRow(key, "(no roofline cell)", 0.0, 0.0, 0.0, "", "SKIP")
-            )
-            continue
-        cell_target = config_target.cells[key]
-        raw_tput = _finite_number(results[key].get("output_throughput"))
-        if cell_target.status == "oom":
-            skip = "SKIP (oom)"
-            rows.append(
-                RooflineRow(
-                    key,
-                    "output_token_throughput_per_chip",
-                    0.0,
-                    cell_target.output_token_throughput_per_chip,
-                    0.0,
-                    cell_target.status,
-                    skip,
-                )
-            )
-            continue
-        if raw_tput is None or raw_tput < 0:
-            rows.append(
-                RooflineRow(
-                    key,
-                    "output_token_throughput_per_chip",
-                    0.0,
-                    cell_target.output_token_throughput_per_chip,
-                    0.0,
-                    cell_target.status,
-                    "SKIP",
-                )
-            )
-            continue
-        actual_per_chip = raw_tput / num_chips
-        ratio = actual_per_chip / cell_target.output_token_throughput_per_chip
-        status = (
-            "ADVISORY (unverified)"
-            if cell_target.status == "unverified"
-            else "ADVISORY"
-        )
-        rows.append(
-            RooflineRow(
-                key,
-                "output_token_throughput_per_chip",
-                actual_per_chip,
-                cell_target.output_token_throughput_per_chip,
-                ratio,
-                cell_target.status,
-                status,
-            )
-        )
-
+    num_chips: int,
+) -> None:
+    """Print each measured cell's output throughput per chip as % of roofline."""
     print(
         f"\n## Roofline speed check (`{config_name}`, "
         f"{num_chips} physical chips, advisory)\n"
     )
     print("| key | metric | actual/chip | roofline/chip | % of roofline | status |")
     print("|---|---|---:|---:|---:|---|")
-    for row in rows:
-        pct = "-" if row.status.startswith("SKIP") else f"{row.ratio * 100:.2f}%"
+    for key in sorted(results):
+        if key not in cells:
+            print(f"| `{key}` | (no roofline cell) | 0.00 | 0.00 | - | SKIP |")
+            continue
+        cell = cells[key]
+        measured = _finite_number(results[key].get("output_throughput"))
+        actual, pct = 0.0, "-"
+        if cell.status == "oom":
+            status = "SKIP (oom)"
+        elif measured is None:
+            status = "SKIP"
+        else:
+            actual = measured / num_chips
+            pct = f"{actual / cell.output_token_throughput_per_chip * 100:.2f}%"
+            unverified = cell.status == "unverified"
+            status = "ADVISORY (unverified)" if unverified else "ADVISORY"
         print(
-            f"| `{row.cell}` | {row.metric} | {row.actual_per_chip:.2f} | "
-            f"{row.target_per_chip:.2f} | {pct} | {row.status} |"
+            f"| `{key}` | output_token_throughput_per_chip | {actual:.2f} | "
+            f"{cell.output_token_throughput_per_chip:.2f} | {pct} | {status} |"
         )
     print()
-    return RooflineCheckResult(config_name, num_chips, rows)
 
 
 def calibrate_perf(
@@ -884,25 +807,27 @@ def main() -> int:
     )
     parser.add_argument(
         "--config-name",
-        help="Perf mode: config stem to look up in --roofline-targets.",
+        help="The config to look up in --roofline-targets.",
     )
     parser.add_argument(
         "--chips",
         type=int,
         default=None,
-        help="Perf mode: total physical accelerator chips serving the run.",
+        help="Physical chips serving the run, for --roofline-targets. "
+        "Default: the config's num_chips in that file.",
     )
     parser.add_argument(
         "--prefill-chips",
         type=int,
         default=None,
-        help="Perf mode: physical prefill chips in a disaggregated run.",
+        help="Physical prefill chips of a disaggregated run; give it with "
+        "--decode-chips instead of --chips.",
     )
     parser.add_argument(
         "--decode-chips",
         type=int,
         default=None,
-        help="Perf mode: physical decode chips in a disaggregated run.",
+        help="Physical decode chips of a disaggregated run.",
     )
     args = parser.parse_args()
 
@@ -1008,35 +933,48 @@ def main() -> int:
         print("PASS: all evaluated tasks within tolerance.")
         return 0
 
-    if args.roofline_targets is not None and not args.config_name:
+    if args.roofline_targets is None:
+        for flag, value in (
+            ("--config-name", args.config_name),
+            ("--chips", args.chips),
+            ("--prefill-chips", args.prefill_chips),
+            ("--decode-chips", args.decode_chips),
+        ):
+            if value is not None:
+                parser.error(f"{flag} requires --roofline-targets")
+    elif not args.config_name:
         parser.error("--config-name is required with --roofline-targets")
 
-    try:
-        chips = resolve_physical_chips(
-            args.chips, args.prefill_chips, args.decode_chips
-        )
-        roofline_db = (
-            load_roofline_targets(args.roofline_targets)
-            if args.roofline_targets is not None
-            else None
-        )
-        if (
-            roofline_db is not None
-            and args.config_name not in roofline_db.targets
-            and args.config_name not in roofline_db.not_modeled
-        ):
-            raise ValueError(
-                f"config {args.config_name!r} not found in roofline targets"
+    cells = None
+    not_modeled = None
+    num_chips = None
+    if args.roofline_targets is not None:
+        try:
+            chips = resolve_physical_chips(
+                args.chips, args.prefill_chips, args.decode_chips
             )
-    except ValueError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 2
+            roofline = load_roofline_targets(args.roofline_targets)
+            not_modeled = roofline.not_modeled.get(args.config_name)
+            if not_modeled is None:
+                if args.config_name not in roofline.targets:
+                    raise ValueError(
+                        f"config {args.config_name!r} not found in roofline targets"
+                    )
+                target = roofline.targets[args.config_name]
+                cells = target.cells
+                num_chips = chips if chips is not None else target.num_chips
+                if num_chips is None:
+                    raise ValueError(
+                        f"chip count required for roofline check of "
+                        f"{args.config_name!r}"
+                    )
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
 
-    roofline_not_modeled = (
-        roofline_db is not None and args.config_name in roofline_db.not_modeled
-    )
     results = load_perf_results(args.results_dir[0])
-    if not results and (args.baseline is not None or not roofline_not_modeled):
+    # A config that is not modeled only prints a note, which needs no results.
+    if not results and (args.baseline is not None or cells is not None):
         print(
             f"ERROR: no isl*_osl*_c*.json files found in {args.results_dir[0]}",
             file=sys.stderr,
@@ -1049,12 +987,14 @@ def main() -> int:
             baseline = json.load(fh)
         perf_failed = check_perf(results, gated_entries(baseline), tolerance)
 
-    if roofline_db is not None:
-        try:
-            check_roofline(results, roofline_db, args.config_name, chips=chips)
-        except ValueError as e:
-            print(f"ERROR: {e}", file=sys.stderr)
-            return 2
+    if not_modeled is not None:
+        print(f"\n## Roofline speed check (`{args.config_name}`: not modeled)\n")
+        print(
+            f"NOTE: `{args.config_name}` is not modeled in roofline targets "
+            f"({not_modeled.reason}: {not_modeled.detail})\n"
+        )
+    elif cells is not None:
+        check_roofline(results, cells, args.config_name, num_chips)
 
     if perf_failed:
         print(
