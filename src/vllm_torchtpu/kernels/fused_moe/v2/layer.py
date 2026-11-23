@@ -69,7 +69,9 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     build_combine_kernel,
     build_fused_ep_moe_kernel,
     build_slab_run_copy,
+    combine_prefetch_bytes,
     combine_step_tokens,
+    combine_tables_fit,
     rowquant_fp8,
     scale_slab_fits,
     slab_run_copy_pays,
@@ -115,7 +117,14 @@ def _row_routes(scores, gate_l):
 
 
 def _combine_arrivals(
-    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+    arrivals,
+    arrival_scales,
+    pos,
+    mirror_pos,
+    topk_weights,
+    out_dtype,
+    *,
+    use_kernel: bool | None = None,
 ):
     """Combine arrivals [rows, lane blocks, 128] into [t_local, hidden].
 
@@ -127,12 +136,13 @@ def _combine_arrivals(
     written in it -- so a whole source TILE's scales are one sublane and the
     mirror position is NOT the arrival row.
 
-    Where the kernel path applies (kernel.combine_step_tokens) the row gather
-    and the weighted sum are one Mosaic call: XLA answers `arrivals[rows]`
-    with a SparseCore gather whose output is in HBM at any size, so the rows
-    are written out and read straight back before the sum sees them.
-    Everywhere else the gather is not offloaded and there is no round trip to
-    remove, so the fused XLA epilogue below stays.
+    Where the kernel path applies (kernel.combine_step_tokens and
+    kernel.combine_tables_fit) the row gather and the weighted sum are one
+    Mosaic call: XLA answers `arrivals[rows]` with a SparseCore gather whose
+    output is in HBM at any size, so the rows are written out and read straight
+    back before the sum sees them. Everywhere else -- below the minimum token
+    threshold or when the scalar-prefetched `pos` and `coef` tables exceed the
+    SMEM budget -- the fused XLA epilogue below stays.
 
     Both paths fold the arrival row's scale and the router weight into one
     coefficient over K * t_local values, so each of the K * t_local * hidden
@@ -150,7 +160,11 @@ def _combine_arrivals(
     scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
     row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
     coef = row_scales * topk_weights.astype(jnp.float32)
-    if combine_step_tokens(t_local):
+    if use_kernel is None:
+        use_kernel = bool(
+            combine_step_tokens(t_local) and combine_tables_fit(t_local, topk)
+        )
+    if use_kernel:
         combine = build_combine_kernel(
             t_local=t_local,
             topk=topk,
@@ -597,6 +611,17 @@ def fused_ep_moe_v2(
             ),
             "set" if slab_by_set else "add",
         )
+    combine_has_step = stage != "route" and bool(combine_step_tokens(t_local))
+    combine_by_kernel = bool(combine_has_step and combine_tables_fit(t_local, topk))
+    if combine_has_step and not combine_by_kernel:
+        logger.info_once(
+            "fused_ep_moe_v2: combine kernel scalar prefetch (%d bytes for "
+            "t_local=%d, topk=%d) exceeds SMEM budget; using XLA combine "
+            "epilogue",
+            combine_prefetch_bytes(t_local, topk),
+            t_local,
+            topk,
+        )
 
     layout = _exchange_layout(
         t_local, topk, e_total, form.quantized_activations, per_pair=tables_by_run_copy
@@ -1026,7 +1051,13 @@ def fused_ep_moe_v2(
             )
         )
         combined = _combine_arrivals(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+            arrivals,
+            arrival_scales,
+            pos,
+            mirror_pos,
+            topk_weights,
+            out_dtype,
+            use_kernel=combine_by_kernel,
         )
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
@@ -1192,6 +1223,7 @@ def fused_ep_moe_v2(
         scale_by_lookup,
         gather_by_sort,
         tables_by_run_copy,
+        combine_by_kernel,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),
