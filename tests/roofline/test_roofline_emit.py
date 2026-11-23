@@ -38,9 +38,12 @@ from vllm_torchtpu.roofline import (
     cli,
     emit_ceiling_rows,
     emit_launch_args,
+    format_parallelism,
+    format_submodule_parallelism,
     from_hf_config,
     point_launch_args,
     pool_cli_args,
+    pool_label,
     solve_serving_plan,
     top_layouts,
 )
@@ -1171,3 +1174,58 @@ def test_solve_payload_preserves_pd_ratio_and_partial_pins() -> None:
         and pt.decode_pool.instances == 1
         for pt in ratio_only_plan.candidates
     )
+
+
+def test_pool_label_joins_axes_with_x_and_omits_ones() -> None:
+    """Verify format_parallelism and pool_label omit size-1 axes and join with x."""
+    sample_pool = {
+        "instances": 1,
+        "topology": "2x2x1",
+        "chips_per_instance": 4,
+        "tp": 8,
+        "dp": 1,
+        "ep": 8,
+        "pp": 1,
+        "pcp": 1,
+        "kv_split": 4,
+    }
+    assert format_parallelism(sample_pool) == "TP8 x EP8 x DCP4"
+    label = pool_label(sample_pool)
+    assert label.endswith(": TP8 x EP8 x DCP4")
+
+    all_one_pool = {
+        "instances": 1,
+        "topology": "1x1x1",
+        "chips_per_instance": 1,
+        "tp": 1,
+        "dp": 1,
+        "ep": 1,
+        "pp": 1,
+        "pcp": 1,
+        "kv_split": 1,
+    }
+    assert format_parallelism(all_one_pool) == "TP1"
+
+
+def test_format_submodule_parallelism_splits_attn_and_moe() -> None:
+    """format_submodule_parallelism separates Attention, PP, and MoE sharding."""
+    pcp_ep_pool = {"tp": 1, "dp": 1, "ep": 8, "pp": 1, "pcp": 8, "kv_split": 1}
+    assert (
+        format_submodule_parallelism(pcp_ep_pool, has_moe=True)
+        == "Attn: PCP8 · MoE: EP8"
+    )
+
+    tp_sliced_pool = {"tp": 8, "dp": 1, "ep": 1, "pp": 1, "pcp": 1, "kv_split": 4}
+    assert (
+        format_submodule_parallelism(tp_sliced_pool, has_moe=True)
+        == "Attn: TP8 x DCP4 · MoE: TP8"
+    )
+
+    pp_pcp_ep_pool = {"tp": 1, "dp": 1, "ep": 2, "pp": 4, "pcp": 2, "kv_split": 1}
+    assert (
+        format_submodule_parallelism(pp_pcp_ep_pool, has_moe=True)
+        == "PP4 · Attn: PCP2 · MoE: EP2"
+    )
+
+    dense_tp_pool = {"tp": 8, "dp": 1, "ep": 1, "pp": 1, "pcp": 1, "kv_split": 1}
+    assert format_submodule_parallelism(dense_tp_pool, has_moe=False) == "TP8"

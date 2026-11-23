@@ -19,6 +19,7 @@ import argparse
 import json
 import sys
 from dataclasses import asdict, replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .chips import CHIPS, ChipSpec, SliceTopology, load_chip_spec
@@ -45,6 +46,7 @@ from .emit import (
 from .geometry import UnsupportedArchitectureError, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config_with_identity
 from .modules import Dtypes, Parallel, StepShape
+from .report import write_html
 from .serving import ServingRequest, plan
 from .solver import (
     EXAMPLE_SCENARIOS,
@@ -178,6 +180,12 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_scenario_args(p_solve)
+    p_solve.add_argument(
+        "--html",
+        type=Path,
+        default=None,
+        help="Write an offline HTML report to PATH.",
+    )
 
     p_emit = sub.add_parser(
         "emit",
@@ -356,8 +364,18 @@ def _dispatch_solve(
         return _dispatch_ceiling(args, splan)
     if args.cmd == "emit":
         return _dispatch_emit(args, splan, dt_resolved, chip)
+    src = args.model if args.model is not None else (model_ref or args.config)
+    if args.html is not None:
+        payload_html = build_solve_payload(
+            splan,
+            chip=chip,
+            dtypes=dt_resolved,
+            model=src,
+            top_k=args.top_k,
+            topologies=custom_topos,
+        )
+        write_html(payload_html, args.html)
     if args.json:
-        src = args.model if args.model is not None else (model_ref or args.config)
         payload = build_solve_payload(
             splan,
             chip=chip,

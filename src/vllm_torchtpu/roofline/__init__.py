@@ -23,6 +23,7 @@ from .chips import (
     ChipOverrides,
     ChipSpec,
     SliceTopology,
+    count_hosts,
     load_chip_spec,
     register_chip,
     topologies_for_chip,
@@ -38,6 +39,7 @@ from .constants import (
     FRONTIER_2D_TIE_TOLERANCE,
     HF_REPO_TO_CANONICAL_ID,
     INSPECT_SCHEMA,
+    MAX_EMBEDDED_CANDIDATES,
     SLO_VERDICT_ESTIMATE_MEETS,
     SLO_VERDICT_RANK,
     SLO_VERDICT_RULED_OUT,
@@ -117,6 +119,7 @@ from .occupancy import (
     min_experts_per_ep_shard,
     parse_activation_spec,
 )
+from .report import render_html, write_html
 from .schema import (
     FloorTimes,
     ParetoPoint,
@@ -151,6 +154,7 @@ __all__ = [
     "FRONTIER_2D_TIE_TOLERANCE",
     "HF_REPO_TO_CANONICAL_ID",
     "INSPECT_SCHEMA",
+    "MAX_EMBEDDED_CANDIDATES",
     "SLO_VERDICT_ESTIMATE_MEETS",
     "SLO_VERDICT_RANK",
     "SLO_VERDICT_RULED_OUT",
@@ -210,6 +214,7 @@ __all__ = [
     "build_example_scenario",
     "build_solve_payload",
     "classify_multihost_mp_mode",
+    "count_hosts",
     "count_layer_types",
     "default_rpa_page_size",
     "dsa_indexer_layer_weight_elems",
@@ -238,6 +243,7 @@ __all__ = [
     "pool_slice_summary",
     "pp_stage_layer_scale",
     "register_chip",
+    "render_html",
     "resolve_model_identity",
     "solve_serving_plan",
     "spec_cycle_floor",
@@ -247,4 +253,5 @@ __all__ = [
     "topologies_for_chip",
     "torus_collective_s",
     "tpu_min_page_size",
+    "write_html",
 ]
