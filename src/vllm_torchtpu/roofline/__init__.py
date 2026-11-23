@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU roofline serving, memory, collective, and execution modeling."""
+"""Analytical TPU serving roofline, step floor, and mesh solver."""
 
 from __future__ import annotations
 
@@ -52,10 +52,24 @@ from .geometry import (
     resolve_model_identity,
 )
 from .hf_loader import (
+    ConfigAudit,
     apply_hf_overrides,
+    audit_hf_config,
     dtypes_from_hf_config,
     load_hf_config,
     load_hf_config_with_identity,
+)
+from .memory import (
+    HbmBreakdown,
+    KvFitInput,
+    ParamBreakdown,
+    SeqKvLayout,
+    default_rpa_page_size,
+    hbm_breakdown_per_core_bytes,
+    hbm_footprint_per_core_bytes,
+    param_counts,
+    pp_stage_layer_scale,
+    tpu_min_page_size,
 )
 from .modules import (
     Dtypes,
@@ -76,6 +90,18 @@ from .occupancy import (
     parse_activation_spec,
 )
 from .serving import ConcurrencyRow, ServingRequest, plan
+from .solver import (
+    EXAMPLE_SCENARIOS,
+    ParetoPoint,
+    PoolMeshPlan,
+    ScenarioOverrides,
+    ServingPlan,
+    SolveOptions,
+    TrafficScenario,
+    build_example_scenario,
+    classify_multihost_mp_mode,
+    solve_serving_plan,
+)
 from .step import (
     FloorOptions,
     SpecShape,
@@ -89,6 +115,7 @@ __all__ = [
     "BENIGN_HF_METADATA_KEYS",
     "CHIPS",
     "CHIP_TOPOLOGIES",
+    "EXAMPLE_SCENARIOS",
     "HF_REPO_TO_CANONICAL_ID",
     "INSPECT_SCHEMA",
     "SUPPORTED_CHIPS",
@@ -101,42 +128,63 @@ __all__ = [
     "Collective",
     "CollectiveConfig",
     "ConcurrencyRow",
+    "ConfigAudit",
     "Dtypes",
     "ExpertActivationModel",
     "ExpertDispatch",
     "FloorOptions",
+    "HbmBreakdown",
     "KeyTracker",
+    "KvFitInput",
     "LayerCounts",
     "ModelGeometry",
     "ModelIdentity",
     "ModelSpec",
     "ModuleCost",
     "Parallel",
+    "ParamBreakdown",
+    "ParetoPoint",
+    "PoolMeshPlan",
+    "ScenarioOverrides",
+    "SeqKvLayout",
+    "ServingPlan",
     "ServingRequest",
     "SliceTopology",
+    "SolveOptions",
     "SpecShape",
     "StepFloor",
     "StepShape",
+    "TrafficScenario",
     "active_experts_envelope",
     "aligned_moe_tp_shard_width",
     "apply_hf_overrides",
+    "audit_hf_config",
     "bernoulli_expected_experts",
+    "build_example_scenario",
+    "classify_multihost_mp_mode",
     "count_layer_types",
+    "default_rpa_page_size",
     "dsa_indexer_layer_weight_elems",
     "dtypes_from_hf_config",
     "from_hf_config",
+    "hbm_breakdown_per_core_bytes",
+    "hbm_footprint_per_core_bytes",
     "load_activation_hull",
     "load_chip_spec",
     "load_hf_config",
     "load_hf_config_with_identity",
     "min_experts_per_ep_shard",
+    "param_counts",
     "parse_activation_spec",
     "pass_costs",
     "plan",
+    "pp_stage_layer_scale",
     "register_chip",
     "resolve_model_identity",
+    "solve_serving_plan",
     "spec_cycle_floor",
     "step_floor",
     "topologies_for_chip",
     "torus_collective_s",
+    "tpu_min_page_size",
 ]
