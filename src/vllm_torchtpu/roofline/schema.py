@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
 
 from .chips import count_hosts
@@ -23,12 +23,14 @@ from .constants import (
     DEFAULT_CHIPS_PER_HOST,
     DEFAULT_CORES_PER_CHIP,
     DEFAULT_GPU_MEMORY_UTILIZATION,
+    DEFAULT_HBM_RESERVE_GB,
     DEFAULT_PREFILL_CHUNK,
     SLO_VERDICT_ESTIMATE_MEETS,
     SLO_VERDICT_RULED_OUT,
     TOPOLOGY_AXES,
     SloVerdict,
 )
+from .occupancy import ExpertActivationModel
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -135,6 +137,10 @@ class FloorTimes:
     hop_latency_ms: float
     hard_floor_ms: float
     binding: str
+    hbm_bound_ms: float = 0.0
+    matmul_bound_ms: float = 0.0
+    vector_bound_ms: float = 0.0
+    coll_bound_ms: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +152,8 @@ class SearchStats:
     slo_met: int
     frontier: int
     core_grid: int = 0
+    not_ruled_out: int = 0
+    envelope_feasible: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,33 +190,25 @@ class ParetoPoint:
     total_chips: int
     prefill_pool: PoolMeshPlan | None
     decode_pool: PoolMeshPlan
-    p90_ttft_ms: float
-    p90_tpot_ms: float
-    p90_interactivity_tok_s: float
+    est_ttft_ms: float
+    est_tpot_ms: float
+    est_interactivity_tok_s: float
     output_throughput_per_chip: float
     token_throughput_per_chip: float
     p_mixed: float
     binding: str
     slo_met: bool
-    slo_verdict: SloVerdict | None = None
+    bound_tpot_ms: float = 0.0
+    bound_ttft_ms: float = 0.0
+    slo_verdict: SloVerdict = SLO_VERDICT_ESTIMATE_MEETS
     decode_floor: FloorTimes | None = None
     kv_cache_capacity_tokens: int | None = None
     effective_prefix_hit_rate: float | None = None
-
-    @property
-    def est_ttft_ms(self) -> float:
-        """Compatibility property for p90_ttft_ms."""
-        return self.p90_ttft_ms
-
-    @property
-    def est_tpot_ms(self) -> float:
-        """Compatibility property for p90_tpot_ms."""
-        return self.p90_tpot_ms
-
-    @property
-    def est_interactivity_tok_s(self) -> float:
-        """Compatibility property for p90_interactivity_tok_s."""
-        return self.p90_interactivity_tok_s
+    min_decode_seqs: float = 0.0
+    floor_throughput_per_chip: float = 0.0
+    envelope_tpot_ms: float = 0.0
+    envelope_ttft_ms: float = 0.0
+    envelope_decode_seqs: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +226,9 @@ class ServingPlan:
     gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION
     collective_latency_s: float = 0.0
     spec_k: int = 0
+    spec_tokens: int = 0
+    mtp_layers: int = 0
+    hbm_reserve_gb: float = DEFAULT_HBM_RESERVE_GB
     model_id: str = ""
     search: SearchStats | None = None
     has_moe: bool = False
@@ -233,6 +236,9 @@ class ServingPlan:
     budget_source: str = "flag"
     max_instances: int | None = None
     pins: dict[str, object] | None = None
+    activation_model: ExpertActivationModel = field(
+        default_factory=ExpertActivationModel
+    )
 
 
 class PointLaunchPayload(TypedDict):
@@ -315,15 +321,18 @@ class SolvePayload(TypedDict):
 class CeilingRow(TypedDict):
     """Single uncalibrated L1 candidate row exported by ``emit_ceiling_rows``."""
 
-    p90_interactivity_tok_s: float
+    est_interactivity_tok_s: float
     token_throughput_per_chip: float
     output_throughput_per_chip: float
-    p90_ttft_ms: float
-    p90_tpot_ms: float
+    est_ttft_ms: float
+    est_tpot_ms: float
+    bound_tpot_ms: float
     concurrency: int
     total_chips: int
     mode: str
     binding_unit: str
+    min_decode_seqs: float
+    floor_throughput_per_chip: float
 
 
 type PoolStructKey = tuple[str, int, int, int, int, int, int]

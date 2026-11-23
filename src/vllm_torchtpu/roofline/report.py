@@ -864,11 +864,13 @@ def _extract_recommended_view(
     chip: ChipSpec | None = None,
 ) -> tuple[dict[str, object], list[Mapping[str, object]], str]:
     """Extract display metrics, instance pools, and summary for recommended."""
-    if (
-        rec is not None
-        and rec.get("slo_verdict") != SLO_VERDICT_RULED_OUT
-        and bool(rec.get("slo_met", True))
-    ):
+    rec_verdict = rec.get("slo_verdict") if rec is not None else None
+    rec_feasible = rec is not None and (
+        rec_verdict != SLO_VERDICT_RULED_OUT
+        if rec_verdict is not None
+        else bool(rec.get("slo_met", True))
+    )
+    if rec is not None and rec_feasible:
         pools_list: list[Mapping[str, object]] = []
         p_pool = _as_mapping(rec.get("prefill_pool"))
         d_pool = _as_mapping(rec.get("decode_pool"))
@@ -1966,9 +1968,11 @@ def render_html(payload: Mapping[str, object]) -> str:
     infeasible_msg = (
         "No candidate layout met latency SLOs; recommended layout is infeasible."
     )
+    top_verdict = rec.get("slo_verdict") if rec is not None else None
     rec_infeasible = rec is None or (
-        rec.get("slo_verdict") == SLO_VERDICT_RULED_OUT
-        or not bool(rec.get("slo_met", True))
+        top_verdict == SLO_VERDICT_RULED_OUT
+        if top_verdict is not None
+        else not bool(rec.get("slo_met", True))
     )
     if rec_infeasible and infeasible_msg not in warnings:
         warnings.append(infeasible_msg)

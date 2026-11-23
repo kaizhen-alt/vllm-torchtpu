@@ -66,16 +66,17 @@ def strict_rank(
     return 1 + sum(1 for other in values if other > value)
 
 
-def _point_tpot_floor_ms(point: ParetoPoint) -> float:
-    """Return decode TPOT lower bound (ms) available on a candidate point."""
-    if point.decode_floor is not None:
-        return point.decode_floor.hard_floor_ms
-    return point.p90_tpot_ms
+@dataclass(frozen=True, slots=True)
+class _SkylineFillConfig:
+    """Slot limit and TPOT lower-bound selector for skyline filling."""
+
+    max_slots: int
+    use_envelope: bool
 
 
-def _point_ttft_floor_ms(point: ParetoPoint) -> float:
-    """Return prefill TTFT reference time (ms) available on a candidate point."""
-    return point.p90_ttft_ms
+def _skyline_tpot_floor(point: ParetoPoint, *, use_envelope: bool) -> float:
+    """Return active TPOT lower bound used consistently across skyline orderings."""
+    return point.envelope_tpot_ms if use_envelope else point.bound_tpot_ms
 
 
 def _pool_mesh_family(pool: PoolMeshPlan | None) -> tuple[object, ...] | None:
@@ -127,15 +128,15 @@ def _decode_group_key(
 
 
 def _skyline_preference(
-    point: ParetoPoint,
+    point: ParetoPoint, *, use_envelope: bool = False
 ) -> tuple[bool, bool, float, float, float]:
     """Order candidate variants within one mesh family by verdict and 3 objectives."""
     return (
         point.slo_met,
         effective_slo_verdict(point) != SLO_VERDICT_RULED_OUT,
-        -_point_tpot_floor_ms(point),
+        -_skyline_tpot_floor(point, use_envelope=use_envelope),
         point.token_throughput_per_chip,
-        point.p90_interactivity_tok_s,
+        point.est_interactivity_tok_s,
     )
 
 
@@ -144,20 +145,20 @@ def _fill_skyline_slots(
     chosen_keys: set[tuple[object, ...]],
     candidates: Sequence[ParetoPoint],
     key_fn: Callable[[ParetoPoint], tuple[object, ...]],
-    max_slots: int,
+    config: _SkylineFillConfig,
 ) -> None:
     """Fill remaining skyline slots up to max_slots without duplicating keys."""
     ordered = sorted(
         (pt for pt in candidates if key_fn(pt) not in chosen_keys),
         key=lambda pt: (
             not pt.slo_met,
-            _point_tpot_floor_ms(pt),
+            _skyline_tpot_floor(pt, use_envelope=config.use_envelope),
             -pt.token_throughput_per_chip,
-            -pt.p90_interactivity_tok_s,
+            -pt.est_interactivity_tok_s,
         ),
     )
     for point in ordered:
-        if len(selected) >= max_slots:
+        if len(selected) >= config.max_slots:
             break
         selected.append(point)
         chosen_keys.add(key_fn(point))
@@ -166,20 +167,26 @@ def _fill_skyline_slots(
 def _select_concurrency_skyline(
     points: Sequence[ParetoPoint],
     k: int,
+    *,
+    use_envelope: bool = False,
 ) -> tuple[ParetoPoint, ...]:
     """Select up to k 3-objective Pareto skyline points at one concurrency."""
     best_by_pair: dict[tuple[object, ...], ParetoPoint] = {}
     for point in points:
         pair_key = _pair_family_key(point)
         current = best_by_pair.get(pair_key)
-        if current is None or _skyline_preference(point) > _skyline_preference(current):
+        if current is None or _skyline_preference(
+            point, use_envelope=use_envelope
+        ) > _skyline_preference(current, use_envelope=use_envelope):
             best_by_pair[pair_key] = point
 
     best_by_group: dict[tuple[object, ...], ParetoPoint] = {}
     for point in best_by_pair.values():
         group_key = _decode_group_key(point)
         current = best_by_group.get(group_key)
-        if current is None or _skyline_preference(point) > _skyline_preference(current):
+        if current is None or _skyline_preference(
+            point, use_envelope=use_envelope
+        ) > _skyline_preference(current, use_envelope=use_envelope):
             best_by_group[group_key] = point
 
     group_pool = list(best_by_group.values())
@@ -188,9 +195,9 @@ def _select_concurrency_skyline(
             group_pool,
             key=lambda pt: (
                 not pt.slo_met,
-                _point_tpot_floor_ms(pt),
+                _skyline_tpot_floor(pt, use_envelope=use_envelope),
                 -pt.token_throughput_per_chip,
-                -pt.p90_interactivity_tok_s,
+                -pt.est_interactivity_tok_s,
             ),
         ),
         max(
@@ -198,16 +205,16 @@ def _select_concurrency_skyline(
             key=lambda pt: (
                 pt.slo_met,
                 pt.token_throughput_per_chip,
-                -_point_tpot_floor_ms(pt),
-                pt.p90_interactivity_tok_s,
+                -_skyline_tpot_floor(pt, use_envelope=use_envelope),
+                pt.est_interactivity_tok_s,
             ),
         ),
         max(
             group_pool,
             key=lambda pt: (
                 pt.slo_met,
-                pt.p90_interactivity_tok_s,
-                -_point_tpot_floor_ms(pt),
+                pt.est_interactivity_tok_s,
+                -_skyline_tpot_floor(pt, use_envelope=use_envelope),
                 pt.token_throughput_per_chip,
             ),
         ),
@@ -223,7 +230,10 @@ def _select_concurrency_skyline(
             selected.append(anchor)
             chosen_groups.add(group_key)
 
-    _fill_skyline_slots(selected, chosen_groups, group_pool, _decode_group_key, k)
+    fill_cfg = _SkylineFillConfig(max_slots=k, use_envelope=use_envelope)
+    _fill_skyline_slots(
+        selected, chosen_groups, group_pool, _decode_group_key, fill_cfg
+    )
     if len(selected) < k:
         chosen_pairs: set[tuple[object, ...]] = {
             _pair_family_key(pt) for pt in selected
@@ -233,14 +243,14 @@ def _select_concurrency_skyline(
             chosen_pairs,
             list(best_by_pair.values()),
             _pair_family_key,
-            k,
+            fill_cfg,
         )
 
     selected.sort(
         key=lambda pt: (
             -pt.token_throughput_per_chip,
-            _point_tpot_floor_ms(pt),
-            -pt.p90_interactivity_tok_s,
+            _skyline_tpot_floor(pt, use_envelope=use_envelope),
+            -pt.est_interactivity_tok_s,
         )
     )
     return tuple(selected)
@@ -265,7 +275,11 @@ def pareto_skyline_by_concurrency(
             if effective_slo_verdict(pt) != SLO_VERDICT_RULED_OUT
         ]
         pool = not_ruled_out if not_ruled_out else conc_points
-        result[concurrency] = _select_concurrency_skyline(pool, k)
+        result[concurrency] = _select_concurrency_skyline(
+            pool,
+            k,
+            use_envelope=plan.activation_model.prunes_on_envelope,
+        )
     return result
 
 
@@ -301,7 +315,7 @@ def _bound_family_label(point: ParetoPoint) -> tuple[str, ...]:
 class _BoundFamilySummary:
     """Intermediate sortable family summary for one concurrency level."""
 
-    sort_key: tuple[bool, float, float]
+    sort_key: tuple[bool, float, float, float]
     payload: dict[str, object]
 
 
@@ -309,6 +323,8 @@ def _summarize_bound_family(
     family_label: tuple[str, ...],
     group: Sequence[ParetoPoint],
     launch_fn: Callable[[ParetoPoint], PointLaunchPayload] | None,
+    *,
+    use_envelope: bool,
 ) -> _BoundFamilySummary:
     """Aggregate one structural family at a concurrency into bound metadata."""
     active = [pt for pt in group if effective_slo_verdict(pt) != SLO_VERDICT_RULED_OUT]
@@ -317,20 +333,24 @@ def _summarize_bound_family(
     best_pt = min(
         pool,
         key=lambda pt: (
-            _point_tpot_floor_ms(pt),
-            _point_ttft_floor_ms(pt),
-            -pt.token_throughput_per_chip,
+            pt.envelope_tpot_ms if use_envelope else pt.bound_tpot_ms,
+            pt.bound_tpot_ms,
+            pt.bound_ttft_ms,
         ),
     )
     sorted_members = sorted(
         pool,
         key=lambda pt: (
-            _point_tpot_floor_ms(pt),
+            pt.envelope_tpot_ms if use_envelope else pt.bound_tpot_ms,
+            pt.bound_tpot_ms,
             -pt.token_throughput_per_chip,
         ),
     )
-    min_bound_tpot = min(_point_tpot_floor_ms(pt) for pt in pool)
-    min_bound_ttft = min(_point_ttft_floor_ms(pt) for pt in pool)
+    min_bound_tpot = min(pt.bound_tpot_ms for pt in pool)
+    min_bound_ttft = min(pt.bound_ttft_ms for pt in pool)
+    min_env_tpot = min(pt.envelope_tpot_ms for pt in pool)
+    min_env_ttft = min(pt.envelope_ttft_ms for pt in pool)
+    active_tpot = min_env_tpot if use_envelope else min_bound_tpot
     members: list[dict[str, object]] = []
     for pt in sorted_members:
         entry: dict[str, object] = dict(asdict(pt))
@@ -342,13 +362,15 @@ def _summarize_bound_family(
         "family": family_label,
         "min_bound_tpot_ms": min_bound_tpot,
         "min_bound_ttft_ms": min_bound_ttft,
+        "min_envelope_tpot_ms": min_env_tpot,
+        "min_envelope_ttft_ms": min_env_ttft,
         "binding": best_pt.binding,
         "any_not_ruled_out": any_not_ruled_out,
         "member_count": len(members),
         "members": members,
     }
     return _BoundFamilySummary(
-        sort_key=(not any_not_ruled_out, min_bound_tpot, min_bound_ttft),
+        sort_key=(not any_not_ruled_out, active_tpot, min_bound_tpot, min_bound_ttft),
         payload=payload,
     )
 
@@ -360,6 +382,7 @@ def build_bound_families_by_concurrency(
     """Group and rank layout families by active lower bound per concurrency."""
     if not plan.candidates:
         return {}
+    use_envelope = plan.activation_model.prunes_on_envelope
     by_concurrency: dict[int, list[ParetoPoint]] = {}
     for point in plan.candidates:
         by_concurrency.setdefault(point.concurrency, []).append(point)
@@ -372,7 +395,12 @@ def build_bound_families_by_concurrency(
             grouped.setdefault(key, []).append(point)
             labels.setdefault(key, _bound_family_label(point))
         summaries = [
-            _summarize_bound_family(labels[key], group, launch_fn)
+            _summarize_bound_family(
+                labels[key],
+                group,
+                launch_fn,
+                use_envelope=use_envelope,
+            )
             for key, group in grouped.items()
         ]
         summaries.sort(key=lambda item: item.sort_key)
@@ -592,11 +620,11 @@ def reference_layout_report(
         num_candidates = len(
             {_point_struct_key(candidate) for candidate in peer_candidates}
         )
-        reference_bound = _point_tpot_floor_ms(best_candidate)
+        reference_bound = best_candidate.bound_tpot_ms
         other_bounds = _best_values_by_non_matching_layout(
             peer_candidates,
             parsed_layout,
-            _point_tpot_floor_ms,
+            lambda candidate: candidate.bound_tpot_ms,
             lower_is_better=True,
         )
         rank_by_tpot_bound = strict_rank(

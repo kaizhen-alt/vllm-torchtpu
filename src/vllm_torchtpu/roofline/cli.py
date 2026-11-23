@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from .chips import CHIPS, ChipSpec, SliceTopology, load_chip_spec
 from .constants import (
     DEFAULT_GPU_MEMORY_UTILIZATION,
+    DEFAULT_HBM_RESERVE_GB,
     DEFAULT_TOP_K,
     EXAMPLE_CONCURRENCIES,
     EXAMPLE_SLO_TIERS,
@@ -51,9 +52,10 @@ from .families import (
     parse_layout,
     reference_layout_report,
 )
-from .geometry import UnsupportedArchitectureError, from_hf_config
+from .geometry import ModelGeometry, UnsupportedArchitectureError, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config_with_identity
 from .modules import Dtypes, Parallel, StepShape
+from .occupancy import ExpertActivationModel, parse_activation_spec
 from .report import write_html
 from .serving import ServingRequest, plan
 from .solver import (
@@ -162,6 +164,21 @@ def _add_scenario_args(p: argparse.ArgumentParser) -> None:
         "--gpu-memory-utilization",
         type=float,
         default=DEFAULT_GPU_MEMORY_UTILIZATION,
+    )
+    p.add_argument(
+        "--hbm-reserve-gb",
+        type=float,
+        default=DEFAULT_HBM_RESERVE_GB,
+    )
+    p.add_argument(
+        "--collective-latency-us",
+        type=float,
+        default=0.0,
+    )
+    p.add_argument(
+        "--moe-activation",
+        default="bernoulli",
+        help="MoE expert activation regime: bernoulli, pigeonhole, or hull:<path>.",
     )
     p.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     p.add_argument("--json", action="store_true")
@@ -352,6 +369,18 @@ def _dispatch_emit(
     return 0
 
 
+def _parse_cli_activation(
+    spec: str,
+    parser: argparse.ArgumentParser,
+    geom: ModelGeometry,
+) -> ExpertActivationModel:
+    """Parse --moe-activation CLI spec, reporting usage errors via parser."""
+    try:
+        return parse_activation_spec(spec, geom)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+
 def _dispatch_solve(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -366,11 +395,15 @@ def _dispatch_solve(
     dt_resolved = resolve_dtypes_from_args(args, cfg)
     chip, custom_topos = _resolve_chip_and_topos(args)
     geom = from_hf_config(cfg, model_ref=model_ref)
+    activation_model = _parse_cli_activation(args.moe_activation, parser, geom)
     solve_opts = SolveOptions(
         mode=args.mode,
         max_chips=args.max_chips,
         max_instances=args.max_instances,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        hbm_reserve_gb=args.hbm_reserve_gb,
+        collective_latency_s=args.collective_latency_us * UNIT_MICRO,
+        activation_model=activation_model,
         topologies=tuple(custom_topos.values()) if custom_topos else None,
     )
     splan = solve_serving_plan(geom, dt_resolved, chip, scen, solve_opts)
@@ -415,6 +448,10 @@ def _dispatch_solve(
                 chip=chip,
                 model_id=splan.model_id,
                 spec_k=splan.spec_k,
+                spec_tokens=splan.spec_tokens,
+                mtp_layers=splan.mtp_layers if splan.spec_tokens > 0 else None,
+                hbm_reserve_gb=splan.hbm_reserve_gb,
+                topologies=custom_topos,
             )
             payload = attach_reference_report(
                 payload,
@@ -431,8 +468,8 @@ def _dispatch_solve(
         sys.stdout.write(f"WARNING: {warning}\n")
     sys.stdout.write(
         f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pools':<24}  "
-        f"{'p90_int_tok_s':>13}  {'tok_tput_chip':>13}  {'p90_ttft_ms':>11}  "
-        f"{'p90_tpot_ms':>11}\n"
+        f"{'est_int_tok_s':>13}  {'tok_tput_chip':>13}  {'est_ttft_ms':>11}  "
+        f"{'est_tpot_ms':>11}\n"
     )
     for pt in splan.frontier:
         pools = (
@@ -443,9 +480,9 @@ def _dispatch_solve(
         )
         sys.stdout.write(
             f"{pt.mode:<7}  {pt.concurrency:>5}  {pt.total_chips:>5}  "
-            f"{pools:<24}  {pt.p90_interactivity_tok_s:>13.2f}  "
+            f"{pools:<24}  {pt.est_interactivity_tok_s:>13.2f}  "
             f"{pt.token_throughput_per_chip:>13.1f}  "
-            f"{pt.p90_ttft_ms:>11.1f}  {pt.p90_tpot_ms:>11.2f}\n"
+            f"{pt.est_ttft_ms:>11.1f}  {pt.est_tpot_ms:>11.2f}\n"
         )
     return 0
 

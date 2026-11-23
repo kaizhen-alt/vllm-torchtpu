@@ -54,6 +54,7 @@ from .constants import (
     RPA_PAGE_SIZE_BRACKET_TOKENS,
     RPA_PAGE_SIZE_TOKENS,
     SMEM_PAGE_TABLE_DIVISOR,
+    SOLVER_ASSUMPTIONS,
     SUBCHANNEL_BLOCK_K_FLOOR,
     TOPOLOGY_AXES,
     UNIT_GIGA,
@@ -1474,3 +1475,15 @@ def load_chip_spec(
         raw, chip.cores_per_chip, base_name, chip.min_torus_dim
     )
     return chip, topologies
+
+
+def get_solver_assumptions(
+    chip: ChipSpec | None = None,
+) -> list[dict[str, object]]:
+    """Return a fresh list of structured solver assumption entries."""
+    entries = [dict(entry) for entry in SOLVER_ASSUMPTIONS]
+    if chip is not None:
+        for entry in entries:
+            if entry["name"] == "smem_page_table_budget":
+                entry["value"] = chip.smem_page_table_bytes
+    return entries

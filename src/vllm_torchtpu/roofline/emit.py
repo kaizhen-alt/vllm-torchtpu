@@ -21,21 +21,31 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, TypedDict, Unpack
 
-from .chips import CHIPS, JAX_VERSION, chip_catalog, topologies_for_chip
+from .chips import (
+    CHIPS,
+    JAX_VERSION,
+    chip_catalog,
+    get_solver_assumptions,
+    topologies_for_chip,
+)
 from .constants import (
     DEFAULT_CHIPS_PER_HOST,
     DEFAULT_CORES_PER_CHIP,
+    DEFAULT_HBM_RESERVE_GB,
     DEFAULT_PCP_KV_INTERLEAVE_SIZE,
     DEFAULT_TOP_K,
     FRONTIER_2D_TIE_TOLERANCE,
     KV_DTYPE_BYTES,
+    MIN_TOP_LAYOUTS_FOR_BOUND_BEST,
     MIN_TOP_LAYOUTS_FOR_FASTEST,
     NO_FEASIBLE_LAYOUT_WARNING,
     PERCENT_SCALE,
+    SLO_VERDICT_ESTIMATE_MEETS,
     SLO_VERDICT_RANK,
     SLO_VERDICT_RULED_OUT,
     SOLVE_SCHEMA,
     UNIT_GIGA,
+    UNIT_MICRO,
 )
 from .families import (
     attach_reference_report,
@@ -87,6 +97,8 @@ _UNKNOWN_MODEL_WARNING = (
     f"The model to serve is not known: replace {_MODEL_PLACEHOLDER} in each "
     "command with a model ID or a model directory."
 )
+_DEFAULT_ACTIVATION_REGIME = "bernoulli"
+
 
 __all__ = [
     "FRONTIER_2D_TIE_TOLERANCE",
@@ -106,6 +118,7 @@ __all__ = [
     "format_parallelism",
     "format_solve_json",
     "format_submodule_parallelism",
+    "frontier_2d_points",
     "pareto_skyline_by_concurrency",
     "parse_layout",
     "point_launch_args",
@@ -129,6 +142,10 @@ class LaunchOptions:
     chip: ChipSpec | None = None
     model_id: str = ""
     spec_k: int = 0
+    spec_tokens: int = 0
+    mtp_layers: int | None = None
+    hbm_reserve_gb: float = DEFAULT_HBM_RESERVE_GB
+    topologies: Mapping[str, SliceTopology] | None = None
 
 
 class _PointLaunchKwargs(TypedDict, total=False):
@@ -140,6 +157,10 @@ class _PointLaunchKwargs(TypedDict, total=False):
     chip: ChipSpec | None
     model_id: str
     spec_k: int
+    spec_tokens: int
+    mtp_layers: int | None
+    hbm_reserve_gb: float
+    topologies: Mapping[str, SliceTopology] | None
 
 
 class _BuildSolvePayloadOpts(TypedDict, total=False):
@@ -386,12 +407,23 @@ def _format_pool_commands(
     return commands
 
 
-def _frontier_2d_v1(points: Sequence[ParetoPoint]) -> list[ParetoPoint]:
-    """Return upper envelope over modeled (interactivity, throughput) estimates."""
+def _filter_eligible(points: Sequence[ParetoPoint]) -> list[ParetoPoint]:
+    """Return non-ruled-out points, preferring ``estimate_meets`` when present."""
+    eligible = [
+        pt for pt in points if effective_slo_verdict(pt) != SLO_VERDICT_RULED_OUT
+    ]
+    meets = [
+        pt for pt in eligible if effective_slo_verdict(pt) == SLO_VERDICT_ESTIMATE_MEETS
+    ]
+    return meets if meets else eligible
+
+
+def frontier_2d_points(points: Sequence[ParetoPoint]) -> list[ParetoPoint]:
+    """Return non-dominated 2D upper envelope in (interactivity, throughput)."""
     ordered = sorted(
         points,
         key=lambda point: (
-            -point.p90_interactivity_tok_s,
+            -point.est_interactivity_tok_s,
             -point.token_throughput_per_chip,
         ),
     )
@@ -404,7 +436,7 @@ def _frontier_2d_v1(points: Sequence[ParetoPoint]) -> list[ParetoPoint]:
         ):
             envelope.append(point)
             best_throughput = point.token_throughput_per_chip
-    envelope.sort(key=lambda point: point.p90_interactivity_tok_s)
+    envelope.sort(key=lambda point: point.est_interactivity_tok_s)
     return envelope
 
 
@@ -415,59 +447,84 @@ def _is_2d_dominated(
     """Return True if a peer beats point on both interactivity and throughput."""
     return any(
         other is not point
-        and other.p90_interactivity_tok_s >= point.p90_interactivity_tok_s
+        and other.est_interactivity_tok_s >= point.est_interactivity_tok_s
         and other.token_throughput_per_chip >= point.token_throughput_per_chip
         and (
-            other.p90_interactivity_tok_s > point.p90_interactivity_tok_s
+            other.est_interactivity_tok_s > point.est_interactivity_tok_s
             or other.token_throughput_per_chip > point.token_throughput_per_chip
         )
         for other in peers
     )
 
 
-def top_layouts(plan: ServingPlan, k: int = DEFAULT_TOP_K) -> tuple[ParetoPoint, ...]:
-    """Build a heuristic family-collapsed anchor shortlist of up to k layouts.
-
-    Collapses modeled candidates across concurrencies by structural pool axes
-    and selects uncalibrated serial-phase throughput/interactivity anchors
-    that satisfy SLO targets.
-    """
-    if k <= 0:
-        return ()
-    best: dict[tuple[str, PoolStructKey | None, PoolStructKey | None], ParetoPoint] = {}
-    slo_cands: list[ParetoPoint] = []
-    frontier_slo = [pt for pt in plan.frontier if pt.slo_met]
-    source_points = _frontier_2d_v1(frontier_slo) or [
-        pt for pt in plan.candidates if pt.slo_met
-    ]
-    for pt in source_points:
-        if not pt.slo_met:
-            continue
-        slo_cands.append(pt)
-        key = _point_struct_key(pt)
-        cur = best.get(key)
-        if cur is None or (
-            pt.token_throughput_per_chip,
-            pt.p90_interactivity_tok_s,
-        ) > (
-            cur.token_throughput_per_chip,
-            cur.p90_interactivity_tok_s,
-        ):
-            best[key] = pt
-    ranked = sorted(best.values(), key=lambda p: -p.token_throughput_per_chip)
-    if len(ranked) <= 1 or k < MIN_TOP_LAYOUTS_FOR_FASTEST:
-        return tuple(ranked[:k])
-    selected = list(ranked[:k])
-    fastest = max(
-        slo_cands,
-        key=lambda p: (p.p90_interactivity_tok_s, p.token_throughput_per_chip),
-    )
+def _select_compact_top_layouts(
+    ranked: list[ParetoPoint],
+    fastest: ParetoPoint,
+    slots: int,
+) -> list[ParetoPoint]:
+    """Select top throughput layouts plus the fastest interactivity anchor."""
+    if len(ranked) <= 1 or slots < MIN_TOP_LAYOUTS_FOR_FASTEST:
+        return list(ranked[:slots])
+    selected = list(ranked[:slots])
     f_key = _point_struct_key(fastest)
     sel_keys = [_point_struct_key(p) for p in selected]
     if f_key not in sel_keys:
         selected[-1] = fastest
     elif sel_keys.index(f_key) > 0:
         selected[sel_keys.index(f_key)] = fastest
+    selected.sort(key=lambda p: -p.token_throughput_per_chip)
+    return selected
+
+
+def top_layouts(
+    plan: ServingPlan,
+    k: int = DEFAULT_TOP_K,
+    *,
+    near_tie_rel: float = 0.0,
+) -> tuple[ParetoPoint, ...]:
+    """Select up to k structurally distinct eligible layouts spanning Pareto roles."""
+    if k <= 0:
+        return ()
+    eligible = _filter_eligible(plan.candidates)
+    if not eligible:
+        return ()
+    frontier_2d = frontier_2d_points(_filter_eligible(plan.frontier))
+    source_points = frontier_2d if (near_tie_rel <= 0.0 and frontier_2d) else eligible
+    best: dict[tuple[str, PoolStructKey | None, PoolStructKey | None], ParetoPoint] = {}
+    for pt in source_points:
+        key = _point_struct_key(pt)
+        cur = best.get(key)
+        if cur is None or (
+            pt.token_throughput_per_chip,
+            pt.est_interactivity_tok_s,
+        ) > (cur.token_throughput_per_chip, cur.est_interactivity_tok_s):
+            best[key] = pt
+    ranked = sorted(best.values(), key=lambda p: -p.token_throughput_per_chip)
+    fastest = max(
+        source_points,
+        key=lambda p: (p.est_interactivity_tok_s, p.token_throughput_per_chip),
+    )
+    selected = _select_compact_top_layouts(ranked, fastest, k)
+    if near_tie_rel > 0.0 and len(selected) >= k and len(ranked) > k:
+        kth_tput = selected[k - 1].token_throughput_per_chip
+        sel_keys = {_point_struct_key(p) for p in selected}
+        selected.extend(
+            p
+            for p in ranked[k:]
+            if _point_struct_key(p) not in sel_keys
+            and (kth_tput - p.token_throughput_per_chip)
+            / max(FRONTIER_2D_TIE_TOLERANCE, kth_tput)
+            <= near_tie_rel
+        )
+    if k >= MIN_TOP_LAYOUTS_FOR_BOUND_BEST:
+        lowest_bound = min(pt.bound_tpot_ms for pt in eligible)
+        best_bnd = [pt for pt in eligible if pt.bound_tpot_ms == lowest_bound]
+        sel_keys = {_point_struct_key(pt) for pt in selected}
+        if not any(_point_struct_key(pt) in sel_keys for pt in best_bnd):
+            bound_pt = max(best_bnd, key=lambda pt: pt.token_throughput_per_chip)
+            if len(selected) >= k:
+                selected = _select_compact_top_layouts(ranked, fastest, k - 1)
+            selected.append(bound_pt)
     selected.sort(key=lambda p: -p.token_throughput_per_chip)
     return tuple(selected)
 
@@ -482,16 +539,24 @@ def top_layout_roles(
         max(
             range(len(top_pts)),
             key=lambda i: (
-                top_pts[i].p90_interactivity_tok_s,
+                top_pts[i].est_interactivity_tok_s,
                 top_pts[i].token_throughput_per_chip,
             ),
         )
         if len(top_pts) > 1
         else -1
     )
-    eligible_frontier = [
-        pt for pt in frontier if effective_slo_verdict(pt) != SLO_VERDICT_RULED_OUT
-    ]
+    lowest_bound = min((pt.bound_tpot_ms for pt in top_pts), default=0.0)
+    bound_idx = next(
+        (i for i, pt in enumerate(top_pts) if pt.bound_tpot_ms == lowest_bound), -1
+    )
+    if any(
+        top_pts[i].bound_tpot_ms == lowest_bound
+        for i in (0, fastest_idx)
+        if 0 <= i < len(top_pts)
+    ):
+        bound_idx = -1
+    eligible_frontier = _filter_eligible(frontier) if frontier else ()
     dominance_pool: tuple[ParetoPoint, ...] = (*top_pts, *eligible_frontier)
     out: list[tuple[ParetoPoint, str, float]] = []
     for idx, pt in enumerate(top_pts):
@@ -499,6 +564,8 @@ def top_layout_roles(
             role = "max_throughput"
         elif idx == fastest_idx:
             role = "max_interactivity"
+        elif idx == bound_idx:
+            role = "min_tpot_bound"
         elif _is_2d_dominated(pt, dominance_pool):
             role = "off_frontier_alt"
         else:
@@ -506,7 +573,7 @@ def top_layout_roles(
         margin = round(
             PERCENT_SCALE
             * (pt.token_throughput_per_chip - top1_tput)
-            / max(1e-9, top1_tput),
+            / max(FRONTIER_2D_TIE_TOLERANCE, top1_tput),
             2,
         )
         out.append((pt, role, margin))
@@ -528,12 +595,16 @@ def point_launch_args(
     chip = kwargs.get("chip", base.chip)
     model_id = kwargs.get("model_id", base.model_id)
     spec_k = kwargs.get("spec_k", base.spec_k)
+    spec_tokens = kwargs.get("spec_tokens", base.spec_tokens)
+    mtp_layers = kwargs.get("mtp_layers", base.mtp_layers)
+    raw_spec = spec_tokens if spec_tokens > 0 else spec_k
+    eff_spec = 0 if (mtp_layers is not None and mtp_layers <= 0) else raw_spec
     decode_args = pool_cli_args(
         pt.decode_pool,
         kv_dtype=kv_dtype,
         gpu_memory_utilization=gpu_memory_utilization,
         model_id=model_id,
-        spec_k=spec_k,
+        spec_k=eff_spec,
     )
     prefill_args = (
         pool_cli_args(
@@ -541,7 +612,7 @@ def point_launch_args(
             kv_dtype=kv_dtype,
             gpu_memory_utilization=gpu_memory_utilization,
             model_id=model_id,
-            spec_k=spec_k,
+            spec_k=eff_spec,
         )
         if pt.prefill_pool is not None
         else []
@@ -574,12 +645,21 @@ def point_launch_args(
     }
 
 
+def _plan_dict(plan: ServingPlan) -> dict[str, object]:
+    """Convert ``ServingPlan`` to dict with serialized ``activation_regime``."""
+    data: dict[str, object] = dict(asdict(plan).items())
+    data.pop("activation_model", None)
+    data["activation_regime"] = plan.activation_model.regime
+    return data
+
+
 def emit_launch_args(
     plan: ServingPlan,
     *,
     dtypes: Dtypes | None = None,
     model: str | None = None,
     chip: ChipSpec | None = None,
+    topologies: Mapping[str, SliceTopology] | None = None,
 ) -> LaunchPayload:
     """Emit ``vllm serve`` CLI flags and commands for the top-ranked L1 candidate."""
     kv_str = (
@@ -588,11 +668,7 @@ def emit_launch_args(
     eff_chip = chip if chip is not None else CHIPS.get(plan.chip)
     warnings = list(plan.warnings)
     rec = plan.recommended
-    if (
-        rec is None
-        or not rec.slo_met
-        or effective_slo_verdict(rec) == SLO_VERDICT_RULED_OUT
-    ):
+    if rec is None or effective_slo_verdict(rec) == SLO_VERDICT_RULED_OUT:
         if not warnings:
             warnings.append(NO_FEASIBLE_LAYOUT_WARNING)
         return {
@@ -601,17 +677,33 @@ def emit_launch_args(
             "prefill_cli_args": [],
             "commands": [],
             "warnings": warnings,
-            "serving_plan": asdict(plan),
+            "serving_plan": _plan_dict(plan),
         }
 
+    eff_spec = (
+        plan.spec_tokens
+        if plan.spec_tokens > 0
+        else (plan.spec_k if plan.spec_k > 0 else (plan.scenario.spec_tokens or 0))
+    )
+    if eff_spec > 0 and plan.mtp_layers <= 0 and plan.spec_tokens > 0:
+        warnings.append(
+            "Model declares zero MTP draft layers; omitting --speculative-config."
+        )
+    mtp_guard = plan.mtp_layers if plan.spec_tokens > 0 else None
     launch = point_launch_args(
         rec,
-        kv_dtype=kv_str,
-        gpu_memory_utilization=plan.gpu_memory_utilization,
-        model=model,
-        chip=eff_chip,
-        model_id=plan.model_id,
-        spec_k=plan.spec_k,
+        LaunchOptions(
+            kv_dtype=kv_str,
+            gpu_memory_utilization=plan.gpu_memory_utilization,
+            model=model,
+            chip=eff_chip,
+            model_id=plan.model_id,
+            spec_k=eff_spec,
+            spec_tokens=eff_spec,
+            mtp_layers=mtp_guard,
+            hbm_reserve_gb=plan.hbm_reserve_gb,
+            topologies=topologies,
+        ),
     )
     if rec.prefill_pool is not None:
         warnings.append(_DISAGG_WIRING_WARNING)
@@ -623,7 +715,7 @@ def emit_launch_args(
         "prefill_cli_args": launch["prefill_cli_args"],
         "commands": launch["commands"],
         "warnings": warnings,
-        "serving_plan": asdict(plan),
+        "serving_plan": _plan_dict(plan),
     }
 
 
@@ -698,10 +790,12 @@ def _compute_single_host_fit(
             ),
         }
     per_core_bytes = eff_chip.hbm_bytes if eff_chip else CHIPS["tpu7x"].hbm_bytes
-    limit_gb = round(
-        max(0.0, per_core_bytes * plan.gpu_memory_utilization) / float(UNIT_GIGA),
-        2,
+    effective_limit_bytes = max(
+        0.0,
+        per_core_bytes * plan.gpu_memory_utilization
+        - plan.hbm_reserve_gb * float(UNIT_GIGA),
     )
+    limit_gb = round(effective_limit_bytes / float(UNIT_GIGA), 2)
     if plan.mode == "disagg":
         reason = (
             f"Disaggregated mode selected; single-host {host_topo} requires mixed mode "
@@ -732,6 +826,72 @@ def _compute_single_host_fit(
     }
 
 
+def _supplied_entry(
+    name: str,
+    flag: str,
+    kind: str,
+    value: object,
+    unit: str,
+) -> dict[str, object]:
+    """Build one structured supplied-override provenance record."""
+    return {"name": name, "flag": flag, "kind": kind, "value": value, "unit": unit}
+
+
+def _build_provenance_payload(plan: ServingPlan) -> ProvenancePayload:
+    """Build provenance block recording active calibrations and supplied constraints."""
+    active_calibrations: list[str] = []
+    supplied_values: list[dict[str, object]] = []
+    if plan.collective_latency_s > 0.0:
+        supplied_values.append(
+            _supplied_entry(
+                "collective_latency_us",
+                "--collective-latency-us",
+                "calibration",
+                plan.collective_latency_s / UNIT_MICRO,
+                "us",
+            )
+        )
+        active_calibrations.append("collective_latency_s")
+    if plan.hbm_reserve_gb != DEFAULT_HBM_RESERVE_GB:
+        supplied_values.append(
+            _supplied_entry(
+                "hbm_reserve_gb",
+                "--hbm-reserve-gb",
+                "constraint",
+                plan.hbm_reserve_gb,
+                "GB",
+            )
+        )
+    if plan.activation_model.regime != _DEFAULT_ACTIVATION_REGIME:
+        is_cal = plan.activation_model.prunes_on_envelope
+        supplied_values.append(
+            _supplied_entry(
+                "moe_activation",
+                "--moe-activation",
+                "calibration" if is_cal else "constraint",
+                plan.activation_model.regime,
+                "mode",
+            )
+        )
+        if is_cal:
+            active_calibrations.append("moe_activation")
+    return {
+        "calibrated": bool(active_calibrations),
+        "supplied_values": supplied_values,
+        "ranking_basis": (
+            "modeled serial_estimate_s estimate ranking for recommended, frontier, "
+            "and top_k; active TPOT lower bound ranking for "
+            "bound_families_by_concurrency"
+        ),
+        "basis": (
+            "L1 analytical step floors and uncalibrated serial-phase "
+            "roofline estimates; est_* values are modeled estimates, bound_* "
+            "values are physical lower bounds, and envelope_* values reflect "
+            "the active activation_regime (empirical_hull drives SLO ruling out)"
+        ),
+    }
+
+
 def build_solve_payload(
     plan: ServingPlan,
     *,
@@ -747,13 +907,27 @@ def build_solve_payload(
         "fp8" if (dtypes is not None and dtypes.kv <= KV_DTYPE_BYTES["fp8"]) else "auto"
     )
     top_pts = top_layouts(plan, top_k)
+    eff_spec = (
+        plan.spec_tokens
+        if plan.spec_tokens > 0
+        else (plan.spec_k if plan.spec_k > 0 else (plan.scenario.spec_tokens or 0))
+    )
+    topo_map: Mapping[str, SliceTopology] | None = (
+        {topo.name: topo for topo in topologies}
+        if isinstance(topologies, Sequence)
+        else topologies
+    )
     launch_opts = LaunchOptions(
         kv_dtype=kv_str,
         gpu_memory_utilization=plan.gpu_memory_utilization,
         model=model,
         chip=chip,
         model_id=plan.model_id,
-        spec_k=plan.spec_k,
+        spec_k=eff_spec,
+        spec_tokens=eff_spec,
+        mtp_layers=plan.mtp_layers if plan.spec_tokens > 0 else None,
+        hbm_reserve_gb=plan.hbm_reserve_gb,
+        topologies=topo_map,
     )
     top_entries: list[TopKEntry] = [
         {
@@ -785,13 +959,7 @@ def build_solve_payload(
         "gpu_memory_utilization": plan.gpu_memory_utilization,
         "search": asdict(plan.search) if plan.search is not None else None,
         "schema": SOLVE_SCHEMA,
-        "provenance": {
-            "calibrated": False,
-            "basis": (
-                "L1 analytical step floors and uncalibrated serial-phase "
-                "p90 estimates; modeled, not measured"
-            ),
-        },
+        "provenance": _build_provenance_payload(plan),
         "chip_spec": chip_dict,
         "model": model,
         "top_k": top_entries,
@@ -830,6 +998,11 @@ def build_solve_payload(
         plan,
         launch_fn=lambda pt: point_launch_args(pt, launch_opts),
     )
+    payload["solver_assumptions"] = get_solver_assumptions(chip)
+    payload["activation_regime"] = plan.activation_model.regime
+    payload["spec_tokens"] = plan.spec_tokens
+    payload["mtp_layers"] = plan.mtp_layers
+    payload["hbm_reserve_gb"] = plan.hbm_reserve_gb
     if dtypes is not None:
         payload["dtypes"] = asdict(dtypes)
     return payload
@@ -841,19 +1014,22 @@ def format_solve_json(payload: SolvePayload) -> str:
 
 
 def emit_ceiling_rows(plan: ServingPlan) -> list[CeilingRow]:
-    """Export uncalibrated L1 candidate rows by p90 interactivity and throughput."""
+    """Export Pareto ceiling rows leading with interactivity and throughput."""
     return [
         {
-            "p90_interactivity_tok_s": pt.p90_interactivity_tok_s,
+            "est_interactivity_tok_s": pt.est_interactivity_tok_s,
             "token_throughput_per_chip": pt.token_throughput_per_chip,
             "output_throughput_per_chip": pt.output_throughput_per_chip,
-            "p90_ttft_ms": pt.p90_ttft_ms,
-            "p90_tpot_ms": pt.p90_tpot_ms,
+            "est_ttft_ms": pt.est_ttft_ms,
+            "est_tpot_ms": pt.est_tpot_ms,
+            "bound_tpot_ms": pt.bound_tpot_ms,
             "concurrency": pt.concurrency,
             "total_chips": pt.total_chips,
             "mode": pt.mode,
             "binding_unit": pt.binding,
+            "min_decode_seqs": pt.min_decode_seqs,
+            "floor_throughput_per_chip": pt.floor_throughput_per_chip,
         }
         for pt in plan.frontier
-        if pt.slo_met
+        if effective_slo_verdict(pt) != SLO_VERDICT_RULED_OUT
     ]

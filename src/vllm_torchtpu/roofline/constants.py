@@ -266,6 +266,20 @@ SLO_VERDICT_RANK: dict[str, int] = {
     SLO_VERDICT_ESTIMATE_MEETS: 2,
 }
 
+# Warning a serving plan carries when the recommended layout's SLO verdict is undecided.
+UNDECIDED_SLO_WARNING: str = (
+    "Recommended layout has SLO verdict 'undecided': its modeled estimate "
+    "misses the latency SLO, though the physical lower bound does not rule "
+    "the layout out."
+)
+
+# Informational warning emitted when closed-loop think_time_s is zero.
+ZERO_THINK_TIME_WARNING: str = (
+    "Closed-loop scenario evaluated with zero think time (think_time_s = 0.0): "
+    "steady-state residency follows active request arrival bounded by HBM, "
+    "SMEM, and prefill capacity limits."
+)
+
 # Sub-1e-9 tok/s guard (~1e7 * float64 ulp at 1e5 tok/s) for 2D envelope ties.
 FRONTIER_2D_TIE_TOLERANCE: float = 1e-9
 # PCP KV interleave satisfying both pooled GDN (% 16) and HND (% 128).
@@ -439,3 +453,116 @@ HULL_CONCAVITY_SLOPE_TOLERANCE: float = 1e-9
 # Absorbs 6-decimal JSON rounding (0.5e-6 half-ULP with 2x margin,
 # unit: experts) when comparing exported knots to the Bernoulli cap.
 HULL_BERNOULLI_CAP_TOLERANCE: float = 1e-6
+
+
+_DEFAULT_SMEM_PAGE_TABLE_BYTES: int = (
+    int(pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1).smem_capacity_bytes)
+    // SMEM_PAGE_TABLE_DIVISOR
+)
+_SOLVER_ASSUMPTION_ROWS: tuple[tuple[str, str, str, object, str, str, str], ...] = (
+    (
+        "bound_ttft_envelope_formula",
+        "",
+        "assumption",
+        "hit-rate-adjusted uncached prefill step floor",
+        "formula",
+        "TTFT bounds evaluate unpadded prefill at scenario prefix hit rate.",
+        "solver",
+    ),
+    (
+        "bound_tpot_residency",
+        "",
+        "assumption",
+        "least fixed-point steady-state residency",
+        "formula",
+        "TPOT bounds evaluate bottom-up from batch 1 to HBM/SMEM cap.",
+        "solver",
+    ),
+    (
+        "bound_capacity_ceiling",
+        "",
+        "assumption",
+        "unpadded linear work-conservation",
+        "req/s",
+        "X_cap_pool divides unpadded HBM, matmul, vector, and collective cuts.",
+        "solver",
+    ),
+    (
+        "eff_prefill_rounding",
+        "",
+        "assumption",
+        "floor((1 - h) * isl) for bounds; ceil(...) for estimates",
+        "tokens",
+        "Strict bounds floor uncached tokens; estimates include chunk overhead.",
+        "modules",
+    ),
+    (
+        "hbm_reserve_gb",
+        "--hbm-reserve-gb",
+        "constraint",
+        DEFAULT_HBM_RESERVE_GB,
+        "GB",
+        "Extra HBM reserve subtracted from usable device memory.",
+        "cli",
+    ),
+    (
+        "gpu_memory_utilization",
+        "",
+        "assumption",
+        DEFAULT_GPU_MEMORY_UTILIZATION,
+        "fraction",
+        "Usable HBM fraction before weights, runtime buffers, and KV cache.",
+        "constants",
+    ),
+    (
+        "smem_page_table_budget",
+        "",
+        "assumption",
+        _DEFAULT_SMEM_PAGE_TABLE_BYTES,
+        "bytes",
+        "On-chip SMEM byte cap constraining page-table sequence residency.",
+        "constants",
+    ),
+    (
+        "prefill_chunk_tokens",
+        "",
+        "assumption",
+        DEFAULT_PREFILL_CHUNK,
+        "tokens",
+        "Default chunk size for chunked prefill under mixed concurrency.",
+        "constants",
+    ),
+    (
+        "collective_latency_us",
+        "--collective-latency-us",
+        "calibration",
+        DEFAULT_ICI_HOP_LATENCY_S / UNIT_MICRO,
+        "us",
+        "Optional per-hop ICI calibration latency added only to estimates.",
+        "cli",
+    ),
+    (
+        "ep_uniform_routing",
+        "--moe-activation",
+        "constraint",
+        "uniform",
+        "mode",
+        "Default routed MoE activation unless a supplied hull is active.",
+        "occupancy",
+    ),
+)
+
+# Shared structured solver assumption catalog consumed by CLI --assumptions,
+# solve JSON, and HTML reports.
+SOLVER_ASSUMPTIONS: tuple[dict[str, object], ...] = tuple(
+    {
+        "name": name,
+        "flag": flag,
+        "kind": kind,
+        "value": value,
+        "unit": unit,
+        "description": desc,
+        "source": src,
+    }
+    for name, flag, kind, value, unit, desc, src in _SOLVER_ASSUMPTION_ROWS
+)

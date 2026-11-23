@@ -168,6 +168,7 @@ def test_report_slo_unmet_recommended_renders_warning_banner(
     assert sample_payload["recommended"] is not None
     rec_unmet = dict(sample_payload["recommended"])
     rec_unmet["slo_met"] = False
+    rec_unmet["slo_verdict"] = "ruled_out"
     payload["recommended"] = rec_unmet
     payload["top_k"] = []
     payload["warnings"] = []
@@ -260,15 +261,15 @@ def test_frontier_chart_plots_monotonic_2d_envelope_with_throughput_on_y(
     # Include a lower-concurrency point at the same interactivity as a higher-tput point
     p_low = copy.deepcopy(payload["frontier"][0])
     p_low["concurrency"] = 1
-    p_low["p90_interactivity_tok_s"] = 1000.0
+    p_low["est_interactivity_tok_s"] = 1000.0
     p_low["token_throughput_per_chip"] = 2500.0
     p_high = copy.deepcopy(payload["frontier"][0])
     p_high["concurrency"] = 4
-    p_high["p90_interactivity_tok_s"] = 1000.0
+    p_high["est_interactivity_tok_s"] = 1000.0
     p_high["token_throughput_per_chip"] = 10000.0
     p_tput = copy.deepcopy(payload["frontier"][0])
     p_tput["concurrency"] = 64
-    p_tput["p90_interactivity_tok_s"] = 200.0
+    p_tput["est_interactivity_tok_s"] = 200.0
     p_tput["token_throughput_per_chip"] = 40000.0
     payload["frontier"] = (p_low, p_high, p_tput)
     payload["candidates"] = (p_low, p_high, p_tput)

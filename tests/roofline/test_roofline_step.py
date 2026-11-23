@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 import vllm_torchtpu.roofline as rf
-from tests.roofline.conftest import load_qwen3_8_bringup_config
+from tests.roofline.conftest import SMALL_HYBRID_MOE_CFG, load_qwen3_8_bringup_config
 from vllm_torchtpu.roofline import (
     CHIPS,
     TOPOLOGIES,
@@ -1294,3 +1294,68 @@ def test_block_parallel_and_multilayer_mtp_draft_cost() -> None:
         replace(geom_bp, mtp_inter=0), dt, par, seq_layout
     )
     assert bd_mtp2.weights < bd_moe.weights
+
+
+def test_unpadded_prefill_capacity_bound_keeps_sampled_lm_head_rows() -> None:
+    """Unpadded prefill capacity bound charges 1 sampled LM-head row, not isl rows."""
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    chip = CHIPS["tpu7x"]
+    dt = EXAMPLE_FP8_DTYPES
+    topo = TOPOLOGIES["2x2x1"]
+    par = Parallel(
+        tp=8,
+        dp=1,
+        ep=8,
+        moe="ep",
+        moe_dispatch="ag_ep",
+        ranks_per_chip=topo.cores_per_chip,
+    )
+    short_shape = StepShape(
+        batch=0, rows_per_seq=1, context=0, prefill_tokens=1024, prefix_hit_rate=0.0
+    )
+    long_shape = StepShape(
+        batch=0, rows_per_seq=1, context=0, prefill_tokens=8192, prefix_hit_rate=0.0
+    )
+    short_lm = next(
+        m
+        for m in pass_costs(geom, par, short_shape, dt, unpadded_linear=True, chip=chip)
+        if m.name == "lm_head"
+    )
+    long_lm = next(
+        m
+        for m in pass_costs(geom, par, long_shape, dt, unpadded_linear=True, chip=chip)
+        if m.name == "lm_head"
+    )
+    assert short_lm.bf16_flops == pytest.approx(long_lm.bf16_flops, rel=0, abs=0)
+    assert short_lm.ici_bytes == pytest.approx(long_lm.ici_bytes, rel=0, abs=0)
+    zero_lm = next(
+        m
+        for m in pass_costs(
+            geom,
+            par,
+            StepShape(batch=0, rows_per_seq=0, context=0, prefill_tokens=0),
+            dt,
+            unpadded_linear=True,
+            chip=chip,
+        )
+        if m.name == "lm_head"
+    )
+    assert zero_lm.bf16_flops == 0.0
+    assert zero_lm.vector_flops == 0.0
+    assert zero_lm.ici_bytes == 0.0
+    unp_short = rf.unpadded_strict_resource_times(
+        geom,
+        chip,
+        par,
+        short_shape,
+        rf.UnpaddedFloorOptions(dt=dt, topology=topo, zero_weights=True),
+    )
+    unp_long = rf.unpadded_strict_resource_times(
+        geom,
+        chip,
+        par,
+        long_shape,
+        rf.UnpaddedFloorOptions(dt=dt, topology=topo, zero_weights=True),
+    )
+    assert all(val >= 0.0 for val in unp_short)
+    assert unp_long[1] > unp_short[1]

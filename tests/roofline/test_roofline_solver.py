@@ -61,6 +61,7 @@ from vllm_torchtpu.roofline.solver import (
     _candidate_decode_parallels,
     _candidate_moe_dispatches,
     _candidate_prefill_parallels,
+    _decode_capacity_profile,
     _find_prefill_options,
     _pareto_filter,
     _SolveContext,
@@ -277,7 +278,7 @@ def _check_pp_prefill_ttft(chip: rf.ChipSpec) -> None:
             ),
         )
         bubble_mult = 1.0 + float(p0.prefill_pool.pp - 1) / float(n_chk)
-        assert p0.p90_ttft_ms == pytest.approx(
+        assert p0.est_ttft_ms == pytest.approx(
             sf_st.serial_estimate_s * bubble_mult * 1e3
         )
 
@@ -346,7 +347,7 @@ def test_solver_hybrid_moe_mixed_vs_disagg_and_crossover(
             topology=rf.TOPOLOGIES[rec_d.topology],
         ),
     )
-    assert ca_plan.recommended.p90_tpot_ms == pytest.approx(
+    assert ca_plan.recommended.est_tpot_ms == pytest.approx(
         sf_k3.serial_estimate_s * 1e3 / ca_scen.accept_len, rel=1e-4
     )
 
@@ -606,7 +607,7 @@ def test_physical_kv_page_capacity_and_unpruned_regimes() -> None:
         and p.decode_pool.ep == 1
         and p.decode_pool.max_num_seqs == expected_c48
     ]
-    best_tp16 = min(tp16_pts, key=lambda p: p.p90_tpot_ms)
+    best_tp16 = min(tp16_pts, key=lambda p: p.est_tpot_ms)
     assert best_tp16.decode_pool.kv_split == kv_split_16
 
     w4_dsa_geom = dc_replace(
@@ -663,8 +664,8 @@ def test_physical_kv_page_capacity_and_unpruned_regimes() -> None:
     ]
     assert tp2_dp8
     assert tp1_dp16
-    assert min(p.p90_ttft_ms for p in tp2_dp8) < min(p.p90_ttft_ms for p in tp1_dp16)
-    assert min(p.p90_tpot_ms for p in tp1_dp16) < min(p.p90_tpot_ms for p in tp2_dp8)
+    assert min(p.est_ttft_ms for p in tp2_dp8) < min(p.est_ttft_ms for p in tp1_dp16)
+    assert min(p.est_tpot_ms for p in tp1_dp16) < min(p.est_tpot_ms for p in tp2_dp8)
 
 
 def test_engine_memory_utilization_and_explicit_scenario_inputs(tmp_path: Path) -> None:
@@ -744,7 +745,7 @@ def test_engine_memory_utilization_and_explicit_scenario_inputs(tmp_path: Path) 
     )
     assert p_c0.recommended is not None
     assert p_think.recommended is not None
-    assert p_think.recommended.p90_tpot_ms <= p_c0.recommended.p90_tpot_ms
+    assert p_think.recommended.est_tpot_ms <= p_c0.recommended.est_tpot_ms
 
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps(QWEN35_CFG))
@@ -962,7 +963,7 @@ def test_disagg_capacity_clamped_hit_rate_and_prefill_dispatch() -> None:
             matched += 1
             assert pt_s.kv_cache_capacity_tokens is not None
             assert pt_h.effective_prefix_hit_rate < pt_s.effective_prefix_hit_rate
-            assert pt_h.p90_ttft_ms > pt_s.p90_ttft_ms
+            assert pt_h.est_ttft_ms > pt_s.est_ttft_ms
     assert matched >= 1
     pcp_ep_pts = [
         p
@@ -1745,3 +1746,58 @@ def test_search_stats_tracks_core_grid_before_arch_pruning() -> None:
     )
     assert plan.search.core_grid == expected_core_grid
     assert plan.search.core_grid > plan.search.enumerated
+
+
+def test_decode_capacity_profile_subtracts_logit_peak_from_b_hbm_max() -> None:
+    """_decode_capacity_profile reserves logit_peak_b when computing b_hbm_max."""
+    geom = rf.from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt = rf.dtypes_from_hf_config(SMALL_HYBRID_MOE_CFG)
+    chip = rf.CHIPS["tpu7x"]
+    scen = rf.TrafficScenario(
+        name="logit-cap-check",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(32,),
+        kv_working_set_turns=1.0,
+    )
+    par = rf.Parallel(tp=2, dp=4, ep=8, moe="ep", ranks_per_chip=chip.cores_per_chip)
+    ctx_full = scen.isl + scen.osl
+    hbm_limit_b = float(chip.hbm_bytes) * rf.constants.DEFAULT_GPU_MEMORY_UTILIZATION
+    eval_context = _SolveContext(
+        geom=geom,
+        dtypes=dt,
+        chip=chip,
+        scenario=scen,
+        mode="mixed",
+        max_chips=4,
+        max_instances=None,
+        gpu_memory_utilization=rf.constants.DEFAULT_GPU_MEMORY_UTILIZATION,
+        hbm_limit_b=hbm_limit_b,
+        hbm_limit_gb=hbm_limit_b / rf.constants.UNIT_GIGA,
+        eff_al=1.0,
+        spec_k=0,
+        ctx_full=ctx_full,
+        ctx_mid=scen.isl + scen.osl // 2,
+        eff_isl=scen.isl,
+        n_chunks=1,
+        page_size=rf.default_rpa_page_size(ctx_full, is_mla=geom.kv_lora_rank > 0),
+        c_max=max(scen.concurrencies),
+    )
+    w_base_0, b_max_0, _, _, _, hbm_c1 = _decode_capacity_profile(
+        eval_context, par, logit_peak_b=0.0
+    )
+    per_seq_b = hbm_c1 - w_base_0
+    reserved_seqs = 4
+    assert b_max_0 > reserved_seqs
+    large_logit_peak = float(reserved_seqs) * per_seq_b
+    w_base_1, b_max_1, _, _, _, _ = _decode_capacity_profile(
+        eval_context, par, logit_peak_b=large_logit_peak
+    )
+    assert w_base_1 == pytest.approx(w_base_0, rel=0, abs=0)
+    assert b_max_1 <= b_max_0 - reserved_seqs
+    assert (
+        w_base_1 + float(b_max_1) * per_seq_b + large_logit_peak <= hbm_limit_b + 1e-6
+    )
