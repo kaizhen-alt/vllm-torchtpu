@@ -235,6 +235,9 @@ class ServingPlan:
     hbm_reserve_gb: float = DEFAULT_HBM_RESERVE_GB
     model_id: str = ""
     search: SearchStats | None = None
+    sweep_candidates: tuple[ParetoPoint, ...] = ()
+    winner_prefix_hit_range: tuple[float, float] | None = None
+    prefix_hit_crossover_rate: float | None = None
     has_moe: bool = False
     is_hybrid: bool = False
     budget: int = 0

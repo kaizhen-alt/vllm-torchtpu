@@ -26,6 +26,7 @@ import pytest
 import vllm_torchtpu.roofline as rf
 from tests.roofline.conftest import (
     SMALL_HYBRID_MOE_CFG,
+    cold_crossover_sweep,
     load_qwen3_8_bringup_config,
 )
 from vllm_torchtpu.roofline import (
@@ -36,12 +37,17 @@ from vllm_torchtpu.roofline import (
     KvFitInput,
     LaunchOptions,
     Parallel,
+    ParetoPoint,
+    PoolMeshPlan,
     ScenarioOverrides,
     SeqKvLayout,
+    ServingPlan,
     SolveOptions,
     SpecShape,
     StepShape,
     TrafficScenario,
+    build_example_scenario,
+    build_solve_payload,
     cli,
     dsa_indexer_layer_weight_elems,
     dtypes_from_hf_config,
@@ -55,8 +61,24 @@ from vllm_torchtpu.roofline import (
     solve_serving_plan,
 )
 from vllm_torchtpu.roofline import constants as rf_constants
+from vllm_torchtpu.roofline import crossover as rf_crossover
 from vllm_torchtpu.roofline import solver as rf_solver
 from vllm_torchtpu.roofline.constants import DEFAULT_GPU_MEMORY_UTILIZATION, UNIT_GIGA
+from vllm_torchtpu.roofline.crossover import (
+    CandidateState,
+    EpLoadSpec,
+    _CrossoverPlanner,
+    _derive_winner_range_and_crossover,
+    _eval_grid_disagg_ttft,
+    _pool_sig,
+    ep_z_unit,
+    eval_grid_mix_candidates,
+    max_ep_load_ratio,
+    scale_ep_moe_floor,
+    scaled_ep_serial_s,
+    setup_crossover_sweep,
+    sweep_prefix_hit_crossovers,
+)
 from vllm_torchtpu.roofline.geometry import (
     UnsupportedArchitectureError,
     _from_hf_config_dry_run,
@@ -85,6 +107,11 @@ from vllm_torchtpu.roofline.solver import (
     _valid_head_tp,
     _valid_raiden_gdn_pair,
     _valid_raiden_kv_pair,
+)
+from vllm_torchtpu.roofline.step import (
+    combine_modules,
+    spec_cycle_floor,
+    step_floor,
 )
 
 QWEN35_CFG: dict[str, object] = {
@@ -2564,3 +2591,986 @@ def test_raiden_kv_pairing_guards_and_pcp_explain(
     )
     assert "PP > 1, " not in pcp_pp_reason
     assert pcp_pp_reason == "PCP > 1 is not permitted with this profile or spec_k > 1"
+
+
+def test_fast_pass_memo_matches_step_and_spec_cycle_floors() -> None:
+    """Verify crossover planner memoization matches step and spec cycle floors."""
+    chip = CHIPS["tpu7x"]
+    geom = rf.from_hf_config(QWEN35_CFG)
+    dt = Dtypes(kv=1.0, state=2.0)
+    scen = TrafficScenario(
+        name="memo-test",
+        isl=2048,
+        osl=256,
+        concurrencies=(16,),
+        prefix_hit_rate=0.5,
+        accept_len=2.0,
+        think_time_s=0.0,
+        kv_working_set_turns=1.0,
+        spec_tokens=2,
+    )
+    planner = _CrossoverPlanner(geom, dt, chip, scen)
+    pool = PoolMeshPlan(
+        role="mixed",
+        instances=1,
+        tp=2,
+        dp=2,
+        pp=2,
+        pcp=1,
+        ep=4,
+        kv_split=1,
+        chips_per_instance=4,
+        topology="2x2x1",
+        mesh_axes=(2, 2, 2, 1),
+        hbm_used_gb=10.0,
+        hbm_limit_gb=94.76,
+        pp_layer_partition=(32, 28),
+    )
+    pid = planner.get_pool_id(pool)
+    topo, par, pp_part = planner.pool_plans[pid]
+    assert pp_part == (32, 28)
+
+    opts = FloorOptions(dt=dt, topology=topo)
+    shape_pre = StepShape(
+        batch=0,
+        rows_per_seq=0,
+        context=0,
+        state_writes=0,
+        prefill_tokens=scen.isl,
+        prefix_hit_rate=0.5,
+    )
+    pre_sf = planner.compute_pre_sf(pid, pool, 0.5)
+    sf_pre_direct = rf.scale_pp_stage_floor(geom, chip, par, (shape_pre, opts), pp_part)
+    assert pre_sf == pytest.approx(sf_pre_direct.serial_estimate_s)
+
+    batch_res = 4
+    dec_sf, draft_s = planner.get_dec_sf(pid, batch_res)
+    ver_shape = StepShape(
+        batch=batch_res,
+        rows_per_seq=planner.spec_k + 1,
+        context=planner.ctx_mid,
+        state_writes=1,
+    )
+    sf_dec_even = spec_cycle_floor(
+        geom,
+        chip,
+        par,
+        SpecShape(batch=batch_res, context=planner.ctx_mid, k=planner.spec_k),
+        opts,
+    )
+    sf_ver_direct = rf.scale_pp_stage_floor(geom, chip, par, (ver_shape, opts), pp_part)
+    draft_mods = tuple(m for m in sf_dec_even.modules if m.name.startswith("draft_"))
+    sf_dec_direct = combine_modules(
+        (*sf_ver_direct.modules, *draft_mods),
+        chip,
+        topology=topo,
+        parallel=par,
+    )
+    tot_tok = batch_res * (planner.spec_k + 1) * par.dp
+    ep_spec = EpLoadSpec(geom=geom, par=par, global_tokens=tot_tok)
+    sf_dec_direct = scale_ep_moe_floor(sf_dec_direct, chip, ep_spec, topology=topo)
+    sf_ver_direct = scale_ep_moe_floor(sf_ver_direct, chip, ep_spec, topology=topo)
+    exp_draft = max(
+        0.0, sf_dec_direct.serial_estimate_s - sf_ver_direct.serial_estimate_s
+    )
+    assert dec_sf == pytest.approx(sf_dec_direct.serial_estimate_s)
+    assert draft_s == pytest.approx(exp_draft)
+
+    chunk_tok = 512
+    mix_sf = planner.compute_mix_sf(pid, batch_res, chunk_tok)
+    shape_mix = StepShape(
+        batch=batch_res,
+        rows_per_seq=planner.spec_k + 1,
+        context=planner.ctx_mid,
+        state_writes=1,
+        prefill_tokens=chunk_tok,
+        prefix_hit_rate=0.0,
+    )
+    sf_mix_direct = rf.scale_pp_stage_floor(geom, chip, par, (shape_mix, opts), pp_part)
+    assert mix_sf == pytest.approx(sf_mix_direct.serial_estimate_s)
+
+
+def test_prefix_hit_crossover_sweep_and_pcie_offload() -> None:
+    """Verify crossover sweep over prefix hit rates and Raiden host PCIe offload."""
+    chip = CHIPS["tpu7x"]
+    geom = rf.from_hf_config(QWEN35_CFG)
+    dt = Dtypes(kv=1.0, state=2.0)
+    hit_90 = 0.90
+    hit_95 = 0.95
+    scen_offload = TrafficScenario(
+        name="offload-compare",
+        isl=32768,
+        osl=512,
+        prefix_hit_rate=hit_90,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(32,),
+        kv_working_set_turns=20.0,
+        kv_offload_gb=64.0,
+    )
+    plan_off = solve_serving_plan(
+        geom, dt, chip, scen_offload, SolveOptions(mode="auto", max_chips=8)
+    )
+    assert len(plan_off.candidates) > len(plan_off.frontier)
+    win_range, cross_rate = cold_crossover_sweep(geom, dt, chip, plan_off)
+    assert win_range is not None
+    assert 0.0 <= win_range[0] <= hit_90 <= win_range[1] <= hit_95
+    assert plan_off.winner_prefix_hit_range == win_range
+    assert plan_off.prefix_hit_crossover_rate == cross_rate
+    solve_payload = build_solve_payload(plan_off, chip=chip, dtypes=dt)
+    assert "sweep_candidates" not in solve_payload
+    assert solve_payload["winner_prefix_hit_range"] == win_range
+    assert solve_payload["prefix_hit_crossover_rate"] == cross_rate
+
+    emitted = emit_launch_args(plan_off, dtypes=dt, model="Qwen/Qwen3.5-397B-A17B-FP8")
+    assert "sweep_candidates" not in emitted["serving_plan"]
+    assert "--kv-offloading-size" not in emitted["cli_args"]
+
+
+def test_prefix_hit_crossover_sweep_slo_probe_and_examples() -> None:
+    """Verify crossover sweep detects TTFT SLO switches across example presets."""
+    chip = CHIPS["tpu7x"]
+    geom = rf.from_hf_config(QWEN35_CFG)
+    probe_geom = rf.from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt = Dtypes(kv=1.0, state=2.0)
+    hit_95 = 0.95
+    tp_high = 8
+    scen_probe = TrafficScenario(
+        name="slo-crossover-probe",
+        isl=16384,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(8, 32),
+        kv_working_set_turns=1.0,
+    )
+    probe_h0 = solve_serving_plan(
+        probe_geom, dt, chip, scen_probe, SolveOptions(mode="mixed", max_chips=4)
+    )
+    assert probe_h0.recommended is not None
+    tp_high_min_ttft = min(
+        cand.est_ttft_ms
+        for cand in probe_h0.candidates
+        if cand.decode_pool.tp == tp_high
+    )
+    mid_ttft_slo = 0.5 * (tp_high_min_ttft + probe_h0.recommended.est_ttft_ms)
+    scen_slo = dc_replace(scen_probe, ttft_slo_ms=mid_ttft_slo)
+    plan_slo_h0 = solve_serving_plan(
+        probe_geom, dt, chip, scen_slo, SolveOptions(mode="mixed", max_chips=4)
+    )
+    plan_slo_h95 = solve_serving_plan(
+        probe_geom,
+        dt,
+        chip,
+        dc_replace(scen_slo, prefix_hit_rate=hit_95),
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    assert plan_slo_h0.recommended is not None
+    assert plan_slo_h95.recommended is not None
+    assert (
+        plan_slo_h0.recommended.decode_pool.tp
+        != plan_slo_h95.recommended.decode_pool.tp
+    )
+    assert plan_slo_h0.prefix_hit_crossover_rate is not None
+    assert plan_slo_h0.winner_prefix_hit_range is not None
+    assert plan_slo_h0.winner_prefix_hit_range[1] < hit_95
+
+    for ex_name, n_chips in (
+        ("coding-agent", 8),
+        ("chat-8k1k", 16),
+        ("reasoning-1k8k", 16),
+    ):
+        ex_scen = build_example_scenario(ex_name)
+        ex_plan = solve_serving_plan(
+            geom, dt, chip, ex_scen, SolveOptions(mode="auto", max_chips=n_chips)
+        )
+        ex_range, _ex_cross = cold_crossover_sweep(geom, dt, chip, ex_plan)
+        assert ex_range is not None
+        if ex_name == "chat-8k1k":
+            ex_uncached = dc_replace(ex_plan, sweep_candidates=())
+            fb_range, fb_cross = cold_crossover_sweep(
+                geom, dt, chip, ex_uncached, repeats=1
+            )
+            assert (fb_range, fb_cross) == (
+                ex_plan.winner_prefix_hit_range,
+                ex_plan.prefix_hit_crossover_rate,
+            )
+
+
+def test_ep_expected_maximum_matches_quadrature() -> None:
+    """Verify ep_z_unit matches exact Gaussian quadrature and max_ep_load_ratio."""
+    ep4, ep8, ep16 = 4, 8, 16
+    assert ep_z_unit(ep4) == pytest.approx(1.029375373003964, rel=1e-12)
+    assert ep_z_unit(ep8) == pytest.approx(1.4236003060452778, rel=1e-12)
+    assert ep_z_unit(ep16) == pytest.approx(1.765991393054788, rel=1e-12)
+    assert max_ep_load_ratio(0, ep8) == 1.0
+    assert max_ep_load_ratio(64, 1) == 1.0
+    assert max_ep_load_ratio(16, ep8) > max_ep_load_ratio(4096, ep8) > 1.0
+
+
+def test_sweep_matches_main_path_ttft_with_offload() -> None:
+    """Verify crossover sweep matches main-path TTFT and throughput with offload."""
+    geom = rf.from_hf_config(QWEN35_CFG)
+    chip = CHIPS["tpu7x"]
+    dt = Dtypes()
+    scen = dc_replace(
+        build_example_scenario("coding-agent"),
+        kv_offload_gb=32.0,
+        prefix_hit_rate=0.5,
+        think_time_s=1.0,
+    )
+    plan_res = solve_serving_plan(
+        geom, dt, chip, scen, SolveOptions(mode="mixed", max_chips=64)
+    )
+    ep_pts = [p for p in plan_res.candidates if p.decode_pool.ep > 1]
+    assert ep_pts
+    pt = ep_pts[0]
+    pools, eval_context = setup_crossover_sweep(geom, dt, chip, scen, [pt])
+    state = CandidateState()
+    eval_grid_mix_candidates(
+        scen.prefix_hit_rate, scen, pools.mix_meta, eval_context, state
+    )
+    entry = state.near_slo[0] if state.near_slo else state.near_all[0]
+    sweep_tput = entry[0]
+    meta = pools.mix_meta[0]
+    h_eff = scen.prefix_hit_rate * meta.cap_ratio
+    pcie_s = (
+        float(scen.isl)
+        * max(0.0, h_eff - scen.prefix_hit_rate * meta.hbm_ratio)
+        * meta.pcie_slope
+        if meta.pcie_slope > 0.0
+        else 0.0
+    )
+    sf_pre_s = eval_context.compute_pre_sf(meta.d_pid, meta.d_pool, h_eff)
+    sweep_ttft_ms = (sf_pre_s + pcie_s) * 1e3
+    assert sweep_ttft_ms == pytest.approx(meta.pt.est_ttft_ms, rel=1e-3)
+    assert sweep_tput == pytest.approx(meta.pt.token_throughput_per_chip, rel=0.03)
+
+
+def test_crossover_ep_decode_passes_slice_topology() -> None:
+    """Verify get_dec_sf preserves slice topology and scales global tokens by DP."""
+    geom = rf.from_hf_config(QWEN35_CFG)
+    chip = CHIPS["tpu7x"]
+    dt = Dtypes()
+    scen = dc_replace(build_example_scenario("coding-agent"), spec_tokens=3)
+    planner = _CrossoverPlanner(geom, dt, chip, scen)
+    pool = PoolMeshPlan(
+        role="decode",
+        instances=1,
+        tp=4,
+        dp=2,
+        pp=1,
+        pcp=1,
+        ep=8,
+        kv_split=1,
+        chips_per_instance=4,
+        topology="2x2x1",
+        mesh_axes=(2, 2, 1, 1),
+        hbm_used_gb=40.0,
+        hbm_limit_gb=94.76,
+    )
+    pid = planner.get_pool_id(pool)
+    topo, par, _ = planner.pool_plans[pid]
+    batch_res = 2
+    dec_sf_s, _ = planner.get_dec_sf(pid, batch_res)
+    sf_raw = spec_cycle_floor(
+        geom,
+        chip,
+        par,
+        SpecShape(batch=batch_res, context=planner.ctx_mid, k=planner.spec_k),
+        FloorOptions(dt=dt, topology=topo),
+    )
+    ep_spec = EpLoadSpec(
+        geom=geom,
+        par=par,
+        global_tokens=batch_res * (planner.spec_k + 1) * pool.dp,
+    )
+    sf_expected = scale_ep_moe_floor(sf_raw, chip, ep_spec, topology=topo)
+    assert dec_sf_s == pytest.approx(sf_expected.serial_estimate_s, rel=1e-12)
+
+
+def test_prune_sweep_candidates_retains_low_concurrency_slo_fallback() -> None:
+    """Verify sweep pruning retains lower concurrency points when SLO is constrained."""
+    chip = CHIPS["tpu7x"]
+    geom = rf.from_hf_config(QWEN35_CFG)
+    dt = Dtypes(kv=1.0)
+    low_conc = 8
+    high_conc = 16
+    scen = TrafficScenario(
+        name="prune-slo-fallback",
+        isl=8192,
+        osl=512,
+        prefix_hit_rate=0.95,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(low_conc, high_conc),
+        kv_working_set_turns=1.0,
+        tpot_slo_ms=6.5,
+    )
+    plan = solve_serving_plan(
+        geom, dt, chip, scen, SolveOptions(mode="mixed", max_chips=4)
+    )
+    assert any(p.concurrency == low_conc for p in plan.sweep_candidates)
+    pruned_res = sweep_prefix_hit_crossovers(geom, dt, chip, plan)
+    unpruned_res = sweep_prefix_hit_crossovers(
+        geom, dt, chip, dc_replace(plan, sweep_candidates=plan.candidates)
+    )
+    assert pruned_res == unpruned_res
+
+
+def test_ep_scaled_serial_time_includes_the_vector_term() -> None:
+    """Include per-module vector time when scaling serial step latency under EP."""
+    geometry = rf.from_hf_config(QWEN35_CFG)
+    vector_bound_chip = dc_replace(CHIPS["tpu7x"], vector_flops=1.0e8)
+    parallel = rf.Parallel(
+        tp=1,
+        dp=8,
+        ep=8,
+        moe="ep",
+        moe_dispatch="ag_ep",
+        ranks_per_chip=vector_bound_chip.cores_per_chip,
+    )
+    base_floor = step_floor(
+        geometry,
+        vector_bound_chip,
+        parallel,
+        rf.StepShape(batch=1, rows_per_seq=1, context=1024),
+        rf.FloorOptions(
+            dt=Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0, act="a8"),
+            topology=rf.TOPOLOGIES["2x2x1"],
+        ),
+    )
+    global_tokens = 8
+    scaled_floor = scale_ep_moe_floor(
+        base_floor,
+        vector_bound_chip,
+        EpLoadSpec(geom=geometry, par=parallel, global_tokens=global_tokens),
+        topology=rf.TOPOLOGIES["2x2x1"],
+    )
+    scaled_serial = scaled_ep_serial_s(
+        base_floor,
+        vector_bound_chip,
+        geometry,
+        parallel,
+        global_tokens,
+    )
+    independent_vector_floor_s = (
+        sum(module.vector_flops for module in base_floor.modules)
+        / vector_bound_chip.vector_flops
+        + base_floor.chain_s
+    )
+    assert (
+        independent_vector_floor_s
+        > base_floor.hbm_s + base_floor.matmul_s + base_floor.chain_s
+    )
+    assert scaled_serial >= independent_vector_floor_s
+    assert scaled_serial >= base_floor.serial_estimate_s
+    assert scaled_serial == pytest.approx(scaled_floor.serial_estimate_s, rel=1e-12)
+
+
+def test_crossover_dcn_key_preserves_distinct_chip_counts() -> None:
+    """Keep distinct chip counts separate in disaggregated sweep candidate pruning."""
+    geom = rf.from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt = rf.dtypes_from_hf_config(SMALL_HYBRID_MOE_CFG)
+    chip = CHIPS["tpu7x"]
+    scen = TrafficScenario(
+        name="crossover-dcn-key",
+        isl=4096,
+        osl=512,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(32,),
+        kv_working_set_turns=1.0,
+    )
+    pre_pool = PoolMeshPlan(
+        role="prefill",
+        instances=1,
+        topology="2x2x4",
+        chips_per_instance=16,
+        tp=8,
+        dp=4,
+        ep=8,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 2, 4),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=94.0,
+        moe_dispatch="ag_ep",
+    )
+    dec_4 = PoolMeshPlan(
+        role="decode",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=4,
+        dp=2,
+        ep=8,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 2, 1),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=94.0,
+        moe_dispatch="ag_ep",
+    )
+    dec_8 = PoolMeshPlan(
+        role="decode",
+        instances=1,
+        topology="2x2x2",
+        chips_per_instance=8,
+        tp=8,
+        dp=2,
+        ep=16,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 2, 2),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=94.0,
+        moe_dispatch="ag_ep",
+    )
+    pt_small = rf.ParetoPoint(
+        mode="disagg",
+        concurrency=32,
+        total_chips=20,
+        prefill_pool=pre_pool,
+        decode_pool=dec_4,
+        est_ttft_ms=50.0,
+        est_tpot_ms=4.0,
+        est_interactivity_tok_s=250.0,
+        output_throughput_per_chip=100.0,
+        token_throughput_per_chip=900.0,
+        p_mixed=0.0,
+        binding="hbm",
+        slo_met=True,
+        slo_verdict="estimate_meets",
+    )
+    pt_large = rf.ParetoPoint(
+        mode="disagg",
+        concurrency=32,
+        total_chips=24,
+        prefill_pool=pre_pool,
+        decode_pool=dec_8,
+        est_ttft_ms=50.0,
+        est_tpot_ms=4.0,
+        est_interactivity_tok_s=250.0,
+        output_throughput_per_chip=100.0,
+        token_throughput_per_chip=900.0,
+        p_mixed=0.0,
+        binding="hbm",
+        slo_met=True,
+        slo_verdict="estimate_meets",
+    )
+    kept = rf_crossover.prune_sweep_candidates(
+        geom, dt, chip, scen, [pt_small, pt_large]
+    )
+    expected_chips = {20, 24}
+    assert {pt.total_chips for pt in kept} == expected_chips
+
+
+def test_crossover_disagg_sweep_uses_prefill_pool_batch_and_isl() -> None:
+    """Disagg crossover KV ratios use prefill pool, prefill batch, and ISL only."""
+    cfg = json.loads(
+        (
+            Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+        ).read_text(encoding="utf-8")
+    )
+    geom = rf.from_hf_config(cfg)
+    dt = rf.dtypes_from_hf_config(cfg)
+    chip = CHIPS["tpu7x"]
+    scen = TrafficScenario(
+        name="disagg-prefill-kv",
+        isl=8192,
+        osl=8192,
+        prefix_hit_rate=0.85,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(32,),
+        kv_working_set_turns=12.0,
+        kv_offload_gb=64.0,
+    )
+    p_pool = PoolMeshPlan(
+        role="prefill",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=8,
+        dp=1,
+        ep=8,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 2, 1),
+        hbm_used_gb=60.0,
+        hbm_limit_gb=78.0,
+        moe_dispatch="ag_ep",
+        hbm_weights_gb=68.0,
+        hbm_kv_gb=2.0,
+        hbm_state_gb=0.2,
+        kv_offload_gb=64.0,
+    )
+    d_pool = PoolMeshPlan(
+        role="decode",
+        instances=4,
+        topology="2x2x2",
+        chips_per_instance=8,
+        tp=8,
+        dp=2,
+        ep=16,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 2, 2),
+        hbm_used_gb=25.0,
+        hbm_limit_gb=94.0,
+        moe_dispatch="ag_ep",
+        hbm_weights_gb=20.0,
+        hbm_kv_gb=4.0,
+        hbm_state_gb=1.0,
+        max_num_seqs=4,
+        kv_offload_gb=0.0,
+    )
+    pt = ParetoPoint(
+        mode="disagg",
+        concurrency=32,
+        total_chips=36,
+        prefill_pool=p_pool,
+        decode_pool=d_pool,
+        est_ttft_ms=120.0,
+        est_tpot_ms=6.0,
+        est_interactivity_tok_s=166.7,
+        output_throughput_per_chip=50.0,
+        token_throughput_per_chip=100.0,
+        p_mixed=0.0,
+        binding="hbm",
+        slo_met=True,
+        slo_verdict="estimate_meets",
+        kv_cache_capacity_tokens=1_500_000,
+    )
+    pools, _ctx = setup_crossover_sweep(geom, dt, chip, scen, [pt])
+    ((_p_pid, cap_ratio), (_grp_pool, _bub, items)) = next(
+        iter(pools.dis_ttft_groups.items())
+    )
+    assert len(items) == 1
+    item = items[0]
+    p_par = Parallel(tp=8, pp=1, pcp=1, kv_split=1, ranks_per_chip=chip.cores_per_chip)
+    b_kv_p, fixed_p = rf.memory.kv_bytes_per_core_parts(
+        geom, dt, p_par, scen.isl, chip=chip
+    )
+    w_tok_p = scen.kv_working_set_turns * float(scen.concurrencies[0] * scen.isl)
+    expected_cap = min(1.0, float(pt.kv_cache_capacity_tokens or 0) / w_tok_p)
+    avail_p = max(
+        0.0,
+        (p_pool.hbm_limit_gb - p_pool.hbm_weights_gb - p_pool.hbm_state_gb)
+        * float(UNIT_GIGA)
+        - fixed_p,
+    )
+    expected_hbm = min(1.0, (avail_p / b_kv_p) / w_tok_p)
+    assert cap_ratio == pytest.approx(expected_cap, rel=1e-9)
+    assert item.hbm_ratio == pytest.approx(expected_hbm, rel=1e-9)
+    half_ratio = 0.5
+    assert item.hbm_ratio < half_ratio
+
+
+def test_crossover_grid_disagg_includes_pcie_and_dcn_cap() -> None:
+    """Disagg grid evaluator folds PCIe offload time into rate_p and caps by DCN."""
+    cfg = json.loads(
+        (
+            Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+        ).read_text(encoding="utf-8")
+    )
+    geom = rf.from_hf_config(cfg)
+    dt = rf.dtypes_from_hf_config(cfg)
+    slow_chip = dc_replace(CHIPS["tpu7x"], dcn_bw=0.5e9, pcie_bw=2.0e9)
+    scen = TrafficScenario(
+        name="disagg-dcn-pcie-grid",
+        isl=8192,
+        osl=256,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(32,),
+        kv_working_set_turns=15.0,
+        kv_offload_gb=64.0,
+    )
+    plan_slow = solve_serving_plan(
+        geom, dt, slow_chip, scen, SolveOptions(mode="disagg", max_chips=16)
+    )
+    assert plan_slow.recommended is not None
+    pt = plan_slow.recommended
+    pools, ctx = setup_crossover_sweep(geom, dt, slow_chip, scen, [pt])
+    state = CandidateState()
+    _eval_grid_disagg_ttft(
+        scen.prefix_hit_rate, scen, pools.dis_ttft_groups, ctx, state
+    )
+    entry = state.near_slo[0] if state.near_slo else state.near_all[0]
+    grid_tput = entry[0]
+
+    fast_dcn_chip = dc_replace(slow_chip, dcn_bw=100.0e9)
+    pools_fast, ctx_fast = setup_crossover_sweep(geom, dt, fast_dcn_chip, scen, [pt])
+    state_fast = CandidateState()
+    _eval_grid_disagg_ttft(
+        scen.prefix_hit_rate, scen, pools_fast.dis_ttft_groups, ctx_fast, state_fast
+    )
+    entry_fast = (
+        state_fast.near_slo[0] if state_fast.near_slo else state_fast.near_all[0]
+    )
+    assert grid_tput < entry_fast[0]
+    assert grid_tput == pytest.approx(pt.token_throughput_per_chip, rel=0.05)
+
+
+def test_crossover_kv_slope_separates_fixed_swa_window() -> None:
+    """Crossover KV ratios separate fixed SWA window bytes from linear KV slope."""
+    swa_window = 512
+    long_isl = 8192
+    swa_geom = _from_hf_config_dry_run(
+        {
+            "model_type": "swa_synth_test",
+            "hidden_size": 2048,
+            "num_hidden_layers": 8,
+            "layer_types": ["sliding_attention", "full_attention"] * 4,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "sliding_window": swa_window,
+            "intermediate_size": 4096,
+            "vocab_size": 32000,
+        }
+    )
+    dt = Dtypes(w_dense=2.0, kv=1.0)
+    chip = CHIPS["tpu7x"]
+    par = Parallel(tp=4, pp=1, ranks_per_chip=chip.cores_per_chip)
+    pool = PoolMeshPlan(
+        role="mixed",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=4,
+        dp=1,
+        ep=1,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 2, 1),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="allreduce",
+        hbm_weights_gb=10.0,
+        hbm_state_gb=0.0,
+        max_num_seqs=16,
+    )
+    scen = TrafficScenario(
+        name="swa-slope",
+        isl=long_isl,
+        osl=256,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(16,),
+        kv_working_set_turns=4.0,
+    )
+    planner = _CrossoverPlanner(swa_geom, dt, chip, scen)
+    ctx_full = scen.isl + scen.osl
+    lin_b, fix_b = planner.get_b_kv_parts(pool, ctx_full)
+    exp_lin, exp_fix = rf.memory.kv_bytes_per_core_parts(
+        swa_geom, dt, par, ctx_full, chip=chip
+    )
+    assert lin_b == pytest.approx(exp_lin, rel=1e-12)
+    assert fix_b == pytest.approx(exp_fix, rel=1e-12)
+    assert fix_b > 0.0
+    # Naive footprint(1, 1) - footprint(1, 0) folds SWA layers into linear slope (2x).
+    naive_slope = rf.hbm_footprint_per_core_bytes(
+        swa_geom, dt, par, rf.SeqKvLayout(1, 1), chip=chip
+    ) - rf.hbm_footprint_per_core_bytes(
+        swa_geom, dt, par, rf.SeqKvLayout(1, 0), chip=chip
+    )
+    assert naive_slope > lin_b * 1.5
+
+
+def test_crossover_mixed_mkey_preserves_distinct_offload_ratios() -> None:
+    """Mixed prune mkey preserves distinct HBM spill ratios when cap_ratio ties."""
+    geom = rf.from_hf_config(QWEN35_CFG)
+    dt = Dtypes(kv=1.0, state=2.0)
+    chip = CHIPS["tpu7x"]
+    scen = TrafficScenario(
+        name="mkey-offload",
+        isl=16384,
+        osl=512,
+        prefix_hit_rate=0.9,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(16,),
+        kv_working_set_turns=20.0,
+        kv_offload_gb=64.0,
+    )
+    pool_light = PoolMeshPlan(
+        role="mixed",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=8,
+        dp=1,
+        ep=8,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 2, 1),
+        hbm_used_gb=45.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="ag_ep",
+        hbm_weights_gb=35.0,
+        hbm_state_gb=1.0,
+        max_num_seqs=16,
+        kv_offload_gb=64.0,
+    )
+    pool_heavy = dc_replace(pool_light, hbm_weights_gb=68.0, hbm_used_gb=72.0)
+    pt_a = ParetoPoint(
+        mode="mixed",
+        concurrency=16,
+        total_chips=4,
+        prefill_pool=None,
+        decode_pool=pool_light,
+        est_ttft_ms=100.0,
+        est_tpot_ms=8.0,
+        est_interactivity_tok_s=125.0,
+        output_throughput_per_chip=100.0,
+        token_throughput_per_chip=800.0,
+        p_mixed=0.1,
+        binding="hbm",
+        slo_met=True,
+        slo_verdict="estimate_meets",
+        kv_cache_capacity_tokens=50_000_000,
+    )
+    pt_b = dc_replace(pt_a, decode_pool=pool_heavy, token_throughput_per_chip=750.0)
+    kept = rf_crossover.prune_sweep_candidates(geom, dt, chip, scen, [pt_a, pt_b])
+    expected_kept = 2
+    assert len(kept) == expected_kept
+
+
+def test_crossover_winner_range_returns_none_when_idx0_differs() -> None:
+    """Return None for winner_prefix_hit_range when grid winner at h0 differs."""
+    scen = TrafficScenario(
+        name="winner-mismatch",
+        isl=4096,
+        osl=256,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(16,),
+        kv_working_set_turns=1.0,
+    )
+    pool_a = PoolMeshPlan(
+        role="mixed",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=8,
+        dp=1,
+        ep=8,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 2, 1),
+        hbm_used_gb=40.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="ag_ep",
+    )
+    pool_b = dc_replace(pool_a, tp=4, dp=2)
+    pt_rec = ParetoPoint(
+        mode="mixed",
+        concurrency=16,
+        total_chips=4,
+        prefill_pool=None,
+        decode_pool=pool_a,
+        est_ttft_ms=100.0,
+        est_tpot_ms=8.0,
+        est_interactivity_tok_s=125.0,
+        output_throughput_per_chip=100.0,
+        token_throughput_per_chip=800.0,
+        p_mixed=0.1,
+        binding="hbm",
+        slo_met=True,
+        slo_verdict="estimate_meets",
+    )
+    pt_other = dc_replace(pt_rec, decode_pool=pool_b)
+    plan_obj = ServingPlan(
+        model_layers=8,
+        chip="tpu7x",
+        scenario=scen,
+        mode="mixed",
+        recommended=pt_rec,
+        frontier=(pt_rec, pt_other),
+        warnings=(),
+    )
+    sig_other = (_pool_sig(pool_b), None, 4, 800.0, pt_other)
+    winners = [(0.0, sig_other), (0.5, sig_other), (0.95, sig_other)]
+    win_range, cross = _derive_winner_range_and_crossover(scen, plan_obj, winners)
+    assert win_range is None
+    assert cross is None
+
+
+def test_crossover_mix_sf_matches_solver_and_ep_scales_by_dp() -> None:
+    """compute_mix_sf matches step_floor directly and get_dec_sf scales EP by DP."""
+    geom = rf.from_hf_config(SMALL_HYBRID_MOE_CFG)
+    chip = CHIPS["tpu7x"]
+    dt = Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0, state=2.0)
+    scen = TrafficScenario(
+        name="ep-dp-mix-match",
+        isl=4096,
+        osl=256,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(16,),
+        kv_working_set_turns=1.0,
+    )
+    planner = _CrossoverPlanner(geom, dt, chip, scen)
+    pool_dp2 = PoolMeshPlan(
+        role="mixed",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=4,
+        dp=2,
+        ep=8,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 2, 1),
+        hbm_used_gb=40.0,
+        hbm_limit_gb=94.76,
+        moe_dispatch="ag_ep",
+    )
+    pid = planner.get_pool_id(pool_dp2)
+    topo, par, _ = planner.pool_plans[pid]
+    opts = FloorOptions(dt=dt, topology=topo)
+    b_res = 2
+    chunk_tok = 512
+
+    mix_sf = planner.compute_mix_sf(pid, b_res, chunk_tok)
+    sf_mix_direct = step_floor(
+        geom,
+        chip,
+        par,
+        StepShape(
+            batch=b_res,
+            rows_per_seq=1,
+            context=planner.ctx_mid,
+            state_writes=1,
+            prefill_tokens=chunk_tok,
+            prefix_hit_rate=0.0,
+        ),
+        opts,
+    )
+    assert mix_sf == pytest.approx(sf_mix_direct.serial_estimate_s, rel=1e-12)
+
+    dec_sf, _ = planner.get_dec_sf(pid, b_res)
+    sf_dec_direct = step_floor(
+        geom,
+        chip,
+        par,
+        StepShape(batch=b_res, rows_per_seq=1, context=planner.ctx_mid),
+        opts,
+    )
+    exp_with_dp = scaled_ep_serial_s(
+        sf_dec_direct, chip, geom, par, b_res * pool_dp2.dp
+    )
+    exp_without_dp = scaled_ep_serial_s(sf_dec_direct, chip, geom, par, b_res)
+    assert dec_sf == pytest.approx(exp_with_dp, rel=1e-12)
+    assert dec_sf < exp_without_dp
+
+
+def test_crossover_mixed_x_capacity_scales_by_instances() -> None:
+    """Mixed crossover closed-loop capacity scales linearly with pool instances."""
+    geom = rf.from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt = rf.dtypes_from_hf_config(SMALL_HYBRID_MOE_CFG)
+    chip = CHIPS["tpu7x"]
+    scen = TrafficScenario(
+        name="mixed-instances",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(64,),
+        kv_working_set_turns=1.0,
+    )
+    pool_1 = PoolMeshPlan(
+        role="mixed",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=8,
+        dp=1,
+        ep=8,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 2, 1),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=94.0,
+        moe_dispatch="ag_ep",
+        max_num_seqs=16,
+    )
+    pool_2 = dc_replace(pool_1, instances=2)
+    pt_1 = ParetoPoint(
+        mode="mixed",
+        concurrency=32,
+        total_chips=4,
+        prefill_pool=None,
+        decode_pool=pool_1,
+        est_ttft_ms=50.0,
+        est_tpot_ms=4.0,
+        est_interactivity_tok_s=250.0,
+        output_throughput_per_chip=100.0,
+        token_throughput_per_chip=500.0,
+        p_mixed=0.1,
+        binding="hbm",
+        slo_met=True,
+        slo_verdict="estimate_meets",
+    )
+    pt_2 = dc_replace(pt_1, concurrency=64, total_chips=8, decode_pool=pool_2)
+    pools_1, ctx_1 = setup_crossover_sweep(geom, dt, chip, scen, [pt_1])
+    pools_2, ctx_2 = setup_crossover_sweep(geom, dt, chip, scen, [pt_2])
+    state_1 = CandidateState()
+    state_2 = CandidateState()
+    eval_grid_mix_candidates(
+        scen.prefix_hit_rate, scen, pools_1.mix_meta, ctx_1, state_1
+    )
+    eval_grid_mix_candidates(
+        scen.prefix_hit_rate, scen, pools_2.mix_meta, ctx_2, state_2
+    )
+    tput_1 = state_1.near_slo[0][0]
+    tput_2 = state_2.near_slo[0][0]
+    assert pools_2.mix_meta[0].res_cap == pytest.approx(
+        2.0 * pools_1.mix_meta[0].res_cap, rel=1e-12
+    )
+    assert tput_2 == pytest.approx(tput_1, rel=1e-6)
+
+
+def test_scale_ep_moe_floor_preserves_collective_latency() -> None:
+    """Verify scale_ep_moe_floor preserves collective_latency_s in chain_s."""
+    geom = rf.from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt = rf.dtypes_from_hf_config(SMALL_HYBRID_MOE_CFG)
+    chip = CHIPS["tpu7x"]
+    topo = rf.TOPOLOGIES["2x2x1"]
+    par = Parallel(tp=4, dp=2, ep=8, moe="ep", moe_dispatch="ag_ep")
+    coll_lat_s = 1e-4
+    sf_base = step_floor(
+        geom,
+        chip,
+        par,
+        StepShape(batch=2, rows_per_seq=1, context=1024),
+        FloorOptions(dt=dt, topology=topo, collective_latency_s=coll_lat_s),
+    )
+    sf_scaled = scale_ep_moe_floor(
+        sf_base,
+        chip,
+        EpLoadSpec(geom=geom, par=par, global_tokens=4),
+        topology=topo,
+        collective_latency_s=coll_lat_s,
+    )
+    assert sf_scaled.chain_s == pytest.approx(sf_base.chain_s, rel=1e-12)

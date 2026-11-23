@@ -50,6 +50,7 @@ from .constants import (
     canonicalize_kv_dtype,
     disagg_prefill_spec_k,
 )
+from .crossover import prune_sweep_candidates, sweep_prefix_hit_crossovers
 from .geometry import resolve_geom_profile
 from .memory import (
     HbmBreakdown,
@@ -3720,7 +3721,8 @@ def solve_serving_plan(
     not_ruled_out_candidates, pool_for_frontier, frontier, recommended = (
         _finalize_plan_selection(scenario, candidates, warnings)
     )
-    return ServingPlan(
+    pruned_sweep = prune_sweep_candidates(geom, dtypes, chip, scenario, candidates)
+    base_plan = ServingPlan(
         model_layers=geom.num_layers,
         chip=chip.name,
         scenario=scenario,
@@ -3755,10 +3757,22 @@ def solve_serving_plan(
                 )
             ),
         ),
+        sweep_candidates=pruned_sweep,
         budget=opts.max_chips if opts.max_chips is not None else 0,
         budget_source=opts.budget_source,
         max_instances=opts.max_instances,
         pins=pins,
         activation_model=opts.activation_model,
         runtime_profile=geom.runtime_profile,
+    )
+    sweep_topos = (
+        opts.topologies if opts.topologies is not None else topologies_for_chip(chip)
+    )
+    win_range, cross_rate = sweep_prefix_hit_crossovers(
+        geom, dtypes, chip, base_plan, topologies=sweep_topos
+    )
+    return replace(
+        base_plan,
+        winner_prefix_hit_range=win_range,
+        prefix_hit_crossover_rate=cross_rate,
     )

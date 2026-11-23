@@ -759,6 +759,7 @@ def _plan_dict(plan: ServingPlan) -> dict[str, object]:
     """Convert ``ServingPlan`` to dict with serialized ``activation_regime``."""
     data: dict[str, object] = dict(asdict(plan).items())
     data.pop("activation_model", None)
+    data.pop("sweep_candidates", None)
     data["activation_regime"] = plan.activation_model.regime
     return data
 
@@ -1128,6 +1129,8 @@ def build_solve_payload(
     payload["spec_tokens"] = plan.spec_tokens
     payload["mtp_layers"] = plan.mtp_layers
     payload["hbm_reserve_gb"] = plan.hbm_reserve_gb
+    payload["winner_prefix_hit_range"] = plan.winner_prefix_hit_range
+    payload["prefix_hit_crossover_rate"] = plan.prefix_hit_crossover_rate
     if dtypes is not None:
         payload["dtypes"] = asdict(dtypes)
     return payload

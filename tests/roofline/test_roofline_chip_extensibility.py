@@ -543,3 +543,61 @@ def test_disagg_offload_h_hbm_p_uses_custom_chip_spec() -> None:
     assert plan_narrow.recommended is not None
     assert plan_wide.recommended is not None
     assert plan_wide.recommended.est_ttft_ms > plan_narrow.recommended.est_ttft_ms
+
+
+def test_unpadded_strict_and_crossover_preserve_five_matmul_buckets() -> None:
+    """Verify unpadded strict times and crossover scaling keep fp4 matmul work."""
+    fp4_payload = _make_base_spec_payload(name="fp4_bucket_chip")
+    fp4_payload["fp4_flops"] = _SYNTH_FP4_FLOPS
+    fp4_chip, topos = rf.load_chip_spec(fp4_payload)
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt_fp4 = Dtypes(
+        w_dense=rf_constants.FP4_BYTES,
+        w_expert=rf_constants.FP4_BYTES,
+        w_dense_dtype="nvfp4",
+        w_expert_dtype="nvfp4",
+    )
+    ep_ranks = 4
+    batch_sz = 4
+    ctx_len = 256
+    global_toks = 16
+    par = Parallel(tp=1, moe="ep", ep=ep_ranks)
+    shape = StepShape(batch=batch_sz, rows_per_seq=1, context=ctx_len)
+    topo = topos["2x2"]
+
+    _hbm_s, matmul_fp4_s, _vector_s, _coll_s = rf.unpadded_strict_resource_times(
+        geom,
+        fp4_chip,
+        par,
+        shape,
+        rf.UnpaddedFloorOptions(dt=dt_fp4, topology=topo),
+    )
+    no_fp4_chip, _ = rf.load_chip_spec(_make_base_spec_payload(name="bf16_fallback"))
+    _hbm_fb, matmul_fb_s, _vector_fb, _coll_fb = rf.unpadded_strict_resource_times(
+        geom,
+        no_fp4_chip,
+        par,
+        shape,
+        rf.UnpaddedFloorOptions(dt=dt_fp4, topology=topo),
+    )
+    assert matmul_fp4_s > 0.0
+    assert matmul_fp4_s < matmul_fb_s
+
+    sf_even = rf.step_floor(
+        geom,
+        fp4_chip,
+        par,
+        shape,
+        rf.FloorOptions(dt=dt_fp4, topology=topo),
+    )
+    sf_ep = rf.scale_ep_moe_floor(
+        sf_even,
+        fp4_chip,
+        rf.EpLoadSpec(geom=geom, par=par, global_tokens=global_toks),
+        topology=topo,
+    )
+    moe_even = next(m for m in sf_even.modules if m.name == "moe")
+    moe_ep = next(m for m in sf_ep.modules if m.name == "moe")
+    assert moe_even.fp4_flops > 0.0
+    assert moe_ep.fp4_flops > moe_even.fp4_flops
+    assert moe_ep.fp4_flops_min == pytest.approx(moe_even.strict_fp4_flops)
