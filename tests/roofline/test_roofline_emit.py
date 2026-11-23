@@ -17,25 +17,32 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from dataclasses import replace as dc_replace
 from pathlib import Path
 from typing import Literal
 
 import pytest
 
+from tests.roofline.conftest import SMALL_HYBRID_MOE_CFG
 from vllm_torchtpu.roofline import (
     CHIPS,
+    SLO_VERDICT_RULED_OUT,
+    SOLVE_SCHEMA,
     Dtypes,
     ParetoPoint,
     PoolMeshPlan,
     ServingPlan,
     SolveOptions,
     TrafficScenario,
+    build_solve_payload,
     cli,
     emit_ceiling_rows,
     emit_launch_args,
     from_hf_config,
+    point_launch_args,
     pool_cli_args,
     solve_serving_plan,
+    top_layouts,
 )
 from vllm_torchtpu.roofline.constants import NO_FEASIBLE_LAYOUT_WARNING
 from vllm_torchtpu.roofline.emit import (
@@ -50,6 +57,7 @@ from vllm_torchtpu.roofline.memory import (
     hbm_breakdown_per_core_bytes as _hbm_breakdown,
 )
 from vllm_torchtpu.roofline.modules import Parallel as _Parallel
+from vllm_torchtpu.roofline.schema import _pool_key
 
 
 @dataclass(frozen=True)
@@ -819,3 +827,347 @@ def test_emit_speculative_config_for_mtp_scenario_and_omit_when_zero() -> None:
         disagg_spec, dtypes=dt, model="Qwen/Qwen3.5-397B-A17B-FP8"
     )
     assert "--prefill-context-parallel-size" not in out_disagg["prefill_cli_args"]
+
+
+def test_top_layouts_distinct_and_led_by_recommended() -> None:
+    """Top-K layouts are distinct, SLO-met, sorted by throughput, led by recommended."""
+    chip = CHIPS["tpu7x"]
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt = Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0)
+    scenario = TrafficScenario(
+        name="chat-8k1k",
+        isl=8192,
+        osl=1024,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(1, 2, 4),
+        kv_working_set_turns=1.0,
+    )
+    splan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    top_k = 3
+    top = top_layouts(splan, k=top_k)
+    assert 1 <= len(top) <= top_k
+    assert splan.recommended is not None
+    assert top[0] == splan.recommended
+
+    keys: set[tuple[object, ...]] = set()
+    for pt in top:
+        assert pt.slo_met
+        key = (
+            pt.mode,
+            _pool_key(pt.prefill_pool),
+            _pool_key(pt.decode_pool),
+        )
+        assert key not in keys
+        keys.add(key)
+
+    tputs = [pt.token_throughput_per_chip for pt in top]
+    assert tputs == sorted(tputs, reverse=True)
+
+
+def test_top_layouts_empty_without_slo_met() -> None:
+    """Top-K layouts return empty tuple if no candidate meets SLOs."""
+    chip = CHIPS["tpu7x"]
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt = Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0)
+    scenario = TrafficScenario(
+        name="custom",
+        isl=8192,
+        osl=1024,
+        concurrencies=(1,),
+        tpot_slo_ms=0.0001,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        kv_working_set_turns=1.0,
+    )
+    splan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    assert top_layouts(splan, k=3) == ()
+
+
+def test_solve_json_envelope_and_provenance(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Solve --json outputs versioned schema with provenance, stats, and launches."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(SMALL_HYBRID_MOE_CFG), encoding="utf-8")
+
+    rc = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "chat-8k1k",
+            "--chip",
+            "tpu7x",
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "4",
+            "--concurrency",
+            "1,2",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["schema"] == SOLVE_SCHEMA
+    assert out["provenance"]["calibrated"] is False
+    assert "L1 analytical step floors" in out["provenance"]["basis"]
+    assert "uncalibrated serial-phase" in out["provenance"]["basis"]
+    assert out["search"]["enumerated"] >= 1
+    assert len(out["top_k"]) >= 1
+    assert out["top_k"][0]["launch"]["commands"][0].startswith("vllm serve")
+    assert out["single_host_fit"]["feasible"] is True
+    expected_max_chips = 4
+    assert out["chip_budget"]["max_chips"] == expected_max_chips
+    assert "recommended" in out
+    assert "frontier" in out
+    assert "candidates" in out
+
+
+def test_top_layouts_structural_diversity_and_interactivity_anchor() -> None:
+    """Verify structural diversity across top layouts with interactivity anchor."""
+    scen = TrafficScenario(
+        name="chat-8k1k",
+        isl=4096,
+        osl=512,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(1, 16, 64),
+        kv_working_set_turns=1.0,
+    )
+    p_a1 = dc_replace(
+        _sample_pool(
+            role="mixed",
+            cfg=_PoolConfig(topology="2x2x2", chips=8, tp=2, dp=8, ep=16),
+        ),
+        moe_dispatch="ag_ep",
+    )
+    p_a2 = dc_replace(
+        _sample_pool(
+            role="mixed",
+            cfg=_PoolConfig(topology="2x2x2", chips=8, tp=2, dp=8, ep=16),
+        ),
+        moe_dispatch="a2a_push",
+    )
+    p_b = _sample_pool(
+        role="mixed",
+        cfg=_PoolConfig(topology="2x2x2", chips=8, tp=4, dp=4, ep=16),
+    )
+    p_c = _sample_pool(
+        role="mixed",
+        cfg=_PoolConfig(topology="2x2x2", chips=8, tp=8, dp=2, ep=16),
+    )
+    p_d = _sample_pool(
+        role="mixed",
+        cfg=_PoolConfig(topology="2x2x2", chips=8, tp=16, dp=1, ep=16),
+    )
+
+    def _mk_pt(pool: PoolMeshPlan, conc: int, tput: float, inter: float) -> ParetoPoint:
+        """Create a synthetic Pareto point for testing layout selection."""
+        return ParetoPoint(
+            mode="mixed",
+            concurrency=conc,
+            total_chips=8,
+            prefill_pool=None,
+            decode_pool=pool,
+            p90_ttft_ms=100.0,
+            p90_tpot_ms=1000.0 / inter,
+            p90_interactivity_tok_s=inter,
+            output_throughput_per_chip=tput * 0.1,
+            token_throughput_per_chip=tput,
+            p_mixed=0.05,
+            binding="hbm",
+            slo_met=True,
+        )
+
+    a1 = _mk_pt(p_a1, 64, 5000.0, 40.0)
+    a2 = _mk_pt(p_a2, 64, 4900.0, 39.0)
+    b = _mk_pt(p_b, 32, 4200.0, 65.0)
+    c = _mk_pt(p_c, 16, 3800.0, 80.0)
+    d = _mk_pt(p_d, 1, 2500.0, 130.0)
+    splan = ServingPlan(
+        model_layers=32,
+        chip="tpu7x",
+        scenario=scen,
+        mode="mixed",
+        recommended=a1,
+        frontier=(d, c, b, a1),
+        warnings=(),
+        candidates=(a1, a2, b, c, d),
+    )
+
+    top_k = 3
+    top = top_layouts(splan, k=top_k)
+    assert top == (a1, b, d)
+    cmds = {
+        tuple(point_launch_args(pt, kv_dtype="fp8", model="m")["commands"])
+        for pt in top
+    }
+    assert len(cmds) == top_k
+
+    payload = build_solve_payload(
+        splan,
+        chip=CHIPS["tpu7x"],
+        dtypes=Dtypes(kv=1.0),
+        model="m",
+        top_k=top_k,
+    )
+    roles = [entry["frontier_role"] for entry in payload["top_k"]]
+    margins = [entry["margin_vs_rank1_pct"] for entry in payload["top_k"]]
+    assert roles == ["max_throughput", "balanced_knee", "max_interactivity"]
+    assert margins == [0.0, -16.0, -50.0]
+
+
+def test_single_host_fit_excludes_ruled_out_candidates() -> None:
+    """Single-host fit rejects ruled-out single-host layouts."""
+    chip = CHIPS["tpu7x"]
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt = Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0)
+    impossible_scen = TrafficScenario(
+        name="impossible-slo",
+        isl=4096,
+        osl=512,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(1,),
+        kv_working_set_turns=1.0,
+        tpot_slo_ms=0.0001,
+    )
+    splan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        impossible_scen,
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    assert splan.recommended is None
+    assert splan.candidates
+    payload = build_solve_payload(splan, chip=chip, dtypes=dt)
+    assert payload["single_host_fit"]["feasible"] is False
+    assert payload["single_host_fit"]["status"] == "REJECTED"
+
+    host_pool = _sample_pool(
+        role="mixed",
+        cfg=_PoolConfig(topology="2x2x1", chips=4, tp=8, dp=1, ep=8),
+    )
+    ruled_out_pt = ParetoPoint(
+        mode="mixed",
+        concurrency=1,
+        total_chips=4,
+        prefill_pool=None,
+        decode_pool=host_pool,
+        p90_ttft_ms=50.0,
+        p90_tpot_ms=10.0,
+        p90_interactivity_tok_s=100.0,
+        output_throughput_per_chip=50.0,
+        token_throughput_per_chip=200.0,
+        p_mixed=0.0,
+        binding="hbm",
+        slo_met=False,
+        slo_verdict=SLO_VERDICT_RULED_OUT,
+    )
+    synthetic_plan = ServingPlan(
+        model_layers=8,
+        chip="tpu7x",
+        scenario=impossible_scen,
+        mode="mixed",
+        recommended=None,
+        frontier=(ruled_out_pt,),
+        warnings=(),
+        candidates=(ruled_out_pt,),
+        has_moe=True,
+        budget=4,
+    )
+    synth_payload = build_solve_payload(synthetic_plan, chip=chip, dtypes=dt)
+    assert synth_payload["single_host_fit"]["feasible"] is False
+    assert synth_payload["single_host_fit"]["status"] == "REJECTED"
+
+
+def test_solve_payload_preserves_pd_ratio_and_partial_pins() -> None:
+    """Solve payload preserves pd_ratio key and emits partial pins independently."""
+    chip = CHIPS["tpu7x"]
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt = Dtypes(w_dense=1.0, w_expert=1.0, kv=1.0)
+    scen = TrafficScenario(
+        name="pin-check",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(1, 4),
+        kv_working_set_turns=1.0,
+    )
+    full_pin_plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen,
+        SolveOptions(
+            mode="disagg",
+            prefill_topology="2x2x1",
+            decode_topology="2x2x1",
+            pd_ratio=(1, 2),
+        ),
+    )
+    assert full_pin_plan.pins == {
+        "prefill_topology": "2x2x1",
+        "decode_topology": "2x2x1",
+        "pd_ratio": "1:2",
+    }
+    expected_pinned_chips = 12
+    assert full_pin_plan.budget == expected_pinned_chips
+    full_payload = build_solve_payload(full_pin_plan, chip=chip, dtypes=dt)
+    assert full_payload["chip_budget"]["pd_ratio"] == "1:2"
+    assert full_payload["chip_budget"]["prefill_topology"] == "2x2x1"
+    assert full_payload["chip_budget"]["decode_topology"] == "2x2x1"
+    assert full_payload["pins"] == full_pin_plan.pins
+
+    partial_pin_plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen,
+        SolveOptions(mode="mixed", max_chips=8, decode_topology="2x2x1"),
+    )
+    assert partial_pin_plan.pins == {"decode_topology": "2x2x1"}
+    partial_payload = build_solve_payload(partial_pin_plan, chip=chip, dtypes=dt)
+    assert partial_payload["chip_budget"]["decode_topology"] == "2x2x1"
+    assert partial_payload["chip_budget"]["prefill_topology"] is None
+    assert partial_payload["chip_budget"]["pd_ratio"] is None
+    assert all(pt.decode_pool.topology == "2x2x1" for pt in partial_pin_plan.candidates)
+
+    ratio_only_plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen,
+        SolveOptions(mode="disagg", max_chips=12, pd_ratio=(1, 1)),
+    )
+    assert ratio_only_plan.pins == {"pd_ratio": "1:1"}
+    ratio_payload = build_solve_payload(ratio_only_plan, chip=chip, dtypes=dt)
+    assert ratio_payload["chip_budget"]["pd_ratio"] == "1:1"
+    assert all(
+        pt.prefill_pool is not None
+        and pt.prefill_pool.instances == 1
+        and pt.decode_pool.instances == 1
+        for pt in ratio_only_plan.candidates
+    )

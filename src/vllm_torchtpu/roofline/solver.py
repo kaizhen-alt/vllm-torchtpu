@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
@@ -30,14 +31,18 @@ from .constants import (
     EXAMPLE_SLO_TIERS,
     LINEAR_ATTENTION_LAYER_TOKENS,
     NO_FEASIBLE_LAYOUT_WARNING,
+    SLO_VERDICT_ESTIMATE_MEETS,
+    SLO_VERDICT_RULED_OUT,
     UNIT_GIGA,
     UNIT_MICRO,
     UNIT_MILLIS_PER_SECOND,
 )
 from .memory import (
+    HbmBreakdown,
     KvFitInput,
     SeqKvLayout,
     default_rpa_page_size,
+    hbm_breakdown_per_core_bytes,
     hbm_footprint_per_core_bytes,
     kv_bytes_per_core_parts,
     kv_capacity_and_hit_rate,
@@ -48,88 +53,21 @@ from .modules import Dtypes, Parallel, StepShape
 from .partition import (
     count_full_attn_layers,
 )
+from .schema import (
+    FloorTimes,
+    ParetoPoint,
+    PoolMeshPlan,
+    ScenarioOverrides,
+    SearchStats,
+    ServingPlan,
+    TrafficScenario,
+)
 from .step import FloorOptions, SpecShape, StepFloor, spec_cycle_floor, step_floor
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from .geometry import ModelGeometry
-
-
-@dataclass(frozen=True, slots=True)
-class TrafficScenario:
-    """User-selected workload distribution and optional p90 SLO bounds."""
-
-    name: str
-    isl: int
-    osl: int
-    prefix_hit_rate: float
-    accept_len: float
-    think_time_s: float
-    concurrencies: tuple[int, ...]
-    kv_working_set_turns: float
-    prefill_chunk: int = 2048
-    ttft_slo_ms: float | None = None
-    tpot_slo_ms: float | None = None
-    spec_tokens: int | None = None
-    kv_offload_gb: float = 0.0
-    page_size: int | None = None
-    max_num_seqs: int | None = None
-
-    def __post_init__(self) -> None:
-        """Validate input sequence lengths, hit rates, and concurrency parameters."""
-        if self.isl <= 0 or self.osl <= 0:
-            msg = f"isl and osl must be > 0, got {self.isl}, {self.osl}"
-            raise ValueError(msg)
-        if not 0.0 <= self.prefix_hit_rate <= 1.0:
-            msg = f"prefix_hit_rate must be in [0, 1], got {self.prefix_hit_rate}"
-            raise ValueError(msg)
-        if self.accept_len < 1.0:
-            msg = f"accept_len must be >= 1.0, got {self.accept_len}"
-            raise ValueError(msg)
-        self._validate_spec_tokens()
-        if self.think_time_s < 0.0:
-            msg = f"think_time_s must be >= 0, got {self.think_time_s}"
-            raise ValueError(msg)
-        if not self.concurrencies or any(c <= 0 for c in self.concurrencies):
-            msg = f"concurrencies must be positive ints, got {self.concurrencies}"
-            raise ValueError(msg)
-        if self.page_size is not None and self.page_size <= 0:
-            msg = f"page_size must be > 0, got {self.page_size}"
-            raise ValueError(msg)
-        if self.max_num_seqs is not None and self.max_num_seqs <= 0:
-            msg = f"max_num_seqs must be > 0, got {self.max_num_seqs}"
-            raise ValueError(msg)
-
-    def _validate_spec_tokens(self) -> None:
-        """Validate speculative decoding token count against accept_len."""
-        if self.spec_tokens is None:
-            return
-        if self.spec_tokens < 0:
-            msg = f"spec_tokens must be >= 0, got {self.spec_tokens}"
-            raise ValueError(msg)
-        if self.accept_len > 1.0 + float(self.spec_tokens):
-            msg = (
-                f"accept_len={self.accept_len} exceeds "
-                f"1 + spec_tokens={1 + self.spec_tokens}"
-            )
-            raise ValueError(msg)
-
-
-@dataclass(frozen=True, slots=True)
-class ScenarioOverrides:
-    """Optional field overrides applied when building an example TrafficScenario."""
-
-    isl: int | None = None
-    osl: int | None = None
-    concurrencies: tuple[int, ...] | None = None
-    prefix_hit_rate: float | None = None
-    accept_len: float | None = None
-    think_time_s: float | None = None
-    prefill_chunk: int | None = None
-    ttft_slo_ms: float | None = None
-    tpot_slo_ms: float | None = None
-    kv_working_set_turns: float | None = None
 
 
 EXAMPLE_SCENARIOS: dict[str, TrafficScenario] = {
@@ -236,84 +174,8 @@ def build_example_scenario(
 
 
 @dataclass(frozen=True, slots=True)
-class PoolMeshPlan:
-    """Homogeneous instance pool for mixed, prefill-only, or decode-only role."""
-
-    role: Literal["mixed", "prefill", "decode"]
-    instances: int
-    topology: str
-    chips_per_instance: int
-    tp: int
-    dp: int
-    ep: int
-    pp: int
-    pcp: int
-    kv_split: int
-    mesh_axes: tuple[int, ...]
-    hbm_used_gb: float
-    hbm_limit_gb: float
-    moe_dispatch: Literal["allreduce", "ag_ep", "a2a_push", "fused_rs"]
-    max_num_seqs: int | None = None
-    max_model_len: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ParetoPoint:
-    """Evaluated serving configuration with latency, throughput, and SLO state."""
-
-    mode: Literal["mixed", "disagg"]
-    concurrency: int
-    total_chips: int
-    prefill_pool: PoolMeshPlan | None
-    decode_pool: PoolMeshPlan
-    p90_ttft_ms: float
-    p90_tpot_ms: float
-    p90_interactivity_tok_s: float
-    output_throughput_per_chip: float
-    token_throughput_per_chip: float
-    p_mixed: float
-    binding: str
-    slo_met: bool
-    kv_cache_capacity_tokens: int | None = None
-    effective_prefix_hit_rate: float | None = None
-
-    @property
-    def est_ttft_ms(self) -> float:
-        """Compatibility property for p90_ttft_ms."""
-        return self.p90_ttft_ms
-
-    @property
-    def est_tpot_ms(self) -> float:
-        """Compatibility property for p90_tpot_ms."""
-        return self.p90_tpot_ms
-
-    @property
-    def est_interactivity_tok_s(self) -> float:
-        """Compatibility property for p90_interactivity_tok_s."""
-        return self.p90_interactivity_tok_s
-
-
-@dataclass(frozen=True, slots=True)
-class ServingPlan:
-    """Full Pareto frontier and recommended serving configuration for a scenario."""
-
-    model_layers: int
-    chip: str
-    scenario: TrafficScenario
-    mode: str
-    recommended: ParetoPoint | None
-    frontier: tuple[ParetoPoint, ...]
-    warnings: tuple[str, ...]
-    candidates: tuple[ParetoPoint, ...] = ()
-    gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION
-    collective_latency_s: float = 0.0
-    spec_k: int = 0
-    model_id: str = ""
-
-
-@dataclass(frozen=True, slots=True)
 class SolveOptions:
-    """Search mode, slice budget, and HBM headroom options for solve_serving_plan."""
+    """Search mode, slice budget, pins, and HBM headroom options."""
 
     mode: Literal["auto", "mixed", "disagg"] = "auto"
     max_chips: int | None = None
@@ -321,6 +183,10 @@ class SolveOptions:
     gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION
     topologies: tuple[SliceTopology, ...] | None = None
     collective_latency_s: float = 0.0
+    prefill_topology: str | None = None
+    decode_topology: str | None = None
+    pd_ratio: tuple[int, int] | None = None
+    budget_source: str = "flag"
 
 
 def _divisors(n: int) -> tuple[int, ...]:
@@ -463,6 +329,140 @@ def _candidate_moe_dispatches(
     if moe_mode == "ep" and dp > 1:
         return ["ag_ep", "a2a_push"]
     return ["allreduce"]
+
+
+# Disaggregated serving requires at least 1 prefill + 1 decode instance.
+_MIN_DISAGG_INSTANCES = 2
+# Four disjoint core-partitioning axes: PP, TP, DP, PCP.
+_ATTN_CORE_PARTITION_AXES = 4
+# Three decode MoE collective dispatches: allreduce, ag_ep, a2a_push.
+_CORE_GRID_DISPATCH_MODES = 3
+
+
+def _count_core_valid_layouts(cores: int, *, has_moe: bool) -> int:
+    """Count core-partitioned (PP, TP, DP, PCP, DCP, EP, dispatch) tuples."""
+    divisors = _divisors(cores)
+    moe_multiplier = len(divisors) * _CORE_GRID_DISPATCH_MODES if has_moe else 1
+    total = 0
+    for pp_degree, tp_degree, dp_degree, pcp_degree in itertools.product(
+        divisors, repeat=_ATTN_CORE_PARTITION_AXES
+    ):
+        if pp_degree * tp_degree * dp_degree * pcp_degree == cores:
+            total += len(_divisors(tp_degree)) * moe_multiplier
+    return total
+
+
+def _count_disagg_ratio_slots(
+    eval_context: _SolveContext,
+    prefill_topology: SliceTopology,
+    decode_topology: SliceTopology,
+) -> int:
+    """Count valid (prefill, decode) instance ratio slots for one slice pair."""
+    if eval_context.pd_ratio is not None:
+        xp_pin, yd_pin = eval_context.pd_ratio
+        total_chips = (
+            xp_pin * prefill_topology.num_chips + yd_pin * decode_topology.num_chips
+        )
+        if eval_context.max_chips is not None and total_chips > eval_context.max_chips:
+            return 0
+        if (
+            eval_context.max_instances is not None
+            and (xp_pin + yd_pin) > eval_context.max_instances
+        ):
+            return 0
+        return 1
+    effective_max_instances = (
+        eval_context.max_instances
+        if eval_context.max_instances is not None
+        else DEFAULT_MAX_INSTANCES
+    )
+    if effective_max_instances < _MIN_DISAGG_INSTANCES:
+        return 0
+    max_single_pool = effective_max_instances - 1
+    if eval_context.max_chips is not None:
+        max_prefill_instances = min(
+            max_single_pool, eval_context.max_chips // prefill_topology.num_chips
+        )
+        max_decode_instances = min(
+            max_single_pool, eval_context.max_chips // decode_topology.num_chips
+        )
+    else:
+        max_prefill_instances = max_single_pool
+        max_decode_instances = max_single_pool
+    slots = 0
+    for prefill_instances in range(1, max_prefill_instances + 1):
+        max_decode_for_prefill = min(
+            max_decode_instances, effective_max_instances - prefill_instances
+        )
+        for decode_instances in range(1, max_decode_for_prefill + 1):
+            total_chips = (
+                prefill_instances * prefill_topology.num_chips
+                + decode_instances * decode_topology.num_chips
+            )
+            if (
+                eval_context.max_chips is not None
+                and total_chips > eval_context.max_chips
+            ):
+                continue
+            slots += 1
+    return slots
+
+
+def _count_core_grid(
+    eval_context: _SolveContext,
+    topologies: Sequence[SliceTopology],
+) -> int:
+    """Count core-partitioned (layout, concurrency) tuples across searched pools."""
+    has_moe = eval_context.geom.num_experts > 0
+    concurrency_count = len(eval_context.scenario.concurrencies)
+    total = 0
+    if eval_context.mode in ("auto", "mixed") and (
+        eval_context.max_instances is None or eval_context.max_instances >= 1
+    ):
+        for topology in topologies:
+            if (
+                eval_context.decode_topology is not None
+                and topology.name != eval_context.decode_topology
+            ):
+                continue
+            if (
+                eval_context.max_chips is not None
+                and topology.num_chips > eval_context.max_chips
+            ):
+                continue
+            total += (
+                _count_core_valid_layouts(topology.num_cores, has_moe=has_moe)
+                * concurrency_count
+            )
+    if eval_context.mode in ("auto", "disagg"):
+        for decode_topology in topologies:
+            if (
+                eval_context.decode_topology is not None
+                and decode_topology.name != eval_context.decode_topology
+            ):
+                continue
+            decode_layout_count = _count_core_valid_layouts(
+                decode_topology.num_cores, has_moe=has_moe
+            )
+            for prefill_topology in topologies:
+                if (
+                    eval_context.prefill_topology is not None
+                    and prefill_topology.name != eval_context.prefill_topology
+                ):
+                    continue
+                prefill_layout_count = _count_core_valid_layouts(
+                    prefill_topology.num_cores, has_moe=has_moe
+                )
+                ratio_slots = _count_disagg_ratio_slots(
+                    eval_context, prefill_topology, decode_topology
+                )
+                total += (
+                    prefill_layout_count
+                    * decode_layout_count
+                    * ratio_slots
+                    * concurrency_count
+                )
+    return total
 
 
 def _candidate_decode_parallels(
@@ -693,7 +693,7 @@ def _pareto_filter(points: Sequence[ParetoPoint]) -> tuple[ParetoPoint, ...]:
     return tuple(frontier)
 
 
-@dataclass(frozen=True)
+@dataclass
 class _SolveContext:
     """Internal solver context capturing model, hardware, and scenario constants."""
 
@@ -716,6 +716,11 @@ class _SolveContext:
     page_size: int
     c_max: int
     collective_latency_s: float = 0.0
+    prefill_topology: str | None = None
+    decode_topology: str | None = None
+    pd_ratio: tuple[int, int] | None = None
+    enumerated: int = 0
+    hbm_fit: int = 0
 
 
 @dataclass(frozen=True)
@@ -727,6 +732,7 @@ class _PrefillOption:
     ttft_ms: float
     rate_p: float
     hbm_gb: float
+    hbm_bd: HbmBreakdown
 
 
 @dataclass(frozen=True)
@@ -787,6 +793,22 @@ class _PoolPlanInput:
     hbm_limit_gb: float
     max_num_seqs: int | None
     max_model_len: int
+    hbm_weights_gb: float = 0.0
+    hbm_kv_gb: float = 0.0
+    hbm_state_gb: float = 0.0
+
+
+def _floor_times(sf: StepFloor) -> FloorTimes:
+    """Extract decode-step resource times (ms) from a StepFloor."""
+    return FloorTimes(
+        hbm_ms=sf.hbm_s * UNIT_MILLIS_PER_SECOND,
+        matmul_ms=sf.matmul_s * UNIT_MILLIS_PER_SECOND,
+        ici_ms=sf.ici_s * UNIT_MILLIS_PER_SECOND,
+        chain_ms=sf.chain_s * UNIT_MILLIS_PER_SECOND,
+        hop_latency_ms=sf.latency_assumed_s * UNIT_MILLIS_PER_SECOND,
+        hard_floor_ms=sf.hard_floor_s * UNIT_MILLIS_PER_SECOND,
+        binding=sf.binding,
+    )
 
 
 def _build_pool_mesh_plan(spec: _PoolPlanInput) -> PoolMeshPlan:
@@ -811,6 +833,9 @@ def _build_pool_mesh_plan(spec: _PoolPlanInput) -> PoolMeshPlan:
         hbm_used_gb=spec.hbm_used_gb,
         hbm_limit_gb=spec.hbm_limit_gb,
         moe_dispatch=spec.par.moe_dispatch,
+        hbm_weights_gb=spec.hbm_weights_gb,
+        hbm_kv_gb=spec.hbm_kv_gb,
+        hbm_state_gb=spec.hbm_state_gb,
         max_num_seqs=spec.max_num_seqs,
         max_model_len=spec.max_model_len,
     )
@@ -876,28 +901,28 @@ def _clamp_resident_batch(
     eval_context: _SolveContext,
     par: Parallel,
     b_start: int,
-) -> tuple[int, float] | None:
+) -> tuple[int, HbmBreakdown] | None:
     """Decrease resident batch until HBM usage fits within hbm_limit_b."""
     b_res = b_start
-    hbm_b = hbm_footprint_per_core_bytes(
+    hbm_bd = hbm_breakdown_per_core_bytes(
         eval_context.geom,
         eval_context.dtypes,
         par,
         SeqKvLayout(b_res, eval_context.ctx_full),
         chip=eval_context.chip,
     )
-    while b_res > 1 and hbm_b > eval_context.hbm_limit_b:
+    while b_res > 1 and hbm_bd.total > eval_context.hbm_limit_b:
         b_res -= 1
-        hbm_b = hbm_footprint_per_core_bytes(
+        hbm_bd = hbm_breakdown_per_core_bytes(
             eval_context.geom,
             eval_context.dtypes,
             par,
             SeqKvLayout(b_res, eval_context.ctx_full),
             chip=eval_context.chip,
         )
-    if hbm_b > eval_context.hbm_limit_b:
+    if hbm_bd.total > eval_context.hbm_limit_b:
         return None
-    return b_res, hbm_b
+    return b_res, hbm_bd
 
 
 def _find_prefill_options(
@@ -908,6 +933,11 @@ def _find_prefill_options(
     prefill_options: list[_PrefillOption] = []
     min_req_ttft_ms = math.inf
     for topo in topos:
+        if (
+            eval_context.prefill_topology is not None
+            and topo.name != eval_context.prefill_topology
+        ):
+            continue
         for par in _candidate_prefill_parallels(
             eval_context.geom,
             topo,
@@ -915,13 +945,14 @@ def _find_prefill_options(
             spec_k=eval_context.spec_k,
             chip=eval_context.chip,
         ):
-            hbm_b = hbm_footprint_per_core_bytes(
+            hbm_bd = hbm_breakdown_per_core_bytes(
                 eval_context.geom,
                 eval_context.dtypes,
                 par,
                 SeqKvLayout(1, eval_context.scenario.isl),
                 chip=eval_context.chip,
             )
+            hbm_b = hbm_bd.total
             if hbm_b > eval_context.hbm_limit_b:
                 continue
             sf_p = _prefill_step_floor(
@@ -939,6 +970,7 @@ def _find_prefill_options(
                     ttft_ms=ttft_ms,
                     rate_p=rate_p,
                     hbm_gb=hbm_b / UNIT_GIGA,
+                    hbm_bd=hbm_bd,
                 )
             )
     return prefill_options, min_req_ttft_ms
@@ -1053,7 +1085,9 @@ def _evaluate_mixed_point(
     clamped = _clamp_resident_batch(eval_context, par, b_start)
     if clamped is None:
         return None
-    b_res, hbm_b = clamped
+    b_res, hbm_bd = clamped
+    hbm_b = hbm_bd.total
+    eval_context.hbm_fit += 1
     b_ws = max(1, math.ceil(c / max(1, par.dp)))
     cap_tok, h_eff = kv_capacity_and_hit_rate(
         eval_context.geom,
@@ -1173,6 +1207,9 @@ def _evaluate_mixed_point(
             hbm_limit_gb=eval_context.hbm_limit_gb,
             max_num_seqs=max_seqs_flag,
             max_model_len=eval_context.ctx_full,
+            hbm_weights_gb=hbm_bd.weights / UNIT_GIGA,
+            hbm_kv_gb=hbm_bd.kv / UNIT_GIGA,
+            hbm_state_gb=hbm_bd.state / UNIT_GIGA,
         )
     )
     binding = (
@@ -1192,6 +1229,8 @@ def _evaluate_mixed_point(
         p_mixed=p_mix,
         binding=binding,
         slo_met=slo_ok,
+        slo_verdict=(SLO_VERDICT_ESTIMATE_MEETS if slo_ok else SLO_VERDICT_RULED_OUT),
+        decode_floor=_floor_times(sf_dec),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=h_eff,
     )
@@ -1272,6 +1311,11 @@ def _evaluate_mixed_candidates(
     min_c1_tpot_ms = math.inf
     min_req_ttft_ms = math.inf
     for topo in topos:
+        if (
+            eval_context.decode_topology is not None
+            and topo.name != eval_context.decode_topology
+        ):
+            continue
         for par in _candidate_decode_parallels(
             eval_context.geom, topo, chip=eval_context.chip
         ):
@@ -1306,6 +1350,7 @@ def _evaluate_mixed_candidates(
                 fixed_kv_per_seq_b=fixed_kv_per_seq_b,
             )
             for c in eval_context.scenario.concurrencies:
+                eval_context.enumerated += 1
                 pt = _evaluate_mixed_point(eval_context, topo, par, c, bounds)
                 if pt is not None:
                     candidates.append(pt)
@@ -1435,7 +1480,9 @@ def _evaluate_disagg_instance_pair(
     clamped = _clamp_resident_batch(eval_context, dec.par, b_start)
     if clamped is None:
         return None
-    b_res, hbm_d = clamped
+    b_res, hbm_bd_d = clamped
+    hbm_d = hbm_bd_d.total
+    eval_context.hbm_fit += 1
     b_ws_d = max(1, math.ceil(target.c / max(1, target.y_d * dec.par.dp)))
     cap_tok, h_eff = kv_capacity_and_hit_rate(
         eval_context.geom,
@@ -1491,6 +1538,9 @@ def _evaluate_disagg_instance_pair(
             hbm_limit_gb=eval_context.hbm_limit_gb,
             max_num_seqs=None,
             max_model_len=eval_context.ctx_full,
+            hbm_weights_gb=pref.hbm_bd.weights / UNIT_GIGA,
+            hbm_kv_gb=pref.hbm_bd.kv / UNIT_GIGA,
+            hbm_state_gb=pref.hbm_bd.state / UNIT_GIGA,
         )
     )
     d_pool = _build_pool_mesh_plan(
@@ -1503,6 +1553,9 @@ def _evaluate_disagg_instance_pair(
             hbm_limit_gb=eval_context.hbm_limit_gb,
             max_num_seqs=max_seqs_d,
             max_model_len=eval_context.ctx_full,
+            hbm_weights_gb=hbm_bd_d.weights / UNIT_GIGA,
+            hbm_kv_gb=hbm_bd_d.kv / UNIT_GIGA,
+            hbm_state_gb=hbm_bd_d.state / UNIT_GIGA,
         )
     )
     return ParetoPoint(
@@ -1519,6 +1572,8 @@ def _evaluate_disagg_instance_pair(
         p_mixed=0.0,
         binding=sf_d.binding,
         slo_met=slo_ok,
+        slo_verdict=(SLO_VERDICT_ESTIMATE_MEETS if slo_ok else SLO_VERDICT_RULED_OUT),
+        decode_floor=_floor_times(sf_d),
         kv_cache_capacity_tokens=cap_tok_int,
         effective_prefix_hit_rate=h_eff,
     )
@@ -1552,18 +1607,32 @@ def _search_disagg_instance_ratios(
         )
         max_yd = min(eff_max_inst, max(1, eval_context.max_chips // dec.topo.num_chips))
     points: list[ParetoPoint] = []
-    for x_p in range(1, max_xp + 1):
-        for y_d in range(1, max_yd + 1):
-            total_chips = x_p * pref.topo.num_chips + y_d * dec.topo.num_chips
-            pt = _evaluate_disagg_instance_pair(
-                eval_context,
-                dec,
-                pref,
-                _DisaggRatioTarget(c=c, x_p=x_p, y_d=y_d, total_chips=total_chips),
-                cache,
-            )
-            if pt is not None:
-                points.append(pt)
+    ratio_pairs = (
+        [eval_context.pd_ratio]
+        if eval_context.pd_ratio is not None
+        else [
+            (x_p, y_d) for x_p in range(1, max_xp + 1) for y_d in range(1, max_yd + 1)
+        ]
+    )
+    for x_p, y_d in ratio_pairs:
+        total_chips = x_p * pref.topo.num_chips + y_d * dec.topo.num_chips
+        if eval_context.max_chips is not None and total_chips > eval_context.max_chips:
+            continue
+        if (
+            eval_context.max_instances is not None
+            and (x_p + y_d) > eval_context.max_instances
+        ):
+            continue
+        eval_context.enumerated += 1
+        pt = _evaluate_disagg_instance_pair(
+            eval_context,
+            dec,
+            pref,
+            _DisaggRatioTarget(c=c, x_p=x_p, y_d=y_d, total_chips=total_chips),
+            cache,
+        )
+        if pt is not None:
+            points.append(pt)
     return points
 
 
@@ -1578,6 +1647,11 @@ def _evaluate_disaggregated_candidates(
     candidates: list[ParetoPoint] = []
     cache: dict[tuple[str, Parallel, float], tuple[float, float]] = {}
     for topo_d in topos:
+        if (
+            eval_context.decode_topology is not None
+            and topo_d.name != eval_context.decode_topology
+        ):
+            continue
         offload_b = (
             float(eval_context.scenario.kv_offload_gb)
             * UNIT_GIGA
@@ -1659,6 +1733,54 @@ def _qwen4_scenario_warnings(
     return tuple(msgs)
 
 
+def _build_pins(opts: SolveOptions) -> dict[str, object] | None:
+    """Build canonical pin dictionary preserving any partial or full pins."""
+    pins: dict[str, object] = {}
+    if opts.prefill_topology is not None:
+        pins["prefill_topology"] = opts.prefill_topology
+    if opts.decode_topology is not None:
+        pins["decode_topology"] = opts.decode_topology
+    if opts.pd_ratio is not None:
+        x_p, y_d = opts.pd_ratio
+        if x_p < 1 or y_d < 1:
+            msg = f"pd_ratio must have positive counts, got {opts.pd_ratio}"
+            raise ValueError(msg)
+        pins["pd_ratio"] = f"{x_p}:{y_d}"
+    return pins or None
+
+
+def _resolve_budget_max_chips(
+    opts: SolveOptions,
+    *,
+    chip: ChipSpec,
+) -> int | None:
+    """Resolve effective max_chips when full disagg pins are set."""
+    if (
+        opts.pd_ratio is None
+        or opts.prefill_topology is None
+        or opts.decode_topology is None
+    ):
+        return opts.max_chips
+    topo_map = (
+        {t.name: t for t in opts.topologies}
+        if opts.topologies is not None
+        else topologies_for_chip(chip)
+    )
+    if opts.prefill_topology not in topo_map or opts.decode_topology not in topo_map:
+        return opts.max_chips
+    pinned_chips = (
+        opts.pd_ratio[0] * topo_map[opts.prefill_topology].num_chips
+        + opts.pd_ratio[1] * topo_map[opts.decode_topology].num_chips
+    )
+    if opts.max_chips is not None and opts.max_chips != pinned_chips:
+        msg = (
+            f"Pinned disagg chips ({pinned_chips}) conflicts with "
+            f"max_chips={opts.max_chips}"
+        )
+        raise ValueError(msg)
+    return pinned_chips
+
+
 def _active_mode_min_ttft(
     mode: str,
     min_prefill_ttft_ms: float,
@@ -1690,6 +1812,9 @@ def solve_serving_plan(
     if opts.collective_latency_s < 0.0:
         msg = f"collective_latency_s must be >= 0, got {opts.collective_latency_s}"
         raise ValueError(msg)
+    pins = _build_pins(opts)
+    resolved_max_chips = _resolve_budget_max_chips(opts, chip=chip)
+    opts = replace(opts, max_chips=resolved_max_chips)
     topos = _resolve_solve_topologies(opts, chip=chip)
     hbm_limit_b = float(opts.gpu_memory_utilization) * float(chip.hbm_bytes)
     eff_al = max(1.0, scenario.accept_len)
@@ -1727,6 +1852,9 @@ def solve_serving_plan(
         page_size=page_size,
         c_max=max(scenario.concurrencies),
         collective_latency_s=opts.collective_latency_s,
+        prefill_topology=opts.prefill_topology,
+        decode_topology=opts.decode_topology,
+        pd_ratio=opts.pd_ratio,
     )
 
     qwen4_warnings = _qwen4_scenario_warnings(geom, ctx_full, spec_k)
@@ -1744,6 +1872,11 @@ def solve_serving_plan(
             collective_latency_s=opts.collective_latency_s,
             spec_k=spec_k,
             model_id=geom.model_id,
+            has_moe=geom.num_experts > 0,
+            budget=opts.max_chips if opts.max_chips is not None else 0,
+            budget_source=opts.budget_source,
+            max_instances=opts.max_instances,
+            pins=pins,
         )
     prefill_options, min_prefill_ttft_ms = _find_prefill_options(eval_context, topos)
     mixed_candidates, min_c1_tpot_ms, min_mixed_ttft_ms = _evaluate_mixed_candidates(
@@ -1810,4 +1943,16 @@ def solve_serving_plan(
         collective_latency_s=opts.collective_latency_s,
         spec_k=spec_k,
         model_id=geom.model_id,
+        has_moe=geom.num_experts > 0,
+        search=SearchStats(
+            enumerated=eval_context.enumerated,
+            core_grid=_count_core_grid(eval_context, topos),
+            hbm_fit=eval_context.hbm_fit,
+            slo_met=len(slo_candidates),
+            frontier=len(frontier),
+        ),
+        budget=opts.max_chips if opts.max_chips is not None else 0,
+        budget_source=opts.budget_source,
+        max_instances=opts.max_instances,
+        pins=pins,
     )

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from jax.experimental.pallas import tpu as pltpu
 
@@ -252,6 +252,22 @@ EXAMPLE_SLO_TIERS: dict[str, tuple[float | None, float | None]] = {
 NO_FEASIBLE_LAYOUT_WARNING: str = (
     "No feasible layout met memory and latency constraints."
 )
+
+# Three-valued SLO feasibility verdicts and ascending rank order.
+type SloVerdict = Literal["ruled_out", "estimate_meets", "undecided"]
+
+SLO_VERDICT_RULED_OUT: SloVerdict = "ruled_out"
+SLO_VERDICT_UNDECIDED: SloVerdict = "undecided"
+SLO_VERDICT_ESTIMATE_MEETS: SloVerdict = "estimate_meets"
+
+SLO_VERDICT_RANK: dict[str, int] = {
+    SLO_VERDICT_RULED_OUT: 0,
+    SLO_VERDICT_UNDECIDED: 1,
+    SLO_VERDICT_ESTIMATE_MEETS: 2,
+}
+
+# Sub-1e-9 tok/s guard (~1e7 * float64 ulp at 1e5 tok/s) for 2D envelope ties.
+FRONTIER_2D_TIE_TOLERANCE: float = 1e-9
 # PCP KV interleave satisfying both pooled GDN (% 16) and HND (% 128).
 DEFAULT_PCP_KV_INTERLEAVE_SIZE: int = 128
 

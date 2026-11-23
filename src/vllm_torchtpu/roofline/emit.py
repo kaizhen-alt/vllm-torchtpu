@@ -11,31 +11,56 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Render vLLM serve CLI flags and uncalibrated L1 candidate curves from plans."""
+"""Render vLLM serve CLI flags, top-K anchor shortlists, and solve JSON."""
 
 from __future__ import annotations
 
 import json
 import shlex
-from dataclasses import asdict
-from typing import TYPE_CHECKING, TypedDict
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING, TypedDict, Unpack
 
-from .chips import CHIPS
+from .chips import CHIPS, JAX_VERSION, chip_catalog, topologies_for_chip
 from .constants import (
     DEFAULT_CHIPS_PER_HOST,
     DEFAULT_CORES_PER_CHIP,
     DEFAULT_PCP_KV_INTERLEAVE_SIZE,
+    DEFAULT_TOP_K,
+    FRONTIER_2D_TIE_TOLERANCE,
     KV_DTYPE_BYTES,
+    MIN_TOP_LAYOUTS_FOR_FASTEST,
     NO_FEASIBLE_LAYOUT_WARNING,
+    PERCENT_SCALE,
+    SLO_VERDICT_RANK,
+    SLO_VERDICT_RULED_OUT,
+    SOLVE_SCHEMA,
+    UNIT_GIGA,
+)
+from .schema import (
+    CeilingRow,
+    LaunchPayload,
+    ParetoPoint,
+    PointLaunchPayload,
+    PoolMeshPlan,
+    PoolStructKey,
+    ProvenancePayload,
+    ServingPlan,
+    SolvePayload,
+    TopKEntry,
+    _point_struct_key,
+    effective_slo_verdict,
+    format_host_count,
+    format_parallelism,
+    format_submodule_parallelism,
+    pool_label,
+    pool_slice_summary,
 )
 from .solver import classify_multihost_mp_mode
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
-    from .chips import ChipSpec
+    from .chips import ChipSpec, SliceTopology
     from .modules import Dtypes
-    from .solver import PoolMeshPlan, ServingPlan
 
 # Printed in a command in place of a model that ``vllm serve`` cannot load.
 _MODEL_PLACEHOLDER = "<MODEL>"
@@ -55,30 +80,61 @@ _UNKNOWN_MODEL_WARNING = (
     "command with a model ID or a model directory."
 )
 
+__all__ = [
+    "FRONTIER_2D_TIE_TOLERANCE",
+    "CeilingRow",
+    "LaunchOptions",
+    "LaunchPayload",
+    "PointLaunchPayload",
+    "ProvenancePayload",
+    "SolvePayload",
+    "TopKEntry",
+    "build_solve_payload",
+    "emit_ceiling_rows",
+    "emit_launch_args",
+    "format_host_count",
+    "format_parallelism",
+    "format_solve_json",
+    "format_submodule_parallelism",
+    "point_launch_args",
+    "pool_cli_args",
+    "pool_label",
+    "pool_slice_summary",
+    "top_layout_roles",
+    "top_layouts",
+]
 
-class LaunchPayload(TypedDict):
-    """Structured vLLM serve CLI payload emitted for the top-ranked L1 candidate."""
 
-    mode: str
-    cli_args: list[str]
-    prefill_cli_args: list[str]
-    commands: list[str]
-    warnings: list[str]
-    serving_plan: Mapping[str, object]
+@dataclass(frozen=True, slots=True)
+class LaunchOptions:
+    """Typed launch command emission options for ``point_launch_args``."""
+
+    kv_dtype: str = "auto"
+    gpu_memory_utilization: float | None = None
+    model: str | None = None
+    chip: ChipSpec | None = None
+    model_id: str = ""
+    spec_k: int = 0
 
 
-class CeilingRow(TypedDict):
-    """Single uncalibrated L1 candidate row exported by ``emit_ceiling_rows``."""
+class _PointLaunchKwargs(TypedDict, total=False):
+    """Keyword-argument overrides accepted by ``point_launch_args``."""
 
-    p90_interactivity_tok_s: float
-    token_throughput_per_chip: float
-    output_throughput_per_chip: float
-    p90_ttft_ms: float
-    p90_tpot_ms: float
-    concurrency: int
-    total_chips: int
-    mode: str
-    binding_unit: str
+    kv_dtype: str
+    gpu_memory_utilization: float | None
+    model: str | None
+    chip: ChipSpec | None
+    model_id: str
+    spec_k: int
+
+
+class _BuildSolvePayloadOpts(TypedDict, total=False):
+    """Optional arguments for ``build_solve_payload``."""
+
+    dtypes: Dtypes | None
+    model: str | None
+    top_k: int
+    topologies: Mapping[str, SliceTopology] | Sequence[SliceTopology] | None
 
 
 def _kv_transfer_flag_value(role: str) -> str | None:
@@ -316,6 +372,194 @@ def _format_pool_commands(
     return commands
 
 
+def _frontier_2d_v1(points: Sequence[ParetoPoint]) -> list[ParetoPoint]:
+    """Return upper envelope over modeled (interactivity, throughput) estimates."""
+    ordered = sorted(
+        points,
+        key=lambda point: (
+            -point.p90_interactivity_tok_s,
+            -point.token_throughput_per_chip,
+        ),
+    )
+    envelope: list[ParetoPoint] = []
+    best_throughput = -1.0
+    for point in ordered:
+        if (
+            point.token_throughput_per_chip
+            > best_throughput + FRONTIER_2D_TIE_TOLERANCE
+        ):
+            envelope.append(point)
+            best_throughput = point.token_throughput_per_chip
+    envelope.sort(key=lambda point: point.p90_interactivity_tok_s)
+    return envelope
+
+
+def _is_2d_dominated(
+    point: ParetoPoint,
+    peers: Sequence[ParetoPoint],
+) -> bool:
+    """Return True if a peer beats point on both interactivity and throughput."""
+    return any(
+        other is not point
+        and other.p90_interactivity_tok_s >= point.p90_interactivity_tok_s
+        and other.token_throughput_per_chip >= point.token_throughput_per_chip
+        and (
+            other.p90_interactivity_tok_s > point.p90_interactivity_tok_s
+            or other.token_throughput_per_chip > point.token_throughput_per_chip
+        )
+        for other in peers
+    )
+
+
+def top_layouts(plan: ServingPlan, k: int = DEFAULT_TOP_K) -> tuple[ParetoPoint, ...]:
+    """Build a heuristic family-collapsed anchor shortlist of up to k layouts.
+
+    Collapses modeled candidates across concurrencies by structural pool axes
+    and selects uncalibrated serial-phase throughput/interactivity anchors
+    that satisfy SLO targets.
+    """
+    if k <= 0:
+        return ()
+    best: dict[tuple[str, PoolStructKey | None, PoolStructKey | None], ParetoPoint] = {}
+    slo_cands: list[ParetoPoint] = []
+    frontier_slo = [pt for pt in plan.frontier if pt.slo_met]
+    source_points = _frontier_2d_v1(frontier_slo) or [
+        pt for pt in plan.candidates if pt.slo_met
+    ]
+    for pt in source_points:
+        if not pt.slo_met:
+            continue
+        slo_cands.append(pt)
+        key = _point_struct_key(pt)
+        cur = best.get(key)
+        if cur is None or (
+            pt.token_throughput_per_chip,
+            pt.p90_interactivity_tok_s,
+        ) > (
+            cur.token_throughput_per_chip,
+            cur.p90_interactivity_tok_s,
+        ):
+            best[key] = pt
+    ranked = sorted(best.values(), key=lambda p: -p.token_throughput_per_chip)
+    if len(ranked) <= 1 or k < MIN_TOP_LAYOUTS_FOR_FASTEST:
+        return tuple(ranked[:k])
+    selected = list(ranked[:k])
+    fastest = max(
+        slo_cands,
+        key=lambda p: (p.p90_interactivity_tok_s, p.token_throughput_per_chip),
+    )
+    f_key = _point_struct_key(fastest)
+    sel_keys = [_point_struct_key(p) for p in selected]
+    if f_key not in sel_keys:
+        selected[-1] = fastest
+    elif sel_keys.index(f_key) > 0:
+        selected[sel_keys.index(f_key)] = fastest
+    selected.sort(key=lambda p: -p.token_throughput_per_chip)
+    return tuple(selected)
+
+
+def top_layout_roles(
+    top_pts: tuple[ParetoPoint, ...],
+    frontier: Sequence[ParetoPoint] = (),
+) -> list[tuple[ParetoPoint, str, float]]:
+    """Annotate selected Top-K points with role labels and Rank-1 throughput margins."""
+    top1_tput = top_pts[0].token_throughput_per_chip if top_pts else 0.0
+    fastest_idx = (
+        max(
+            range(len(top_pts)),
+            key=lambda i: (
+                top_pts[i].p90_interactivity_tok_s,
+                top_pts[i].token_throughput_per_chip,
+            ),
+        )
+        if len(top_pts) > 1
+        else -1
+    )
+    eligible_frontier = [
+        pt for pt in frontier if effective_slo_verdict(pt) != SLO_VERDICT_RULED_OUT
+    ]
+    dominance_pool: tuple[ParetoPoint, ...] = (*top_pts, *eligible_frontier)
+    out: list[tuple[ParetoPoint, str, float]] = []
+    for idx, pt in enumerate(top_pts):
+        if idx == 0:
+            role = "max_throughput"
+        elif idx == fastest_idx:
+            role = "max_interactivity"
+        elif _is_2d_dominated(pt, dominance_pool):
+            role = "off_frontier_alt"
+        else:
+            role = "balanced_knee"
+        margin = round(
+            PERCENT_SCALE
+            * (pt.token_throughput_per_chip - top1_tput)
+            / max(1e-9, top1_tput),
+            2,
+        )
+        out.append((pt, role, margin))
+    return out
+
+
+def point_launch_args(
+    pt: ParetoPoint,
+    options: LaunchOptions | None = None,
+    **kwargs: Unpack[_PointLaunchKwargs],
+) -> PointLaunchPayload:
+    """Emit ``vllm serve`` CLI flags and commands for a single ``ParetoPoint``."""
+    base = options or LaunchOptions()
+    kv_dtype = kwargs.get("kv_dtype", base.kv_dtype)
+    gpu_memory_utilization = kwargs.get(
+        "gpu_memory_utilization", base.gpu_memory_utilization
+    )
+    model = kwargs.get("model", base.model)
+    chip = kwargs.get("chip", base.chip)
+    model_id = kwargs.get("model_id", base.model_id)
+    spec_k = kwargs.get("spec_k", base.spec_k)
+    decode_args = pool_cli_args(
+        pt.decode_pool,
+        kv_dtype=kv_dtype,
+        gpu_memory_utilization=gpu_memory_utilization,
+        model_id=model_id,
+        spec_k=spec_k,
+    )
+    prefill_args = (
+        pool_cli_args(
+            pt.prefill_pool,
+            kv_dtype=kv_dtype,
+            gpu_memory_utilization=gpu_memory_utilization,
+            model_id=model_id,
+            spec_k=spec_k,
+        )
+        if pt.prefill_pool is not None
+        else []
+    )
+    commands: list[str] = []
+    if pt.prefill_pool is not None:
+        commands.extend(
+            _format_pool_commands(
+                pt.prefill_pool,
+                prefill_args,
+                model,
+                chip=chip,
+                model_id=model_id,
+            )
+        )
+    commands.extend(
+        _format_pool_commands(
+            pt.decode_pool,
+            decode_args,
+            model,
+            chip=chip,
+            model_id=model_id,
+        )
+    )
+    return {
+        "mode": pt.mode,
+        "cli_args": decode_args,
+        "prefill_cli_args": prefill_args,
+        "commands": commands,
+    }
+
+
 def emit_launch_args(
     plan: ServingPlan,
     *,
@@ -330,7 +574,11 @@ def emit_launch_args(
     eff_chip = chip if chip is not None else CHIPS.get(plan.chip)
     warnings = list(plan.warnings)
     rec = plan.recommended
-    if rec is None or not rec.slo_met:
+    if (
+        rec is None
+        or not rec.slo_met
+        or effective_slo_verdict(rec) == SLO_VERDICT_RULED_OUT
+    ):
         if not warnings:
             warnings.append(NO_FEASIBLE_LAYOUT_WARNING)
         return {
@@ -342,57 +590,223 @@ def emit_launch_args(
             "serving_plan": asdict(plan),
         }
 
-    decode_args = pool_cli_args(
-        rec.decode_pool,
+    launch = point_launch_args(
+        rec,
         kv_dtype=kv_str,
         gpu_memory_utilization=plan.gpu_memory_utilization,
+        model=model,
+        chip=eff_chip,
         model_id=plan.model_id,
         spec_k=plan.spec_k,
     )
-    prefill_args = (
-        pool_cli_args(
-            rec.prefill_pool,
-            kv_dtype=kv_str,
-            gpu_memory_utilization=plan.gpu_memory_utilization,
-            model_id=plan.model_id,
-            spec_k=plan.spec_k,
-        )
-        if rec.prefill_pool is not None
-        else []
-    )
-    commands: list[str] = []
-    if rec.prefill_pool is not None:
-        commands.extend(
-            _format_pool_commands(
-                rec.prefill_pool,
-                prefill_args,
-                model,
-                chip=eff_chip,
-                model_id=plan.model_id,
-            )
-        )
-    commands.extend(
-        _format_pool_commands(
-            rec.decode_pool,
-            decode_args,
-            model,
-            chip=eff_chip,
-            model_id=plan.model_id,
-        )
-    )
-
     if rec.prefill_pool is not None:
         warnings.append(_DISAGG_WIRING_WARNING)
     if _servable_model(model) is None:
         warnings.append(_UNKNOWN_MODEL_WARNING)
     return {
-        "mode": rec.mode,
-        "cli_args": decode_args,
-        "prefill_cli_args": prefill_args,
-        "commands": commands,
+        "mode": launch["mode"],
+        "cli_args": launch["cli_args"],
+        "prefill_cli_args": launch["prefill_cli_args"],
+        "commands": launch["commands"],
         "warnings": warnings,
         "serving_plan": asdict(plan),
     }
+
+
+def _resolve_single_host_topology(
+    chips_per_host: int,
+    chip: ChipSpec | None,
+    topologies: Mapping[str, SliceTopology] | Sequence[SliceTopology] | None,
+) -> str:
+    """Return single-host slice topology name matching ``chips_per_host``."""
+    if topologies is not None:
+        topo_seq = (
+            list(topologies.values())
+            if isinstance(topologies, Mapping)
+            else list(topologies)
+        )
+    elif chip is not None:
+        topo_seq = list(topologies_for_chip(chip).values())
+    else:
+        topo_seq = list(topologies_for_chip("tpu7x").values())
+    return next(
+        (topo.name for topo in topo_seq if topo.num_chips == chips_per_host),
+        f"{chips_per_host}chip",
+    )
+
+
+def _compute_single_host_fit(
+    plan: ServingPlan,
+    *,
+    chip: ChipSpec | None = None,
+    topologies: Mapping[str, SliceTopology] | Sequence[SliceTopology] | None = None,
+) -> dict[str, object]:
+    """Compute single-host slice fit verdict, capacity, and status."""
+    eff_chip = chip if chip is not None else CHIPS.get(plan.chip)
+    chips_per_host = (
+        eff_chip.chips_per_host if eff_chip is not None else DEFAULT_CHIPS_PER_HOST
+    )
+    cores_per_chip = (
+        eff_chip.cores_per_chip if eff_chip is not None else DEFAULT_CORES_PER_CHIP
+    )
+    cores_per_host = chips_per_host * cores_per_chip
+    host_topo = _resolve_single_host_topology(chips_per_host, eff_chip, topologies)
+    host_desc = f"(1 host, {chips_per_host} chips, {cores_per_host} TensorCores)"
+    host_points = [
+        pt
+        for pt in (*plan.frontier, *plan.candidates)
+        if pt.total_chips == chips_per_host
+        and pt.decode_pool.topology == host_topo
+        and pt.prefill_pool is None
+        and effective_slo_verdict(pt) != SLO_VERDICT_RULED_OUT
+    ]
+    if host_points:
+        best_pt = max(
+            host_points,
+            key=lambda point: (
+                SLO_VERDICT_RANK[effective_slo_verdict(point)],
+                point.token_throughput_per_chip,
+            ),
+        )
+        pool = best_pt.decode_pool
+        return {
+            "feasible": True,
+            "status": "FEASIBLE",
+            "reason": f"Fits single-host {host_topo} {host_desc}",
+            "topology": host_topo,
+            "chips_per_host": chips_per_host,
+            "cores_per_host": cores_per_host,
+            "hbm_used_gb": round(pool.hbm_used_gb, 2),
+            "hbm_limit_gb": round(pool.hbm_limit_gb, 2),
+            "best_parallelism": format_parallelism(asdict(pool)),
+            "best_submodule_parallelism": format_submodule_parallelism(
+                asdict(pool), has_moe=plan.has_moe
+            ),
+        }
+    per_core_bytes = eff_chip.hbm_bytes if eff_chip else CHIPS["tpu7x"].hbm_bytes
+    limit_gb = round(
+        max(0.0, per_core_bytes * plan.gpu_memory_utilization) / float(UNIT_GIGA),
+        2,
+    )
+    if plan.mode == "disagg":
+        reason = (
+            f"Disaggregated mode selected; single-host {host_topo} requires mixed mode "
+            f"{host_desc}"
+        )
+    elif 0 < plan.budget < chips_per_host:
+        reason = (
+            f"Chip budget ({plan.budget}) is below 1 host "
+            f"({host_topo} requires {chips_per_host} chips, "
+            f"{cores_per_host} TensorCores)"
+        )
+    else:
+        reason = (
+            f"No feasible {host_topo} layout within HBM, SMEM, head-divisibility, or "
+            f"SLO bounds {host_desc}"
+        )
+    return {
+        "feasible": False,
+        "status": "REJECTED",
+        "reason": reason,
+        "topology": host_topo,
+        "chips_per_host": chips_per_host,
+        "cores_per_host": cores_per_host,
+        "hbm_used_gb": 0.0,
+        "hbm_limit_gb": limit_gb,
+        "best_parallelism": None,
+        "best_submodule_parallelism": None,
+    }
+
+
+def build_solve_payload(
+    plan: ServingPlan,
+    *,
+    chip: ChipSpec,
+    **opts: Unpack[_BuildSolvePayloadOpts],
+) -> SolvePayload:
+    """Build versioned solve JSON payload with L1 provenance and anchor shortlist."""
+    dtypes = opts.get("dtypes")
+    model = opts.get("model")
+    top_k = opts.get("top_k", DEFAULT_TOP_K)
+    topologies = opts.get("topologies")
+    kv_str = (
+        "fp8" if (dtypes is not None and dtypes.kv <= KV_DTYPE_BYTES["fp8"]) else "auto"
+    )
+    top_pts = top_layouts(plan, top_k)
+    launch_opts = LaunchOptions(
+        kv_dtype=kv_str,
+        gpu_memory_utilization=plan.gpu_memory_utilization,
+        model=model,
+        chip=chip,
+        model_id=plan.model_id,
+        spec_k=plan.spec_k,
+    )
+    top_entries: list[TopKEntry] = [
+        {
+            "frontier_role": role,
+            "margin_vs_rank1_pct": margin,
+            "point": asdict(pt),
+            "launch": point_launch_args(pt, launch_opts),
+        }
+        for pt, role, margin in top_layout_roles(top_pts, plan.frontier)
+    ]
+    pins_map = plan.pins or {}
+    chip_dict: dict[str, object] = dict(asdict(chip).items())
+    chip_dict["jax_version"] = JAX_VERSION
+    chip_dict["catalog"] = chip_catalog(chip)
+    target_chips = (
+        plan.recommended.total_chips if plan.recommended is not None else plan.budget
+    )
+    payload: SolvePayload = {
+        "model_layers": plan.model_layers,
+        "chip": plan.chip,
+        "scenario": asdict(plan.scenario),
+        "mode": plan.mode,
+        "recommended": (
+            asdict(plan.recommended) if plan.recommended is not None else None
+        ),
+        "frontier": tuple(asdict(p) for p in plan.frontier),
+        "warnings": plan.warnings,
+        "candidates": tuple(asdict(p) for p in plan.candidates),
+        "gpu_memory_utilization": plan.gpu_memory_utilization,
+        "search": asdict(plan.search) if plan.search is not None else None,
+        "schema": SOLVE_SCHEMA,
+        "provenance": {
+            "calibrated": False,
+            "basis": (
+                "L1 analytical step floors and uncalibrated serial-phase "
+                "p90 estimates; modeled, not measured"
+            ),
+        },
+        "chip_spec": chip_dict,
+        "model": model,
+        "top_k": top_entries,
+        "has_moe": plan.has_moe,
+        "single_host_fit": _compute_single_host_fit(
+            plan, chip=chip, topologies=topologies
+        ),
+        "target_chips": target_chips,
+        "budget": plan.budget,
+        "budget_source": plan.budget_source,
+        "max_instances": plan.max_instances,
+        "pins": plan.pins,
+        "chip_budget": {
+            "max_chips": plan.budget,
+            "budget_source": plan.budget_source,
+            "max_instances": plan.max_instances,
+            "prefill_topology": pins_map.get("prefill_topology"),
+            "decode_topology": pins_map.get("decode_topology"),
+            "pd_ratio": pins_map.get("pd_ratio", pins_map.get("pd")),
+        },
+    }
+    if dtypes is not None:
+        payload["dtypes"] = asdict(dtypes)
+    return payload
+
+
+def format_solve_json(payload: SolvePayload) -> str:
+    """Serialize a ``SolvePayload`` mapping as a JSON string."""
+    return json.dumps(payload)
 
 
 def emit_ceiling_rows(plan: ServingPlan) -> list[CeilingRow]:

@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 from .chips import CHIPS, ChipSpec, SliceTopology, load_chip_spec
 from .constants import (
     DEFAULT_GPU_MEMORY_UTILIZATION,
+    DEFAULT_TOP_K,
     EXAMPLE_CONCURRENCIES,
     EXAMPLE_SLO_TIERS,
     EXPERT_DTYPE_BYTES,
@@ -36,8 +37,10 @@ from .constants import (
     WEIGHT_DTYPE_BYTES,
 )
 from .emit import (
+    build_solve_payload,
     emit_ceiling_rows,
     emit_launch_args,
+    format_solve_json,
 )
 from .geometry import UnsupportedArchitectureError, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config_with_identity
@@ -148,6 +151,7 @@ def _add_scenario_args(p: argparse.ArgumentParser) -> None:
         type=float,
         default=DEFAULT_GPU_MEMORY_UTILIZATION,
     )
+    p.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     p.add_argument("--json", action="store_true")
 
 
@@ -353,7 +357,16 @@ def _dispatch_solve(
     if args.cmd == "emit":
         return _dispatch_emit(args, splan, dt_resolved, chip)
     if args.json:
-        sys.stdout.write(json.dumps(asdict(splan)) + "\n")
+        src = args.model if args.model is not None else (model_ref or args.config)
+        payload = build_solve_payload(
+            splan,
+            chip=chip,
+            dtypes=dt_resolved,
+            model=src,
+            top_k=args.top_k,
+            topologies=custom_topos,
+        )
+        sys.stdout.write(format_solve_json(payload) + "\n")
         return 0
     for warning in splan.warnings:
         sys.stdout.write(f"WARNING: {warning}\n")
