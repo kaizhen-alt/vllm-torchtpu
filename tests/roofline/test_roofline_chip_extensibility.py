@@ -458,3 +458,88 @@ def test_load_chip_spec_native_fp4_and_zero_fp8() -> None:
     )
     assert step_bf16.matmul_s > 0.0
     assert spec_bf16.matmul_s > step_bf16.matmul_s
+
+
+def test_disagg_offload_h_hbm_p_uses_custom_chip_spec() -> None:
+    """Verify disagg offload h_hbm_p and PP partitioning use custom chip alignment."""
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt = rf.dtypes_from_hf_config(SMALL_HYBRID_MOE_CFG)
+    base_chip = CHIPS["tpu7x"]
+    wide_align_elems = 512
+    tight_hbm_bytes = int(20.0 * rf_constants.UNIT_GIGA)
+    narrow_chip = _build_spec_chip(
+        {
+            "name": "narrow_align_test",
+            "provenance": "public_spec",
+            "hbm_bytes": tight_hbm_bytes,
+            "hbm_bw": base_chip.hbm_bw,
+            "bf16_flops": base_chip.bf16_flops,
+            "fp8_flops": base_chip.fp8_flops,
+            "ici_bw": base_chip.ici_bw,
+            "d2d_bw": base_chip.d2d_bw,
+            "pcie_bw": 2.0e9,
+            "dcn_bw": base_chip.dcn_bw,
+            "physical_alignment_elems": 128,
+        },
+        base_chip,
+    )
+    wide_chip = _build_spec_chip(
+        {
+            "name": "wide_align_test",
+            "provenance": "public_spec",
+            "hbm_bytes": tight_hbm_bytes,
+            "hbm_bw": base_chip.hbm_bw,
+            "bf16_flops": base_chip.bf16_flops,
+            "fp8_flops": base_chip.fp8_flops,
+            "ici_bw": base_chip.ici_bw,
+            "d2d_bw": base_chip.d2d_bw,
+            "pcie_bw": 2.0e9,
+            "dcn_bw": base_chip.dcn_bw,
+            "physical_alignment_elems": wide_align_elems,
+        },
+        base_chip,
+    )
+    par_pp2 = Parallel(tp=1, pp=2, moe="tp_slice", ranks_per_chip=2)
+    _, bd_narrow, _, ok_narrow = rf.pp_stage_breakdowns(
+        geom, dt, par_pp2, (4096, 1), chip=narrow_chip
+    )
+    part_wide, bd_wide, _, ok_wide = rf.pp_stage_breakdowns(
+        geom, dt, par_pp2, (4096, 1), chip=wide_chip
+    )
+    assert ok_narrow
+    assert ok_wide
+    assert bd_wide.kv > bd_narrow.kv
+    assert (
+        rf.partition_pp_layers(geom, dt, par_pp2, (4096, 1), chip=wide_chip)
+        == part_wide
+    )
+
+    scen = rf.TrafficScenario(
+        name="custom-align-offload",
+        isl=8192,
+        osl=256,
+        prefix_hit_rate=0.95,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(32,),
+        kv_working_set_turns=30.0,
+        kv_offload_gb=64.0,
+    )
+    topo_set = (rf.TOPOLOGIES["2x2x1"],)
+    plan_narrow = rf.solve_serving_plan(
+        geom,
+        dt,
+        narrow_chip,
+        scen,
+        rf.SolveOptions(mode="disagg", max_chips=8, topologies=topo_set),
+    )
+    plan_wide = rf.solve_serving_plan(
+        geom,
+        dt,
+        wide_chip,
+        scen,
+        rf.SolveOptions(mode="disagg", max_chips=8, topologies=topo_set),
+    )
+    assert plan_narrow.recommended is not None
+    assert plan_wide.recommended is not None
+    assert plan_wide.recommended.est_ttft_ms > plan_narrow.recommended.est_ttft_ms

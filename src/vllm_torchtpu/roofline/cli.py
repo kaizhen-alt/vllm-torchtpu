@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 from .chips import CHIPS, ChipSpec, SliceTopology, load_chip_spec
 from .constants import (
+    BITS_PER_BYTE,
     DEFAULT_GPU_MEMORY_UTILIZATION,
     DEFAULT_HBM_RESERVE_GB,
     DEFAULT_TOP_K,
@@ -133,7 +134,16 @@ def _add_common_args(p: argparse.ArgumentParser, *, tp_required: bool = True) ->
         choices=("one_shot", "two_shot", "ring"),
     )
     _add_dtype_override_args(p)
-    p.add_argument("--ici-bw-gbps", type=float, default=None)
+    p.add_argument(
+        "--ici-bw-gbytes-per-s",
+        "--ici-bw-gbps",
+        dest="ici_bw_gbps",
+        type=float,
+        default=None,
+    )
+    p.add_argument(
+        "--dcn-gbit-per-s", "--dcn-gbps", dest="dcn_gbps", type=float, default=None
+    )
     p.add_argument("--collective-latency-us", type=float, default=None)
     p.add_argument("--json", action="store_true")
 
@@ -169,6 +179,21 @@ def _add_scenario_args(p: argparse.ArgumentParser) -> None:
         "--hbm-reserve-gb",
         type=float,
         default=DEFAULT_HBM_RESERVE_GB,
+    )
+    p.add_argument("--kv-offload-gb", type=float, default=0.0)
+    p.add_argument(
+        "--ici-bw-gbytes-per-s",
+        "--ici-bw-gbps",
+        dest="ici_bw_gbps",
+        type=float,
+        default=None,
+    )
+    p.add_argument(
+        "--dcn-gbit-per-s",
+        "--dcn-gbps",
+        dest="dcn_gbps",
+        type=float,
+        default=None,
     )
     p.add_argument(
         "--collective-latency-us",
@@ -297,6 +322,7 @@ def _resolve_scenario(
                 think_time_s=args.think_time_s,
                 ttft_slo_ms=args.ttft_slo_ms,
                 tpot_slo_ms=args.tpot_slo_ms,
+                kv_offload_gb=args.kv_offload_gb if args.kv_offload_gb > 0.0 else None,
             ),
         )
     if (
@@ -322,6 +348,7 @@ def _resolve_scenario(
         kv_working_set_turns=1.0,
         ttft_slo_ms=args.ttft_slo_ms,
         tpot_slo_ms=args.tpot_slo_ms,
+        kv_offload_gb=args.kv_offload_gb,
     )
 
 
@@ -487,14 +514,27 @@ def _dispatch_solve(
     return 0
 
 
+def _apply_chip_overrides(chip: ChipSpec, args: argparse.Namespace) -> ChipSpec:
+    """Apply optional CLI ICI and DCN interconnect overrides onto ``chip``."""
+    out = chip
+    ici_gbps = getattr(args, "ici_bw_gbps", None)
+    if ici_gbps is not None:
+        ici_val = ici_gbps * UNIT_GIGA
+        out = replace(out, ici_bw=ici_val, d2d_bw=ici_val * float(out.cores_per_chip))
+    dcn_gbps = getattr(args, "dcn_gbps", None)
+    if dcn_gbps is not None:
+        out = replace(out, dcn_bw=(dcn_gbps * UNIT_GIGA) / BITS_PER_BYTE)
+    return out
+
+
 def _resolve_chip_and_topos(
     args: argparse.Namespace,
 ) -> tuple[ChipSpec, dict[str, SliceTopology] | None]:
     """Resolve (ChipSpec, optional topologies) from --chip-spec or --chip."""
     if args.chip_spec is not None:
         chip, topos = load_chip_spec(args.chip_spec)
-        return chip, topos
-    return CHIPS[args.chip], None
+        return _apply_chip_overrides(chip, args), topos
+    return _apply_chip_overrides(CHIPS[args.chip], args), None
 
 
 def _resolve_chip_spec(args: argparse.Namespace) -> ChipSpec:
@@ -574,8 +614,6 @@ def _dispatch_plan(
     if args.spec_window > 0 and args.accept_len is None:
         parser.error("--accept-len is required when --spec-window > 0")
     chip = _resolve_chip_spec(args)
-    if args.ici_bw_gbps is not None:
-        chip = replace(chip, ici_bw=args.ici_bw_gbps * UNIT_GIGA)
     par, dt, _ = _build_common_plan_inputs(args, cfg)
     concs_list = [int(x) for x in args.concurrency.split(",") if x.strip()]
     rows = plan(
@@ -620,8 +658,6 @@ def _dispatch_explain(
     """Execute explain for per-module L1 physical step breakdowns."""
     geom = from_hf_config(cfg, model_ref=model_ref)
     chip = _resolve_chip_spec(args)
-    if args.ici_bw_gbps is not None:
-        chip = replace(chip, ici_bw=args.ici_bw_gbps * UNIT_GIGA)
     par, dt, lat_s = _build_common_plan_inputs(args, cfg)
     opts = FloorOptions(dt=dt, collective_latency_s=lat_s)
     sf = (

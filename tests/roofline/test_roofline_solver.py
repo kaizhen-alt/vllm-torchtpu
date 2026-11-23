@@ -278,9 +278,27 @@ def _check_pp_prefill_ttft(chip: rf.ChipSpec) -> None:
             ),
         )
         bubble_mult = 1.0 + float(p0.prefill_pool.pp - 1) / float(n_chk)
-        assert p0.est_ttft_ms == pytest.approx(
-            sf_st.serial_estimate_s * bubble_mult * 1e3
+        chk_disagg_inf_dcn = rf.solve_serving_plan(
+            pp_geom,
+            rf.Dtypes(kv=1.0),
+            dc_replace(chip, dcn_bw=math.inf),
+            chk_scen,
+            SolveOptions(mode="disagg", max_chips=8),
         )
+        p0_inf = next(
+            p
+            for p in chk_disagg_inf_dcn.candidates
+            if p.prefill_pool is not None
+            and p.prefill_pool.pp == p0.prefill_pool.pp
+            and p.prefill_pool.pcp == p0.prefill_pool.pcp
+            and p.prefill_pool.topology == p0.prefill_pool.topology
+            and p.decode_pool.topology == p0.decode_pool.topology
+        )
+        if p0.prefill_pool.ep <= 1:
+            assert p0_inf.est_ttft_ms == pytest.approx(
+                sf_st.serial_estimate_s * bubble_mult * 1e3, rel=1e-4
+            )
+        assert p0.est_ttft_ms > p0_inf.est_ttft_ms
 
 
 def test_solver_hybrid_moe_mixed_vs_disagg_and_crossover(
@@ -1801,3 +1819,181 @@ def test_decode_capacity_profile_subtracts_logit_peak_from_b_hbm_max() -> None:
     assert (
         w_base_1 + float(b_max_1) * per_seq_b + large_logit_peak <= hbm_limit_b + 1e-6
     )
+
+
+def test_pp_dp_accounts_for_logit_peak_on_last_stage() -> None:
+    """DP shifts layers off the last stage when logit_peak_b pushes it above limit."""
+    cfg = json.loads(
+        (Path(__file__).resolve().parent / "fixtures" / "glm_5_2_fp8.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    geom = rf.from_hf_config(cfg)
+    dt = rf.dtypes_from_hf_config(cfg)
+    par = Parallel(tp=1, pp=4, moe="tp_slice", ranks_per_chip=2)
+
+    part_zero, _bd_zero, last_zero, ok_zero = rf.pp_stage_breakdowns(
+        geom,
+        dt,
+        par,
+        (4096, 1),
+        options=rf.PpStageOptions(disagg=True, logit_peak_b=0.0),
+    )
+    assert ok_zero
+    logit_peak_b = 12.0 * float(UNIT_GIGA)
+    part_peak, _bd_peak, last_peak, ok_peak = rf.pp_stage_breakdowns(
+        geom,
+        dt,
+        par,
+        (4096, 1),
+        options=rf.PpStageOptions(disagg=True, logit_peak_b=logit_peak_b),
+    )
+    assert ok_peak
+    assert sum(part_peak) == geom.num_layers
+    assert part_peak[-1] < part_zero[-1]
+    assert last_peak + logit_peak_b < last_zero + logit_peak_b
+
+
+def test_pp_dp_rejects_zero_full_attention_stage_for_hybrid_raiden() -> None:
+    """Hybrid Raiden partitioning requires >= 1 full-attention layer on every stage."""
+    asym_hybrid_cfg = {
+        **SMALL_HYBRID_MOE_CFG,
+        "text_config": {
+            **SMALL_HYBRID_MOE_CFG["text_config"],
+            "num_hidden_layers": 8,
+            "layer_types": ["linear_attention"] * 6 + ["full_attention"] * 2,
+        },
+    }
+    geom = rf.from_hf_config(asym_hybrid_cfg)
+    dt = rf.dtypes_from_hf_config(asym_hybrid_cfg)
+    par_pp2 = Parallel(tp=1, pp=2, moe="tp_slice", ranks_per_chip=2)
+    part_pp2 = rf.partition_pp_layers(
+        geom,
+        dt,
+        par_pp2,
+        (4096, 1),
+        options=rf.PpStageOptions(require_full_attn_per_stage=True),
+    )
+    assert part_pp2 == (7, 1)
+    assert "full_attention" in geom.layer_types[: part_pp2[0]]
+    assert "full_attention" in geom.layer_types[part_pp2[0] :]
+
+    par_pp3 = Parallel(tp=1, pp=3, moe="tp_slice", ranks_per_chip=2)
+    part_pp3, _bd3, _last3, ok_pp3 = rf.pp_stage_breakdowns(
+        geom,
+        dt,
+        par_pp3,
+        (4096, 1),
+        options=rf.PpStageOptions(require_full_attn_per_stage=True),
+    )
+    assert not ok_pp3
+    assert part_pp3 == ()
+    with pytest.raises(ValueError, match="Cannot partition"):
+        rf.partition_pp_layers(
+            geom,
+            dt,
+            par_pp3,
+            (4096, 1),
+            options=rf.PpStageOptions(require_full_attn_per_stage=True),
+        )
+
+
+def test_uneven_pp_scales_hybrid_kv_by_exact_stage_attention_layers() -> None:
+    """Uneven PP hybrid KV uses exact stage full-attention layers, not layer ratio."""
+    asym_hybrid_cfg = {
+        **SMALL_HYBRID_MOE_CFG,
+        "text_config": {
+            **SMALL_HYBRID_MOE_CFG["text_config"],
+            "num_hidden_layers": 8,
+            "layer_types": ["linear_attention"] * 6 + ["full_attention"] * 2,
+        },
+    }
+    geom = rf.from_hf_config(asym_hybrid_cfg)
+    dt = rf.dtypes_from_hf_config(asym_hybrid_cfg)
+    par_pp2 = Parallel(tp=1, pp=2, moe="tp_slice", ranks_per_chip=2)
+    lin_stage, fix_stage = rf.pp_stage_kv_parts(
+        geom, dt, par_pp2, ((7, 1), 4096), chip=CHIPS["tpu7x"]
+    )
+    lin_even, _ = rf.memory.kv_bytes_per_core_parts(
+        geom, dt, par_pp2, 4096, chip=CHIPS["tpu7x"]
+    )
+    # Both stages hold exactly 1 full-attention layer, equal to even 2/2 == 1 layer,
+    # NOT inflated by 7/4 = 1.75x.
+    assert lin_stage == pytest.approx(lin_even, rel=1e-9)
+    assert fix_stage == 0.0
+
+    # When stage 0 holds 2 full-attention layers and stage 1 holds 0, exact max stage
+    # KV equals 2x the even 1-layer average.
+    skewed_cfg = {
+        **SMALL_HYBRID_MOE_CFG,
+        "text_config": {
+            **SMALL_HYBRID_MOE_CFG["text_config"],
+            "num_hidden_layers": 8,
+            "layer_types": ["full_attention"] * 2 + ["linear_attention"] * 6,
+        },
+    }
+    skewed_geom = rf.from_hf_config(skewed_cfg)
+    lin_skewed, _ = rf.pp_stage_kv_parts(
+        skewed_geom, dt, par_pp2, ((3, 5), 4096), chip=CHIPS["tpu7x"]
+    )
+    assert lin_skewed == pytest.approx(2.0 * lin_even, rel=1e-9)
+
+
+def test_disagg_dcn_and_pcie_offload_affect_ttft_on_cdk_fixtures() -> None:
+    """Verify DCN bandwidth and host PCIe offload affect disagg and mixed TTFT."""
+    cfg = json.loads(
+        (
+            Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+        ).read_text(encoding="utf-8")
+    )
+    geom = rf.from_hf_config(cfg)
+    dt = rf.dtypes_from_hf_config(cfg)
+    chip = CHIPS["tpu7x"]
+    scen_off = rf.TrafficScenario(
+        name="q35-offload-dcn",
+        isl=16384,
+        osl=256,
+        prefix_hit_rate=0.9,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(32,),
+        kv_working_set_turns=20.0,
+        kv_offload_gb=64.0,
+    )
+    plan_fast = solve_serving_plan(
+        geom, dt, chip, scen_off, SolveOptions(mode="mixed", max_chips=8)
+    )
+    plan_slow_pcie = solve_serving_plan(
+        geom,
+        dt,
+        dc_replace(chip, pcie_bw=4.0e9),
+        scen_off,
+        SolveOptions(mode="mixed", max_chips=8),
+    )
+    assert plan_fast.recommended is not None
+    assert plan_slow_pcie.recommended is not None
+    assert plan_slow_pcie.recommended.est_ttft_ms > plan_fast.recommended.est_ttft_ms
+
+    scen_dcn = rf.TrafficScenario(
+        name="q35-dcn",
+        isl=8192,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(16,),
+        kv_working_set_turns=1.0,
+    )
+    disagg_fast = solve_serving_plan(
+        geom, dt, chip, scen_dcn, SolveOptions(mode="disagg", max_chips=16)
+    )
+    disagg_slow_dcn = solve_serving_plan(
+        geom,
+        dt,
+        dc_replace(chip, dcn_bw=1.0e9),
+        scen_dcn,
+        SolveOptions(mode="disagg", max_chips=16),
+    )
+    assert disagg_fast.recommended is not None
+    assert disagg_slow_dcn.recommended is not None
+    assert disagg_slow_dcn.recommended.est_ttft_ms > disagg_fast.recommended.est_ttft_ms

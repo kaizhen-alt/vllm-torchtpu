@@ -124,6 +124,7 @@ class ScenarioOverrides:
     ttft_slo_ms: float | None = None
     tpot_slo_ms: float | None = None
     kv_working_set_turns: float | None = None
+    kv_offload_gb: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +180,8 @@ class PoolMeshPlan:
     hbm_state_gb: float = 0.0
     max_num_seqs: int | None = None
     max_model_len: int | None = None
+    pp_layer_partition: tuple[int, ...] | None = None
+    kv_offload_gb: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +235,7 @@ class ServingPlan:
     model_id: str = ""
     search: SearchStats | None = None
     has_moe: bool = False
+    is_hybrid: bool = False
     budget: int = 0
     budget_source: str = "flag"
     max_instances: int | None = None
@@ -335,7 +339,7 @@ class CeilingRow(TypedDict):
     floor_throughput_per_chip: float
 
 
-type PoolStructKey = tuple[str, int, int, int, int, int, int]
+type PoolStructKey = tuple[str, int, int, int, int, int, int, tuple[int, ...] | None]
 
 
 def effective_slo_verdict(pt: ParetoPoint) -> SloVerdict:
@@ -469,6 +473,7 @@ def _pool_key(pool: PoolMeshPlan | None) -> PoolStructKey | None:
         pool.pp,
         pool.pcp,
         pool.kv_split,
+        pool.pp_layer_partition,
     )
 
 

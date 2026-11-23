@@ -40,6 +40,7 @@ from .constants import (
     SLO_VERDICT_RULED_OUT,
     SLO_VERDICT_UNDECIDED,
     UNDECIDED_SLO_WARNING,
+    UNIT_GIBI,
     UNIT_GIGA,
     UNIT_MILLIS_PER_SECOND,
     ZERO_THINK_TIME_WARNING,
@@ -60,7 +61,11 @@ from .memory import (
 from .modules import Dtypes, Parallel, StepShape
 from .occupancy import ExpertActivationModel
 from .partition import (
+    PpStageOptions,
     count_full_attn_layers,
+    pp_stage_breakdowns,
+    pp_stage_kv_parts,
+    scale_pp_stage_floor,
 )
 from .schema import (
     FloorTimes,
@@ -198,6 +203,9 @@ def build_example_scenario(
             base.kv_working_set_turns
             if ovr.kv_working_set_turns is None
             else ovr.kv_working_set_turns
+        ),
+        kv_offload_gb=(
+            base.kv_offload_gb if ovr.kv_offload_gb is None else ovr.kv_offload_gb
         ),
     )
 
@@ -785,6 +793,7 @@ class _SolveContext:
     clamp_batch_cache: dict[tuple[Parallel, int], tuple[int, HbmBreakdown] | None] = (
         field(default_factory=dict)
     )
+    xfer_cache: dict[tuple[str, str, int], float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -797,10 +806,12 @@ class _PrefillOption:
     rate_p: float
     hbm_gb: float
     hbm_bd: HbmBreakdown
+    pp_part: tuple[int, ...] | None = None
     bound_ttft_ms: float = 0.0
     envelope_ttft_ms: float = 0.0
     w_base_b: float = 0.0
     b_kv_phys: float = 0.0
+    offload_b_per_core: float = 0.0
     logit_peak_b: float = 0.0
     fixed_kv_per_seq_b: float = 0.0
 
@@ -867,6 +878,8 @@ class _PoolPlanInput:
     hbm_weights_gb: float = 0.0
     hbm_kv_gb: float = 0.0
     hbm_state_gb: float = 0.0
+    pp_layer_partition: tuple[int, ...] | None = None
+    kv_offload_gb: float = 0.0
 
 
 type _StepDurationKind = Literal["serial_estimate", "hard_floor", "envelope_floor"]
@@ -880,6 +893,7 @@ class _MixedLoopInput:
     n_chunks_c: int
     chunk_tok_c: int
     ttft_service_s: float
+    pcie_read_s: float = 0.0
     eff_isl_c: int = 0
     duration_kind: _StepDurationKind = "serial_estimate"
     ttft_upper_s: float | None = None
@@ -1001,6 +1015,8 @@ def _build_pool_mesh_plan(spec: _PoolPlanInput) -> PoolMeshPlan:
         hbm_state_gb=spec.hbm_state_gb,
         max_num_seqs=spec.max_num_seqs,
         max_model_len=spec.max_model_len,
+        pp_layer_partition=spec.pp_layer_partition,
+        kv_offload_gb=spec.kv_offload_gb,
     )
 
 
@@ -1103,6 +1119,7 @@ class _L1BoundOpts(TypedDict, total=False):
     spec_k: int | None
     activation_model: ExpertActivationModel | None
     total_chips: int | None
+    pp_part: tuple[int, ...] | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1161,6 +1178,47 @@ def _eval_bound_decode_floor(bound_in: _BoundDecodeInput, batch: int) -> StepFlo
     )
 
 
+def _disagg_kv_xfer_s(
+    geom: ModelGeometry,
+    dtypes: Dtypes,
+    chip: ChipSpec,
+    topos: tuple[SliceTopology, SliceTopology],
+    uncached_tokens: int,
+) -> float:
+    """Return transfer time in seconds to migrate KV cache over DCN between pools."""
+    if chip.dcn_bw <= 0.0 or not math.isfinite(chip.dcn_bw):
+        return 0.0
+    bd_one = hbm_breakdown_per_core_bytes(
+        geom,
+        dtypes,
+        Parallel(tp=1, pp=1, ranks_per_chip=chip.cores_per_chip),
+        SeqKvLayout(1, max(0, uncached_tokens), physical_kv_layout=False),
+        chip=chip,
+    )
+    wire_b = bd_one.kv + bd_one.state
+    topo_p, topo_d = topos
+    denom = float(max(1, min(topo_p.num_chips, topo_d.num_chips))) * chip.dcn_bw
+    return wire_b / denom
+
+
+def _pcie_read_s(
+    eval_context: _SolveContext,
+    b_kv_phys: float,
+    h_eff: float,
+    h_hbm_only: float,
+) -> float:
+    """Compute host PCIe offload read time in seconds for spilled KV prefix tokens."""
+    offload_read_b = (
+        max(0.0, h_eff - h_hbm_only) * float(eval_context.scenario.isl) * b_kv_phys
+    )
+    pcie_core_bw = eval_context.chip.pcie_bw / float(
+        max(1, eval_context.chip.cores_per_chip)
+    )
+    if offload_read_b > 0.0 and pcie_core_bw > 0.0 and math.isfinite(pcie_core_bw):
+        return offload_read_b / pcie_core_bw
+    return 0.0
+
+
 def _eval_bound_prefill_floor(
     geom: ModelGeometry,
     dtypes: Dtypes,
@@ -1175,24 +1233,23 @@ def _eval_bound_prefill_floor(
         msg = "prefill_par and prefill_topo are required for TTFT bounds"
         raise ValueError(msg)
     act_model = opts.get("activation_model") or ExpertActivationModel()
-    return step_floor(
-        geom,
-        chip,
-        pref_par,
-        StepShape(
-            batch=0,
-            rows_per_seq=0,
-            context=0,
-            state_writes=0,
-            prefill_tokens=scenario.isl,
-            prefix_hit_rate=scenario.prefix_hit_rate,
-        ),
-        FloorOptions(
-            dt=dtypes,
-            topology=pref_topo,
-            activation_model=act_model,
-        ),
+    shape = StepShape(
+        batch=0,
+        rows_per_seq=0,
+        context=0,
+        state_writes=0,
+        prefill_tokens=scenario.isl,
+        prefix_hit_rate=scenario.prefix_hit_rate,
     )
+    floor_opts = FloorOptions(
+        dt=dtypes,
+        topology=pref_topo,
+        activation_model=act_model,
+    )
+    pp_part = opts.get("pp_part")
+    if pp_part:
+        return scale_pp_stage_floor(geom, chip, pref_par, (shape, floor_opts), pp_part)
+    return step_floor(geom, chip, pref_par, shape, floor_opts)
 
 
 def bound_ttft_ms(
@@ -1310,7 +1367,32 @@ def _disagg_capacity_work_bound(
     x_cap_dec = float(max(1, y_d * bound_in.decode_par.dp)) / max(
         _CAP_DENOM_EPS, *(dec_scale * val for val in dec_res)
     )
-    return min(x_cap_pref, x_cap_dec)
+    chip = bound_in.chip
+    eff_isl_floor = max(
+        0,
+        math.floor(
+            (1.0 - bound_in.scenario.prefix_hit_rate) * float(bound_in.scenario.isl)
+        ),
+    )
+    if eff_isl_floor > 0 and math.isfinite(chip.dcn_bw) and chip.dcn_bw > 0.0:
+        xfer_one_s = _disagg_kv_xfer_s(
+            bound_in.geom,
+            bound_in.dtypes,
+            chip,
+            (pref_topo, bound_in.decode_topo),
+            eff_isl_floor,
+        )
+        if xfer_one_s > 0.0:
+            min_one = float(min(pref_topo.num_chips, bound_in.decode_topo.num_chips))
+            min_pool = float(
+                min(x_p * pref_topo.num_chips, y_d * bound_in.decode_topo.num_chips)
+            )
+            x_cap_dcn = (min_pool / max(1.0, min_one)) / xfer_one_s
+        else:
+            x_cap_dcn = math.inf
+    else:
+        x_cap_dcn = math.inf
+    return min(x_cap_pref, x_cap_dec, x_cap_dcn)
 
 
 def _context_to_bound_input(
@@ -1489,6 +1571,7 @@ def _resolve_l1_tarski_floor(
             prefill_par=ttft_par,
             prefill_topo=ttft_topo,
             activation_model=bound_in.activation_model,
+            pp_part=opts.get("pp_part"),
         )
         rate_p_floor = float(x_p) / max(
             _RATE_FLOOR_EPS, b_ttft_ms / UNIT_MILLIS_PER_SECOND
@@ -1546,6 +1629,7 @@ def x_bound(
             prefill_par=ttft_par,
             prefill_topo=ttft_topo,
             activation_model=bound_in.activation_model,
+            pp_part=opts.get("pp_part"),
         )
         / UNIT_MILLIS_PER_SECOND
     )
@@ -1685,6 +1769,90 @@ def _clamp_resident_batch(
     return b_res, hbm_bd
 
 
+def _prefill_stage_step_floor(
+    eval_context: _SolveContext,
+    topo: SliceTopology,
+    par: Parallel,
+    hit_rate: float,
+    pp_part: tuple[int, ...] | None = None,
+) -> StepFloor:
+    """Evaluate prefill step floor, using exact stage slices for uneven PP."""
+    if not pp_part or par.pp <= 1:
+        return _prefill_step_floor(eval_context, topo, par, hit_rate)
+    shape = StepShape(
+        batch=0,
+        rows_per_seq=0,
+        context=0,
+        state_writes=0,
+        prefill_tokens=eval_context.scenario.isl,
+        prefix_hit_rate=hit_rate,
+    )
+    opts = FloorOptions(
+        dt=eval_context.dtypes,
+        collective_latency_s=eval_context.collective_latency_s,
+        topology=topo,
+        activation_model=eval_context.activation_model,
+    )
+    return scale_pp_stage_floor(
+        eval_context.geom, eval_context.chip, par, (shape, opts), pp_part
+    )
+
+
+def _resolve_prefill_pp_breakdown(
+    eval_context: _SolveContext,
+    par: Parallel,
+    logit_peak_b: float,
+) -> tuple[HbmBreakdown, float, tuple[int, ...] | None] | None:
+    """Resolve prefill stage HBM breakdown and optional uneven PP partition."""
+    if par.pp <= 1:
+        hbm_bd = hbm_breakdown_per_core_bytes(
+            eval_context.geom,
+            eval_context.dtypes,
+            par,
+            SeqKvLayout(1, eval_context.scenario.isl),
+            chip=eval_context.chip,
+        )
+        return (hbm_bd, hbm_bd.total, None)
+    even_cap = max(1, math.ceil(eval_context.geom.num_layers / par.pp))
+    is_hybrid = (
+        0 < count_full_attn_layers(eval_context.geom) < eval_context.geom.num_layers
+    )
+    pp_part, hbm_bd, last_stage_b, pp_feas = pp_stage_breakdowns(
+        eval_context.geom,
+        eval_context.dtypes,
+        par,
+        (eval_context.scenario.isl, 1),
+        options=PpStageOptions(
+            disagg=True,
+            max_stage_layers=even_cap,
+            logit_peak_b=logit_peak_b,
+            require_full_attn_per_stage=is_hybrid,
+        ),
+        chip=eval_context.chip,
+    )
+    if (
+        not pp_feas
+        or hbm_bd.total > eval_context.hbm_limit_b
+        or (last_stage_b + logit_peak_b) > eval_context.hbm_limit_b
+    ):
+        pp_part, hbm_bd, last_stage_b, pp_feas = pp_stage_breakdowns(
+            eval_context.geom,
+            eval_context.dtypes,
+            par,
+            (eval_context.scenario.isl, 1),
+            options=PpStageOptions(
+                disagg=True,
+                logit_peak_b=logit_peak_b,
+                require_full_attn_per_stage=is_hybrid,
+            ),
+            chip=eval_context.chip,
+        )
+    if not pp_feas or not pp_part:
+        return None
+    pp_part_opt = pp_part if len(set(pp_part)) > 1 else None
+    return (hbm_bd, last_stage_b, pp_part_opt)
+
+
 def _find_prefill_options(
     eval_context: _SolveContext,
     topos: list[SliceTopology],
@@ -1693,6 +1861,13 @@ def _find_prefill_options(
     prefill_options: list[_PrefillOption] = []
     min_req_ttft_ms = math.inf
     pre_chunk_rows = min(eval_context.eff_isl, eval_context.scenario.prefill_chunk)
+    eff_isl_floor = max(
+        0,
+        math.floor(
+            (1.0 - eval_context.scenario.prefix_hit_rate)
+            * float(eval_context.scenario.isl)
+        ),
+    )
     for topo in topos:
         if (
             eval_context.prefill_topology is not None
@@ -1713,34 +1888,61 @@ def _find_prefill_options(
                 pre_chunk_rows,
                 sampled_rows=1,
             )
-            hbm_bd = hbm_breakdown_per_core_bytes(
-                eval_context.geom,
-                eval_context.dtypes,
-                par,
-                SeqKvLayout(1, eval_context.scenario.isl),
-                chip=eval_context.chip,
-            )
+            stage_info = _resolve_prefill_pp_breakdown(eval_context, par, logit_peak_b)
+            if stage_info is None:
+                continue
+            hbm_bd, last_stage_b, pp_part_opt = stage_info
             hbm_b = hbm_bd.total
             if (
                 hbm_b > eval_context.hbm_limit_b
-                or (hbm_b + logit_peak_b) > eval_context.hbm_limit_b
+                or (last_stage_b + logit_peak_b) > eval_context.hbm_limit_b
             ):
                 continue
-            sf_p = _prefill_step_floor(
-                eval_context, topo, par, eval_context.scenario.prefix_hit_rate
+            sf_p = _prefill_stage_step_floor(
+                eval_context,
+                topo,
+                par,
+                eval_context.scenario.prefix_hit_rate,
+                pp_part_opt,
             )
             pp_factor = 1.0 + float(par.pp - 1) / float(max(1, eval_context.n_chunks))
             ttft_ms = sf_p.serial_estimate_s * pp_factor * UNIT_MILLIS_PER_SECOND
+            xfer_min_ms = (
+                0.0
+                if eval_context.mode in ("auto", "mixed") or eff_isl_floor <= 0
+                else _disagg_kv_xfer_s(
+                    eval_context.geom,
+                    eval_context.dtypes,
+                    eval_context.chip,
+                    (topo, topo),
+                    eff_isl_floor,
+                )
+                * UNIT_MILLIS_PER_SECOND
+            )
             bound_ttft_val = sf_p.hard_floor_s * UNIT_MILLIS_PER_SECOND
-            min_req_ttft_ms = min(min_req_ttft_ms, bound_ttft_val)
+            min_req_ttft_ms = min(min_req_ttft_ms, bound_ttft_val + xfer_min_ms)
             rate_p = 1.0 / max(_RATE_FLOOR_EPS, sf_p.serial_estimate_s)
             pref_w_base_b = hbm_bd.total - hbm_bd.kv - hbm_bd.state
-            pref_b_kv_phys, pref_fixed_kv_b = kv_bytes_per_core_parts(
-                eval_context.geom,
-                eval_context.dtypes,
-                par,
-                eval_context.scenario.isl,
-                chip=eval_context.chip,
+            if par.pp > 1 and pp_part_opt:
+                pref_b_kv_phys, pref_fixed_kv_b = pp_stage_kv_parts(
+                    eval_context.geom,
+                    eval_context.dtypes,
+                    par,
+                    (pp_part_opt, eval_context.scenario.isl),
+                    chip=eval_context.chip,
+                )
+            else:
+                pref_b_kv_phys, pref_fixed_kv_b = kv_bytes_per_core_parts(
+                    eval_context.geom,
+                    eval_context.dtypes,
+                    par,
+                    eval_context.scenario.isl,
+                    chip=eval_context.chip,
+                )
+            pref_offload_b = (
+                float(eval_context.scenario.kv_offload_gb)
+                * UNIT_GIBI
+                / float(max(1, par.tp * par.pp * par.dp * par.pcp))
             )
             prefill_options.append(
                 _PrefillOption(
@@ -1750,10 +1952,12 @@ def _find_prefill_options(
                     rate_p=rate_p,
                     hbm_gb=hbm_b / UNIT_GIGA,
                     hbm_bd=hbm_bd,
+                    pp_part=pp_part_opt,
                     bound_ttft_ms=bound_ttft_val,
                     envelope_ttft_ms=sf_p.envelope_floor_s * UNIT_MILLIS_PER_SECOND,
                     w_base_b=pref_w_base_b,
                     b_kv_phys=pref_b_kv_phys,
+                    offload_b_per_core=pref_offload_b,
                     logit_peak_b=logit_peak_b,
                     fixed_kv_per_seq_b=pref_fixed_kv_b,
                 )
@@ -1935,10 +2139,16 @@ def _solve_mixed_decode_fixed_point(
         dec_per_res = dec_steps_per_req / float(max(1, loop_in.b_res))
         n_ch = float(loop_in.n_chunks_c)
         if dec_per_res >= n_ch:
-            replica_req_time_s = (dec_per_res - n_ch) * dec_step_s + n_ch * mix_step_s
+            replica_req_time_s = (
+                (dec_per_res - n_ch) * dec_step_s
+                + n_ch * mix_step_s
+                + loop_in.pcie_read_s
+            )
         else:
             replica_req_time_s = (
-                dec_per_res * mix_step_s + (n_ch - dec_per_res) * pure_chunk_s
+                dec_per_res * mix_step_s
+                + (n_ch - dec_per_res) * pure_chunk_s
+                + loop_in.pcie_read_s
             )
         x_capacity = float(dp_val) / max(_RATE_FLOOR_EPS, replica_req_time_s)
         prefill_wait_s = (
@@ -1979,6 +2189,11 @@ def _evaluate_mixed_point(
     _b_local, b_res, hbm_bd = fitted
     hbm_b = hbm_bd.total
     eval_context.hbm_fit += 1
+    offload_b_per_core = (
+        float(eval_context.scenario.kv_offload_gb)
+        * UNIT_GIBI
+        / float(max(1, par.tp * par.pp * par.dp * par.pcp))
+    )
     b_ws = max(1, math.ceil(c / max(1, par.dp)))
     cap_tok, h_eff = kv_capacity_and_hit_rate(
         eval_context.geom,
@@ -1991,7 +2206,7 @@ def _evaluate_mixed_point(
             hbm_limit_b=eval_context.hbm_limit_b,
             w_base_b=bounds.w_base_b,
             b_kv_phys_core=bounds.b_kv_phys_core,
-            offload_b_per_core=0.0,
+            offload_b_per_core=offload_b_per_core,
             prefix_hit_rate=eval_context.scenario.prefix_hit_rate,
             kv_working_set_turns=eval_context.scenario.kv_working_set_turns,
             fixed_kv_per_seq_bytes=bounds.fixed_kv_per_seq_b,
@@ -1999,11 +2214,34 @@ def _evaluate_mixed_point(
         chip=eval_context.chip,
     )
     cap_tok_int = None if math.isinf(cap_tok) else int(cap_tok)
+    if offload_b_per_core > 0.0:
+        _, h_hbm_only = kv_capacity_and_hit_rate(
+            eval_context.geom,
+            eval_context.dtypes,
+            par,
+            b_res,
+            KvFitInput(
+                b_ws=b_ws,
+                ctx_full=eval_context.ctx_full,
+                hbm_limit_b=eval_context.hbm_limit_b,
+                w_base_b=bounds.w_base_b,
+                b_kv_phys_core=bounds.b_kv_phys_core,
+                offload_b_per_core=0.0,
+                prefix_hit_rate=eval_context.scenario.prefix_hit_rate,
+                kv_working_set_turns=eval_context.scenario.kv_working_set_turns,
+                fixed_kv_per_seq_bytes=bounds.fixed_kv_per_seq_b,
+            ),
+            chip=eval_context.chip,
+        )
+    else:
+        h_hbm_only = h_eff
+    pcie_read_s = _pcie_read_s(eval_context, bounds.b_kv_phys_core, h_eff, h_hbm_only)
     sf_ttft_c = (
         _prefill_step_floor(eval_context, topo, par, h_eff)
         if h_eff != eval_context.scenario.prefix_hit_rate
         else bounds.sf_ttft
     )
+    ttft_service_s = sf_ttft_c.serial_estimate_s + pcie_read_s
     bound_ttft_val = bounds.sf_ttft.hard_floor_s * UNIT_MILLIS_PER_SECOND
     envelope_ttft_val = bounds.sf_ttft.envelope_floor_s * UNIT_MILLIS_PER_SECOND
     eff_isl_c = max(1, math.ceil((1.0 - h_eff) * eval_context.scenario.isl))
@@ -2020,7 +2258,8 @@ def _evaluate_mixed_point(
             b_res=b_res,
             n_chunks_c=n_chunks_c,
             chunk_tok_c=chunk_tok_c,
-            ttft_service_s=sf_ttft_c.serial_estimate_s,
+            ttft_service_s=ttft_service_s,
+            pcie_read_s=pcie_read_s,
             eff_isl_c=eff_isl_c,
         ),
     )
@@ -2101,6 +2340,8 @@ def _evaluate_mixed_point(
             hbm_weights_gb=hbm_bd.weights / UNIT_GIGA,
             hbm_kv_gb=hbm_bd.kv / UNIT_GIGA,
             hbm_state_gb=hbm_bd.state / UNIT_GIGA,
+            pp_layer_partition=None,
+            kv_offload_gb=eval_context.scenario.kv_offload_gb,
         )
     )
     binding = (
@@ -2285,10 +2526,10 @@ def _run_disagg_decode_loop(
     dec: _DisaggDecodeState,
     target: _DisaggRatioTarget,
     batch_stats: _DisaggBatchStats,
-    loop_ctrl: tuple[float, _StepDurationKind],
+    loop_ctrl: tuple[float, _StepDurationKind, float],
 ) -> tuple[StepFloor, float, float, float, float]:
     """Solve 3-step Little's-law fixed point for a disaggregated decode pool."""
-    prefill_wait_s, duration_kind = loop_ctrl
+    prefill_wait_s, duration_kind, rate_dcn_cap = loop_ctrl
     eff_al = eval_context.eff_al
     dec_steps_per_req = max(1.0, eval_context.scenario.osl / eff_al)
     think = eval_context.scenario.think_time_s
@@ -2309,7 +2550,9 @@ def _run_disagg_decode_loop(
         rate_d_cap = float(batch_stats.b_res * idp_val) / (
             dec_steps_per_req * max(_RATE_FLOOR_EPS, step_s)
         )
-        x_capacity = min(float(target.x_p) * batch_stats.rate_p_eff, rate_d_cap)
+        x_capacity = min(
+            float(target.x_p) * batch_stats.rate_p_eff, rate_d_cap, rate_dcn_cap
+        )
         x_rate = min(
             x_capacity,
             float(target.c) / max(_RATE_FLOOR_EPS, prefill_wait_s + t_dec_s + think),
@@ -2330,13 +2573,39 @@ def _compute_disagg_metrics(
     """Solve coupled Little's-law fixed point for a disaggregated candidate."""
     think = eval_context.scenario.think_time_s
     osl = float(eval_context.scenario.osl)
-    ttft_service_s = batch_stats.ttft_eff_ms / UNIT_MILLIS_PER_SECOND
+    uncached_d_tok = max(
+        0, math.ceil((1.0 - batch_stats.h_eff) * eval_context.scenario.isl)
+    )
+    if uncached_d_tok > 0:
+        xfer_key = (pref.topo.name, dec.topo.name, uncached_d_tok)
+        xfer_s = eval_context.xfer_cache.get(xfer_key)
+        if xfer_s is None:
+            xfer_s = _disagg_kv_xfer_s(
+                eval_context.geom,
+                eval_context.dtypes,
+                eval_context.chip,
+                (pref.topo, dec.topo),
+                uncached_d_tok,
+            )
+            eval_context.xfer_cache[xfer_key] = xfer_s
+    else:
+        xfer_s = 0.0
+    if xfer_s > 0.0:
+        min_one = float(min(pref.topo.num_chips, dec.topo.num_chips))
+        min_pool = float(
+            min(target.x_p * pref.topo.num_chips, target.y_d * dec.topo.num_chips)
+        )
+        rate_dcn_cap = (min_pool / max(1.0, min_one)) / xfer_s
+    else:
+        rate_dcn_cap = math.inf
+    kv_xfer_ms = xfer_s * UNIT_MILLIS_PER_SECOND
+    ttft_service_s = (batch_stats.ttft_eff_ms + kv_xfer_ms) / UNIT_MILLIS_PER_SECOND
     sf_d, tpot_s, t_dec_s, x_rate, _ = _run_disagg_decode_loop(
         eval_context,
         dec,
         target,
         batch_stats,
-        (ttft_service_s, "serial_estimate"),
+        (ttft_service_s, "serial_estimate", rate_dcn_cap),
     )
     ttft_est_s = float(target.c) / max(_RATE_FLOOR_EPS, x_rate) - t_dec_s - think
     est_ttft_d_ms = ttft_est_s * UNIT_MILLIS_PER_SECOND
@@ -2452,7 +2721,9 @@ def _resolve_effective_prefill(
     n_chunks_p = max(
         1, math.ceil(eff_isl_p / max(1, eval_context.scenario.prefill_chunk))
     )
-    sf_p_eff = _prefill_step_floor(eval_context, pref.topo, pref.par, h_eff)
+    sf_p_eff = _prefill_stage_step_floor(
+        eval_context, pref.topo, pref.par, h_eff, pref.pp_part
+    )
     ttft_p_eff = (
         sf_p_eff.serial_estimate_s
         * (1.0 + float(pref.par.pp - 1) / float(max(1, n_chunks_p)))
@@ -2514,7 +2785,7 @@ def _evaluate_disagg_instance_pair(
     eval_context.hbm_fit += 1
     b_ws_p = max(1, math.ceil(target.c / max(1, target.x_p * pref.par.dp)))
     pref_hbm_limit_b = max(0.0, eval_context.hbm_limit_b - pref.logit_peak_b)
-    kv_key = (pref.par, -1, b_ws_p, 0.0)
+    kv_key = (pref.par, -1, b_ws_p, pref.offload_b_per_core)
     cached_kv = eval_context.kv_fit_cache.get(kv_key)
     if cached_kv is None:
         cached_kv = kv_capacity_and_hit_rate(
@@ -2528,7 +2799,7 @@ def _evaluate_disagg_instance_pair(
                 hbm_limit_b=pref_hbm_limit_b,
                 w_base_b=pref.w_base_b,
                 b_kv_phys_core=pref.b_kv_phys,
-                offload_b_per_core=0.0,
+                offload_b_per_core=pref.offload_b_per_core,
                 prefix_hit_rate=eval_context.scenario.prefix_hit_rate,
                 kv_working_set_turns=eval_context.scenario.kv_working_set_turns,
                 fixed_kv_per_seq_bytes=pref.fixed_kv_per_seq_b,
@@ -2538,7 +2809,42 @@ def _evaluate_disagg_instance_pair(
         eval_context.kv_fit_cache[kv_key] = cached_kv
     cap_tok, h_eff = cached_kv
     cap_tok_int = None if math.isinf(cap_tok) else int(cap_tok)
+    if pref.offload_b_per_core > 0.0:
+        kv_key_hbm = (pref.par, -1, b_ws_p, 0.0)
+        cached_kv_hbm = eval_context.kv_fit_cache.get(kv_key_hbm)
+        if cached_kv_hbm is None:
+            cached_kv_hbm = kv_capacity_and_hit_rate(
+                eval_context.geom,
+                eval_context.dtypes,
+                pref.par,
+                1,
+                KvFitInput(
+                    b_ws=b_ws_p,
+                    ctx_full=eval_context.scenario.isl,
+                    hbm_limit_b=pref_hbm_limit_b,
+                    w_base_b=pref.w_base_b,
+                    b_kv_phys_core=pref.b_kv_phys,
+                    offload_b_per_core=0.0,
+                    prefix_hit_rate=eval_context.scenario.prefix_hit_rate,
+                    kv_working_set_turns=eval_context.scenario.kv_working_set_turns,
+                    fixed_kv_per_seq_bytes=pref.fixed_kv_per_seq_b,
+                ),
+                chip=eval_context.chip,
+            )
+            eval_context.kv_fit_cache[kv_key_hbm] = cached_kv_hbm
+        _, h_hbm_p = cached_kv_hbm
+    else:
+        h_hbm_p = h_eff
+    pcie_p_ms = (
+        _pcie_read_s(eval_context, pref.b_kv_phys, h_eff, h_hbm_p)
+        * UNIT_MILLIS_PER_SECOND
+    )
     eff_prefill = _resolve_effective_prefill(eval_context, pref, h_eff, cache)
+    rate_p_eff = 1.0 / max(
+        _RATE_FLOOR_EPS,
+        1.0 / max(_RATE_FLOOR_EPS, eff_prefill.rate_p)
+        + pcie_p_ms / UNIT_MILLIS_PER_SECOND,
+    )
     bound_ttft_val = pref.bound_ttft_ms
     envelope_ttft_val = pref.envelope_ttft_ms
     disagg_metrics = _compute_disagg_metrics(
@@ -2549,8 +2855,8 @@ def _evaluate_disagg_instance_pair(
         _DisaggBatchStats(
             b_res=b_res,
             b_local=b_local,
-            ttft_eff_ms=eff_prefill.ttft_ms,
-            rate_p_eff=eff_prefill.rate_p,
+            ttft_eff_ms=eff_prefill.ttft_ms + pcie_p_ms,
+            rate_p_eff=rate_p_eff,
             h_eff=h_eff,
         ),
     )
@@ -2592,6 +2898,8 @@ def _evaluate_disagg_instance_pair(
             hbm_weights_gb=pref.hbm_bd.weights / UNIT_GIGA,
             hbm_kv_gb=pref.hbm_bd.kv / UNIT_GIGA,
             hbm_state_gb=pref.hbm_bd.state / UNIT_GIGA,
+            pp_layer_partition=pref.pp_part,
+            kv_offload_gb=eval_context.scenario.kv_offload_gb,
         )
     )
     d_pool = _build_pool_mesh_plan(
@@ -2607,6 +2915,8 @@ def _evaluate_disagg_instance_pair(
             hbm_weights_gb=hbm_bd_d.weights / UNIT_GIGA,
             hbm_kv_gb=hbm_bd_d.kv / UNIT_GIGA,
             hbm_state_gb=hbm_bd_d.state / UNIT_GIGA,
+            pp_layer_partition=None,
+            kv_offload_gb=0.0,
         )
     )
     return ParetoPoint(
@@ -2712,10 +3022,14 @@ def _evaluate_disaggregated_candidates(
             and topo_d.name != eval_context.decode_topology
         ):
             continue
-        offload_b = 0.0
         for par_d in _candidate_decode_parallels(
             eval_context.geom, topo_d, chip=eval_context.chip
         ):
+            offload_b = (
+                float(eval_context.scenario.kv_offload_gb)
+                * UNIT_GIBI
+                / float(max(1, par_d.tp * par_d.pp * par_d.dp * par_d.pcp))
+            )
             w_base_d, b_hbm_max_d, b_smem_max_d, b_kv_phys_d, fixed_kv_d, _ = (
                 _decode_capacity_profile(eval_context, par_d)
             )
@@ -3196,6 +3510,7 @@ def solve_serving_plan(
             hbm_reserve_gb=opts.hbm_reserve_gb,
             model_id=geom.model_id,
             has_moe=geom.num_experts > 0,
+            is_hybrid=0 < count_full_attn_layers(geom) < geom.num_layers,
             budget=opts.max_chips if opts.max_chips is not None else 0,
             budget_source=opts.budget_source,
             max_instances=opts.max_instances,
@@ -3266,6 +3581,7 @@ def solve_serving_plan(
         hbm_reserve_gb=opts.hbm_reserve_gb,
         model_id=geom.model_id,
         has_moe=geom.num_experts > 0,
+        is_hybrid=0 < count_full_attn_layers(geom) < geom.num_layers,
         search=SearchStats(
             enumerated=eval_context.enumerated,
             core_grid=_count_core_grid(eval_context, topos),

@@ -44,6 +44,7 @@ from .constants import (
     SLO_VERDICT_RANK,
     SLO_VERDICT_RULED_OUT,
     SOLVE_SCHEMA,
+    UNIT_GIBI,
     UNIT_GIGA,
     UNIT_MICRO,
 )
@@ -88,6 +89,13 @@ _DEFAULT_DP_RPC_PORT = "13345"
 _QWEN4_BRINGUP_OVERRIDES = '{"text_config": {"ple_layer_ids": []}}'
 _RAIDEN_CONNECTOR_NAME = "TPURaidenConnector"
 _RAIDEN_MODULE_PATH = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
+_RAIDEN_OFFLOAD_CONNECTOR_NAME = "TPURaidenOffloadingConnector"
+_RAIDEN_OFFLOAD_MODULE_PATH = "vllm_torchtpu.offload.raiden_connector"
+_MULTI_CONNECTOR_NAME = "TPUMultiConnector"
+_MULTI_CONNECTOR_MODULE_PATH = (
+    "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector"
+)
+_HYBRID_MODEL_IDS = frozenset({"qwen3_5_moe", "qwen4_exp"})
 _DISAGG_WIRING_WARNING = (
     "Disaggregated launch requires a Raiden controller "
     "(TPU_USE_RAIDEN_KV_CACHE_MANAGER=1, TPU_RAIDEN_CONTROLLER_ADDRESS) "
@@ -146,6 +154,7 @@ class LaunchOptions:
     mtp_layers: int | None = None
     hbm_reserve_gb: float = DEFAULT_HBM_RESERVE_GB
     topologies: Mapping[str, SliceTopology] | None = None
+    is_hybrid: bool = False
 
 
 class _PointLaunchKwargs(TypedDict, total=False):
@@ -161,6 +170,7 @@ class _PointLaunchKwargs(TypedDict, total=False):
     mtp_layers: int | None
     hbm_reserve_gb: float
     topologies: Mapping[str, SliceTopology] | None
+    is_hybrid: bool
 
 
 class _BuildSolvePayloadOpts(TypedDict, total=False):
@@ -172,19 +182,45 @@ class _BuildSolvePayloadOpts(TypedDict, total=False):
     topologies: Mapping[str, SliceTopology] | Sequence[SliceTopology] | None
 
 
-def _kv_transfer_flag_value(role: str) -> str | None:
-    """Return JSON value for --kv-transfer-config on disagg pools."""
-    if role == "prefill":
-        kv_role = "kv_producer"
-    elif role == "decode":
+def _kv_transfer_flag_value(pool: PoolMeshPlan) -> str | None:
+    """Return JSON value for --kv-transfer-config covering disagg and offload."""
+    if pool.role == "prefill":
+        kv_role: str | None = "kv_producer"
+    elif pool.role == "decode":
         kv_role = "kv_consumer"
     else:
+        kv_role = None
+    has_offload = pool.kv_offload_gb > 0.0
+    if kv_role is None and not has_offload:
         return None
-    return json.dumps(
+    raiden_disagg = (
         {
             "kv_connector": _RAIDEN_CONNECTOR_NAME,
             "kv_connector_module_path": _RAIDEN_MODULE_PATH,
             "kv_role": kv_role,
+        }
+        if kv_role is not None
+        else None
+    )
+    if not has_offload:
+        return json.dumps(raiden_disagg)
+    cpu_bytes = round(pool.kv_offload_gb * UNIT_GIBI)
+    raiden_offload: dict[str, object] = {
+        "kv_connector": _RAIDEN_OFFLOAD_CONNECTOR_NAME,
+        "kv_connector_module_path": _RAIDEN_OFFLOAD_MODULE_PATH,
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {"cpu_bytes_to_use": cpu_bytes},
+    }
+    if raiden_disagg is None:
+        return json.dumps(raiden_offload)
+    return json.dumps(
+        {
+            "kv_connector": _MULTI_CONNECTOR_NAME,
+            "kv_connector_module_path": _MULTI_CONNECTOR_MODULE_PATH,
+            "kv_role": kv_role,
+            "kv_connector_extra_config": {
+                "connectors": [raiden_disagg, raiden_offload]
+            },
         }
     )
 
@@ -209,7 +245,7 @@ def _append_pool_runtime_flags(
     if spec_k > 0:
         spec_json = json.dumps({"method": "mtp", "num_speculative_tokens": spec_k})
         args.extend(["--speculative-config", spec_json])
-    kv_transfer = _kv_transfer_flag_value(pool.role)
+    kv_transfer = _kv_transfer_flag_value(pool)
     if kv_transfer is not None:
         args.extend(["--kv-transfer-config", kv_transfer])
 
@@ -269,7 +305,12 @@ def _servable_model(source: str | None) -> str | None:
     return source
 
 
-def _env_prefix(pool: PoolMeshPlan, *, model_id: str = "") -> str:
+def _env_prefix(
+    pool: PoolMeshPlan,
+    *,
+    model_id: str = "",
+    is_hybrid: bool = False,
+) -> str:
     """Return validated runtime environment variable prefix for ``pool``."""
     env_parts: list[str] = []
     if pool.moe_dispatch == "a2a_push":
@@ -282,6 +323,12 @@ def _env_prefix(pool: PoolMeshPlan, *, model_id: str = "") -> str:
             )
             raise ValueError(msg)
         env_parts.append("TPU_MOE_SEQUENCE_PARALLEL=1 USE_MOE_FUSED_EP_KERNEL=1")
+    if pool.pp_layer_partition is not None and len(set(pool.pp_layer_partition)) > 1:
+        part_str = ",".join(str(x) for x in pool.pp_layer_partition)
+        env_parts.append(f"VLLM_PP_LAYER_PARTITION={part_str}")
+    hybrid_pool = is_hybrid or pool.hbm_state_gb > 0.0 or model_id in _HYBRID_MODEL_IDS
+    if pool.kv_offload_gb > 0.0 and hybrid_pool:
+        env_parts.append("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1")
     return " ".join(env_parts)
 
 
@@ -384,10 +431,11 @@ def _format_pool_commands(
     model: str | None,
     *,
     chip: ChipSpec | None = None,
-    model_id: str = "",
+    model_meta: tuple[str, bool] = ("", False),
 ) -> list[str]:
     """Render single-host or per-host Mode A/B launch commands for one pool."""
-    prefix = _env_prefix(pool, model_id=model_id)
+    model_id, is_hybrid = model_meta
+    prefix = _env_prefix(pool, model_id=model_id, is_hybrid=is_hybrid)
     host_args = _multihost_host_arg_lists(pool, base_args, chip)
     is_disagg = pool.role in ("prefill", "decode")
     is_multihost = len(host_args) > 1
@@ -597,6 +645,7 @@ def point_launch_args(
     spec_k = kwargs.get("spec_k", base.spec_k)
     spec_tokens = kwargs.get("spec_tokens", base.spec_tokens)
     mtp_layers = kwargs.get("mtp_layers", base.mtp_layers)
+    is_hybrid = kwargs.get("is_hybrid", base.is_hybrid)
     raw_spec = spec_tokens if spec_tokens > 0 else spec_k
     eff_spec = 0 if (mtp_layers is not None and mtp_layers <= 0) else raw_spec
     decode_args = pool_cli_args(
@@ -625,7 +674,7 @@ def point_launch_args(
                 prefill_args,
                 model,
                 chip=chip,
-                model_id=model_id,
+                model_meta=(model_id, is_hybrid),
             )
         )
     commands.extend(
@@ -634,7 +683,7 @@ def point_launch_args(
             decode_args,
             model,
             chip=chip,
-            model_id=model_id,
+            model_meta=(model_id, is_hybrid),
         )
     )
     return {
@@ -703,6 +752,7 @@ def emit_launch_args(
             mtp_layers=mtp_guard,
             hbm_reserve_gb=plan.hbm_reserve_gb,
             topologies=topologies,
+            is_hybrid=plan.is_hybrid,
         ),
     )
     if rec.prefill_pool is not None:
@@ -928,6 +978,7 @@ def build_solve_payload(
         mtp_layers=plan.mtp_layers if plan.spec_tokens > 0 else None,
         hbm_reserve_gb=plan.hbm_reserve_gb,
         topologies=topo_map,
+        is_hybrid=plan.is_hybrid,
     )
     top_entries: list[TopKEntry] = [
         {

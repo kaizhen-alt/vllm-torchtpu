@@ -43,6 +43,7 @@ from vllm_torchtpu.roofline import (
     torus_collective_s,
 )
 from vllm_torchtpu.roofline import constants as rf_constants
+from vllm_torchtpu.roofline import memory as rf_memory
 from vllm_torchtpu.roofline.collectives import submesh_for_group
 from vllm_torchtpu.roofline.geometry import _from_hf_config_dry_run
 from vllm_torchtpu.roofline.modules import experts_touched
@@ -1359,3 +1360,127 @@ def test_unpadded_prefill_capacity_bound_keeps_sampled_lm_head_rows() -> None:
     )
     assert all(val >= 0.0 for val in unp_short)
     assert unp_long[1] > unp_short[1]
+
+
+def test_partition_pp_rejects_pp_exceeding_num_layers() -> None:
+    """pp_stage_breakdowns returns empty infeasible tuple when pp > num_layers."""
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt = rf.dtypes_from_hf_config(SMALL_HYBRID_MOE_CFG)
+    too_many_stages = geom.num_layers + 4
+    par = Parallel(tp=1, pp=too_many_stages, moe="tp_slice")
+    part, bd, last_tot, ok = rf.pp_stage_breakdowns(geom, dt, par, (1024, 1))
+    assert not ok
+    assert part == ()
+    assert bd.total == 0.0
+    assert last_tot == 0.0
+    with pytest.raises(ValueError, match="Cannot partition"):
+        rf.partition_pp_layers(geom, dt, par, (1024, 1))
+
+
+def test_uneven_pp_step_floor_evaluates_exact_stage_slices() -> None:
+    """scale_pp_stage_floor evaluates exact contiguous stage slices without ratio."""
+    asym_hybrid_cfg = {
+        **SMALL_HYBRID_MOE_CFG,
+        "text_config": {
+            **SMALL_HYBRID_MOE_CFG["text_config"],
+            "num_hidden_layers": 8,
+            "layer_types": ["linear_attention"] * 6 + ["full_attention"] * 2,
+        },
+    }
+    geom = from_hf_config(asym_hybrid_cfg)
+    dt = rf.dtypes_from_hf_config(asym_hybrid_cfg)
+    chip = CHIPS["tpu7x"]
+    topo = TOPOLOGIES["2x2x1"]
+    par = Parallel(tp=1, pp=2, moe="tp_slice", ranks_per_chip=topo.cores_per_chip)
+    shape = StepShape(batch=0, rows_per_seq=0, prefill_tokens=2048, prefix_hit_rate=0.0)
+    opts = FloorOptions(dt=dt, topology=topo)
+    sf_uneven = rf.scale_pp_stage_floor(geom, chip, par, (shape, opts), (7, 1))
+    sf_even = step_floor(geom, chip, par, shape, opts)
+    assert sf_uneven.hard_floor_s <= sf_uneven.envelope_floor_s + 1e-12
+    assert sf_uneven.envelope_floor_s <= sf_uneven.serial_estimate_s + 1e-12
+    assert sf_uneven.serial_estimate_s > sf_even.serial_estimate_s
+    # Stage 0 holds 6 linear + 1 full layer; stage 1 holds 1 full layer.
+    assert any(m.name == "gdn" for m in sf_uneven.modules)
+    assert any(m.name == "embed" for m in sf_uneven.modules)
+    assert not any(m.name == "lm_head" for m in sf_uneven.modules)
+
+
+def test_scale_pp_stage_floor_uniform_preserves_p2p_and_mxu_tile() -> None:
+    """Uniform PP scale_pp_stage_floor preserves P2P collectives and MXU tiling."""
+    fix_path = Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+    cfg = json.loads(fix_path.read_text(encoding="utf-8"))
+    geom = rf.from_hf_config(cfg)
+    dt = rf.dtypes_from_hf_config(cfg)
+    chip = CHIPS["tpu7x"]
+    topo = rf.TOPOLOGIES["2x2x1"]
+    par = Parallel(tp=1, pp=3, ep=1)
+    shape = StepShape(batch=0, rows_per_seq=1, context=512, prefill_tokens=512)
+    opts = FloorOptions(dt=dt, topology=None)
+    sf_uniform = step_floor(geom, chip, par, shape, opts)
+    sf_staged = rf.scale_pp_stage_floor(geom, chip, par, (shape, opts), (20, 20, 20))
+    assert sf_staged.ici_s > 0.0
+    assert sf_staged.coll_bound_s > 0.0
+    assert sf_staged.hbm_s == pytest.approx(sf_uniform.hbm_s, rel=1e-12)
+    assert sf_staged.matmul_s == pytest.approx(sf_uniform.matmul_s, rel=1e-12)
+    assert sf_staged.vector_s == pytest.approx(sf_uniform.vector_s, rel=1e-12)
+    assert sf_staged.ici_s == pytest.approx(sf_uniform.ici_s, rel=1e-12)
+    assert sf_staged.chain_s == pytest.approx(sf_uniform.chain_s, rel=1e-12)
+    assert sf_staged.coll_bound_s == pytest.approx(sf_uniform.coll_bound_s, rel=1e-12)
+    assert sf_staged.hard_floor_s == pytest.approx(sf_uniform.hard_floor_s, rel=1e-12)
+    assert sf_staged.serial_estimate_s == pytest.approx(
+        sf_uniform.serial_estimate_s, rel=1e-12
+    )
+    par_topo = Parallel(tp=1, pp=4, ep=1)
+    opts_topo = FloorOptions(dt=dt, topology=topo)
+    sf_u4 = step_floor(geom, chip, par_topo, shape, opts_topo)
+    sf_s4 = rf.scale_pp_stage_floor(
+        geom, chip, par_topo, (shape, opts_topo), (15, 15, 15, 15)
+    )
+    assert sf_s4.coll_bound_s == pytest.approx(sf_u4.coll_bound_s, rel=1e-12)
+    assert sf_s4.ici_s == pytest.approx(sf_u4.ici_s, rel=1e-12)
+    assert sf_s4.chain_s == pytest.approx(sf_u4.chain_s, rel=1e-12)
+
+
+def test_kv_capacity_and_hit_rate_respects_w_base_b_delta() -> None:
+    """Verify kv_capacity_and_hit_rate responds to uneven PP peak-stage w_base_b."""
+    fix_path = Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+    cfg = json.loads(fix_path.read_text(encoding="utf-8"))
+    geom = rf.from_hf_config(cfg)
+    dt = rf.dtypes_from_hf_config(cfg)
+    chip = CHIPS["tpu7x"]
+    par = Parallel(tp=1, pp=4, ep=1)
+    b_kv_phys, fixed_kv_b = rf_memory.kv_bytes_per_core_parts(
+        geom, dt, par, 4096, chip=chip
+    )
+    base_w = 50.0e9
+    extra_w = 20.0e9
+    hbm_limit = 95.0e9
+    fit_base = rf.KvFitInput(
+        hbm_limit_b=hbm_limit,
+        w_base_b=base_w,
+        b_kv_phys_core=b_kv_phys,
+        offload_b_per_core=0.0,
+        b_ws=1,
+        kv_working_set_turns=1.0,
+        ctx_full=4096,
+        prefix_hit_rate=0.5,
+        fixed_kv_per_seq_bytes=fixed_kv_b,
+    )
+    fit_heavy = rf.KvFitInput(
+        hbm_limit_b=hbm_limit,
+        w_base_b=base_w + extra_w,
+        b_kv_phys_core=b_kv_phys,
+        offload_b_per_core=0.0,
+        b_ws=1,
+        kv_working_set_turns=1.0,
+        ctx_full=4096,
+        prefix_hit_rate=0.5,
+        fixed_kv_per_seq_bytes=fixed_kv_b,
+    )
+    cap_base, _ = rf_memory.kv_capacity_and_hit_rate(
+        geom, dt, par, 1, fit_base, chip=chip
+    )
+    cap_heavy, _ = rf_memory.kv_capacity_and_hit_rate(
+        geom, dt, par, 1, fit_heavy, chip=chip
+    )
+    assert cap_base - cap_heavy == pytest.approx(extra_w / b_kv_phys, rel=1e-9)

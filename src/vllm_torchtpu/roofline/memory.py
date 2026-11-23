@@ -786,12 +786,9 @@ def kv_capacity_and_hit_rate(
     """Compute physical KV token capacity and clamped prefix cache hit rate."""
     fixed_kv_per_seq_bytes = options.get("fixed_kv_per_seq_bytes")
     chip = options.get("chip")
-    st_b = (
-        hbm_footprint_per_core_bytes(
-            geom, dtypes, parallel, SeqKvLayout(b_res, 0), chip=chip
-        )
-        - kv_fit.w_base_b
-    )
+    st_b = hbm_breakdown_per_core_bytes(
+        geom, dtypes, parallel, SeqKvLayout(b_res, 0), chip=chip
+    ).state
     fixed_seq_b = max(
         0.0,
         kv_fit.fixed_kv_per_seq_bytes

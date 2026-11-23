@@ -51,7 +51,7 @@ from vllm_torchtpu.roofline import (
     solve_serving_plan,
     top_layouts,
 )
-from vllm_torchtpu.roofline.constants import NO_FEASIBLE_LAYOUT_WARNING
+from vllm_torchtpu.roofline.constants import NO_FEASIBLE_LAYOUT_WARNING, UNIT_GIBI
 from vllm_torchtpu.roofline.emit import (
     _MODEL_PLACEHOLDER,
     _UNKNOWN_MODEL_WARNING,
@@ -1425,3 +1425,142 @@ def test_families_and_cli_reference_layout_end_to_end(
         SolveOptions(mode="mixed", max_chips=4),
     )
     assert "disaggregated mode" in reason
+
+
+def test_emit_kv_offload_uses_tpu_raiden_offloading_connector_and_unified_pool() -> (
+    None
+):
+    """Emit TPURaidenOffloadingConnector, TPUMultiConnector, and unified pool env."""
+    offload_gib = 64.0
+    expected_cpu_bytes = round(offload_gib * UNIT_GIBI)
+    mixed_hybrid_pool = PoolMeshPlan(
+        role="mixed",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=8,
+        dp=1,
+        ep=8,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 1),
+        hbm_used_gb=40.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="ag_ep",
+        hbm_state_gb=2.0,
+        max_num_seqs=16,
+        max_model_len=8192,
+        kv_offload_gb=offload_gib,
+    )
+    mixed_flags = pool_cli_args(
+        mixed_hybrid_pool, kv_dtype="fp8", model_id="qwen3_5_moe"
+    )
+    assert "--kv-offloading-size" not in mixed_flags
+    assert "--kv-transfer-config" in mixed_flags
+    mixed_kv = json.loads(mixed_flags[mixed_flags.index("--kv-transfer-config") + 1])
+    assert mixed_kv["kv_connector"] == "TPURaidenOffloadingConnector"
+    assert (
+        mixed_kv["kv_connector_module_path"] == "vllm_torchtpu.offload.raiden_connector"
+    )
+    assert mixed_kv["kv_role"] == "kv_both"
+    assert mixed_kv["kv_connector_extra_config"] == {
+        "cpu_bytes_to_use": expected_cpu_bytes
+    }
+
+    hybrid_pt = ParetoPoint(
+        mode="mixed",
+        concurrency=16,
+        total_chips=4,
+        prefill_pool=None,
+        decode_pool=mixed_hybrid_pool,
+        est_ttft_ms=100.0,
+        est_tpot_ms=10.0,
+        est_interactivity_tok_s=100.0,
+        output_throughput_per_chip=200.0,
+        token_throughput_per_chip=600.0,
+        p_mixed=0.1,
+        binding="hbm",
+        slo_met=True,
+    )
+    hybrid_launch = point_launch_args(
+        hybrid_pt,
+        kv_dtype="fp8",
+        model="Qwen/Qwen3.5-397B-A17B-FP8",
+        model_id="qwen3_5_moe",
+        is_hybrid=True,
+    )
+    assert any(
+        "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1" in cmd
+        for cmd in hybrid_launch["commands"]
+    )
+    assert not any("--kv-offloading-size" in cmd for cmd in hybrid_launch["commands"])
+
+    pure_mla_pool = dc_replace(mixed_hybrid_pool, hbm_state_gb=0.0)
+    mla_pt = dc_replace(hybrid_pt, decode_pool=pure_mla_pool)
+    mla_launch = point_launch_args(
+        mla_pt,
+        kv_dtype="fp8",
+        model="zai-org/GLM-5.2-FP8",
+        model_id="glm_moe_dsa",
+        is_hybrid=False,
+    )
+    assert not any(
+        "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1" in cmd for cmd in mla_launch["commands"]
+    )
+
+    prefill_pool = PoolMeshPlan(
+        role="prefill",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=1,
+        dp=1,
+        ep=1,
+        pp=8,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(1,),
+        hbm_used_gb=30.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="allreduce",
+        hbm_state_gb=1.0,
+        max_model_len=8192,
+        pp_layer_partition=(8, 8, 8, 8, 8, 8, 8, 4),
+        kv_offload_gb=offload_gib,
+    )
+    decode_pool = dc_replace(mixed_hybrid_pool, role="decode", kv_offload_gb=0.0)
+    disagg_pt = dc_replace(
+        hybrid_pt, mode="disagg", prefill_pool=prefill_pool, decode_pool=decode_pool
+    )
+    disagg_launch = point_launch_args(
+        disagg_pt,
+        kv_dtype="fp8",
+        model="Qwen/Qwen3.5-397B-A17B-FP8",
+        model_id="qwen3_5_moe",
+        is_hybrid=True,
+    )
+    pre_args = disagg_launch["prefill_cli_args"]
+    assert "--kv-offloading-size" not in pre_args
+    multi_cfg = json.loads(pre_args[pre_args.index("--kv-transfer-config") + 1])
+    assert multi_cfg["kv_connector"] == "TPUMultiConnector"
+    assert (
+        multi_cfg["kv_connector_module_path"]
+        == "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector"
+    )
+    assert multi_cfg["kv_role"] == "kv_producer"
+    children = multi_cfg["kv_connector_extra_config"]["connectors"]
+    assert [c["kv_connector"] for c in children] == [
+        "TPURaidenConnector",
+        "TPURaidenOffloadingConnector",
+    ]
+    assert children[0]["kv_role"] == "kv_producer"
+    assert children[1]["kv_role"] == "kv_both"
+    assert children[1]["kv_connector_extra_config"] == {
+        "cpu_bytes_to_use": expected_cpu_bytes
+    }
+    assert any(
+        "VLLM_PP_LAYER_PARTITION=8,8,8,8,8,8,8,4" in cmd
+        and "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1" in cmd
+        for cmd in disagg_launch["commands"]
+    )

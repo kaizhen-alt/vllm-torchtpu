@@ -19,6 +19,7 @@ import importlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -26,8 +27,10 @@ from tests.roofline.conftest import load_qwen3_8_bringup_config
 from vllm_torchtpu.roofline import (
     CHIPS,
     TOPOLOGIES,
+    Parallel,
     ParetoPoint,
     PoolMeshPlan,
+    PpStageOptions,
     ServingPlan,
     SolveOptions,
     TrafficScenario,
@@ -35,6 +38,7 @@ from vllm_torchtpu.roofline import (
     dtypes_from_hf_config,
     emit_launch_args,
     from_hf_config,
+    partition_pp_layers,
     pool_cli_args,
     solve_serving_plan,
     tpu_min_page_size,
@@ -57,8 +61,28 @@ except ImportError as _exc:
     TPUQwen4ExpConfig = None
     PcpStaticSupportValidator = None
     validate_pipeline_parallel_config = None
+    TpuPlatform = None
+    VllmConfigCls = None
+    ModelConfigCls = None
+    CacheConfigCls = None
+    KVTransferConfigCls = None
+    torch_mod = None
     _RUNTIME_IMPORT_ERROR: Exception | None = _exc
 else:
+    import torch as torch_mod
+    from vllm.config import (
+        CacheConfig as CacheConfigCls,
+    )
+    from vllm.config import (
+        KVTransferConfig as KVTransferConfigCls,
+    )
+    from vllm.config import (
+        ModelConfig as ModelConfigCls,
+    )
+    from vllm.config import (
+        VllmConfig as VllmConfigCls,
+    )
+
     from vllm_torchtpu.layers.adapter.attention import (
         PallasAttentionBackend,
         PallasMLAttentionBackend,
@@ -69,6 +93,7 @@ else:
     from vllm_torchtpu.platforms.pp_validation import (
         validate_pipeline_parallel_config,
     )
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
     _RUNTIME_IMPORT_ERROR = None
 
@@ -542,3 +567,205 @@ def test_qwen4_exp_moe_sp_rejected_by_live_config_and_emit() -> None:
             ),
             model="Qwen/Qwen3.8-Flash-Next-FP8",
         )
+
+
+def _build_platform_vcfg(
+    *,
+    is_hybrid: bool,
+    kv_transfer_cfg: dict[str, object],
+) -> object:
+    """Build a mocked VllmConfig for live TpuPlatform validation checks."""
+    assert VllmConfigCls is not None
+    assert ModelConfigCls is not None
+    assert CacheConfigCls is not None
+    assert KVTransferConfigCls is not None
+    assert torch_mod is not None
+    vcfg = MagicMock(spec=VllmConfigCls)
+    vcfg.model_config = MagicMock(spec=ModelConfigCls)
+    vcfg.model_config.dtype = torch_mod.bfloat16
+    vcfg.model_config.is_hybrid = is_hybrid
+    vcfg.model_config.is_attention_free = False
+    vcfg.model_config.architecture = (
+        "Qwen3_5MoeForConditionalGeneration" if is_hybrid else "GlmMoeDsaForCausalLM"
+    )
+    vcfg.model_config.architectures = [vcfg.model_config.architecture]
+    vcfg.model_config.hf_config = None
+    vcfg.model_config.runner_type = "generate"
+    vcfg.model_config.get_head_size = lambda: 128
+    vcfg.cache_config = CacheConfigCls()
+    vcfg.cache_config.block_size = 128
+    vcfg.cache_config.enable_prefix_caching = False
+    vcfg.cache_config.mamba_cache_mode = None
+    vcfg.attention_config = MagicMock()
+    vcfg.attention_config.backend = None
+    vcfg.compilation_config = MagicMock()
+    vcfg.compilation_config.mode = MagicMock()
+    vcfg.compilation_config.compile_sizes = [16, 32]
+    vcfg.compilation_config.splitting_ops = []
+    vcfg.scheduler_config = MagicMock()
+    vcfg.scheduler_config.max_num_batched_tokens = 32
+    vcfg.scheduler_config.max_num_seqs = 16
+    vcfg.scheduler_config.max_num_scheduled_tokens = None
+    vcfg.scheduler_config.enable_chunked_prefill = True
+    vcfg.scheduler_config.is_multimodal_model = False
+    vcfg.scheduler_config.async_scheduling = False
+    vcfg.speculative_config = None
+    vcfg.lora_config = None
+    vcfg.parallel_config = MagicMock(
+        prefill_context_parallel_size=1,
+        nnodes=1,
+        node_rank=0,
+        world_size=1,
+        world_size_across_dp=1,
+        data_parallel_size=1,
+        data_parallel_size_local=1,
+        enable_expert_parallel=False,
+        pipeline_parallel_size=1,
+        tensor_parallel_size=1,
+        cp_kv_cache_interleave_size=1,
+        decode_context_parallel_size=1,
+    )
+    raw_extra = kv_transfer_cfg.get("kv_connector_extra_config")
+    raw_mod = kv_transfer_cfg.get("kv_connector_module_path")
+    vcfg.kv_transfer_config = KVTransferConfigCls(
+        kv_connector=str(kv_transfer_cfg["kv_connector"]),
+        kv_connector_module_path=str(raw_mod) if raw_mod is not None else None,
+        kv_role=str(kv_transfer_cfg.get("kv_role", "kv_both")),
+        kv_connector_extra_config=(
+            dict(raw_extra) if isinstance(raw_extra, dict) else {}
+        ),
+    )
+    vcfg.additional_config = {}
+    return vcfg
+
+
+def test_kv_offload_and_hybrid_pp_stage_parity_with_live_tpu_platform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Assert offload/multi connectors and hybrid PP partitions pass live runtime."""
+    _require_runtime()
+    assert TpuPlatform is not None
+    assert validate_pipeline_parallel_config is not None
+
+    offload_pool = PoolMeshPlan(
+        role="mixed",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=8,
+        dp=1,
+        ep=8,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 1),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="ag_ep",
+        hbm_state_gb=2.0,
+        kv_offload_gb=32.0,
+    )
+    offload_flags = pool_cli_args(offload_pool, kv_dtype="fp8", model_id="qwen3_5_moe")
+    assert "--kv-offloading-size" not in offload_flags
+    offload_cfg = json.loads(
+        offload_flags[offload_flags.index("--kv-transfer-config") + 1]
+    )
+    disagg_pool = PoolMeshPlan(
+        role="prefill",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=1,
+        dp=1,
+        ep=1,
+        pp=8,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(1,),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="allreduce",
+        kv_offload_gb=32.0,
+    )
+    disagg_flags = pool_cli_args(disagg_pool, kv_dtype="fp8", model_id="qwen3_5_moe")
+    multi_cfg = json.loads(disagg_flags[disagg_flags.index("--kv-transfer-config") + 1])
+
+    with (
+        patch("vllm_torchtpu.patch_registry.apply"),
+        patch(
+            "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+        ),
+    ):
+        monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
+        TpuPlatform.check_and_update_config(
+            _build_platform_vcfg(is_hybrid=True, kv_transfer_cfg=offload_cfg)
+        )
+        TpuPlatform.check_and_update_config(
+            _build_platform_vcfg(is_hybrid=True, kv_transfer_cfg=multi_cfg)
+        )
+        with pytest.raises(AssertionError, match="OffloadingConnector"):
+            TpuPlatform.check_and_update_config(
+                _build_platform_vcfg(
+                    is_hybrid=False,
+                    kv_transfer_cfg={
+                        "kv_connector": "OffloadingConnector",
+                        "kv_role": "kv_both",
+                    },
+                )
+            )
+        monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "0")
+        with pytest.raises(ValueError, match="TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1"):
+            TpuPlatform.check_and_update_config(
+                _build_platform_vcfg(is_hybrid=True, kv_transfer_cfg=offload_cfg)
+            )
+
+    # Live validate_pipeline_parallel_config rejects a hybrid stage with 0 full layers,
+    # while roofline partition_pp_layers(..., require_full_attn_per_stage=True) yields
+    # a VLLM_PP_LAYER_PARTITION that passes.
+    layers = ["linear_attention"] * 6 + ["full_attention"] * 2
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    with pytest.raises(NotImplementedError, match="no full-attention layer"):
+        validate_pipeline_parallel_config(
+            _make_vllm_config(
+                pp=2,
+                tp=1,
+                async_scheduling=False,
+                layer_types=layers,
+                kv_transfer_config=SimpleNamespace(
+                    is_kv_producer=True,
+                    kv_connector=offload_cfg["kv_connector"],
+                ),
+            )
+        )
+    asym_cfg = {
+        **json.loads(
+            (_FIXTURES_DIR / "qwen3_5_397b_fp8.json").read_text(encoding="utf-8")
+        ),
+    }
+    asym_text = dict(asym_cfg["text_config"])
+    asym_text.pop("full_attention_interval", None)
+    asym_text["num_hidden_layers"] = 8
+    asym_text["layer_types"] = layers
+    asym_cfg["text_config"] = asym_text
+    geom_asym = from_hf_config(asym_cfg)
+    dt_asym = dtypes_from_hf_config(asym_cfg)
+    part = partition_pp_layers(
+        geom_asym,
+        dt_asym,
+        Parallel(tp=1, pp=2, moe="tp_slice", ranks_per_chip=2),
+        (4096, 1),
+        options=PpStageOptions(require_full_attn_per_stage=True),
+    )
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", ",".join(str(x) for x in part))
+    validate_pipeline_parallel_config(
+        _make_vllm_config(
+            pp=2,
+            tp=1,
+            async_scheduling=False,
+            layer_types=layers,
+            kv_transfer_config=SimpleNamespace(
+                is_kv_producer=True,
+                kv_connector=offload_cfg["kv_connector"],
+            ),
+        )
+    )
