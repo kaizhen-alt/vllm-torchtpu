@@ -50,7 +50,11 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     )
     from .dma import (
         pool_alias,
+        stream,
         vmem,
+    )
+    from .dma.stream import (
+        TwoRing,
     )
     from .dma.vmem import (
         fit_default_tiles,
@@ -252,6 +256,7 @@ _LAZY: dict[str, str] = {
     "TileContext": ".profile",
     "TileRule": ".profile",
     "Tiles": ".exec_spec",
+    "TwoRing": ".dma.stream",
     "VLLMAlias": ".spec",
     "WeightDecl": ".spec",
     "WeightSource": ".weights",
@@ -281,6 +286,7 @@ _LAZY: dict[str, str] = {
     "register_model": ".model_def",
     "register_profile": ".profile",
     "ssm_to_raw_pages": ".pool",
+    "stream": ".dma",
     "vmem": ".dma",
     "with_cache": ".pool",
 }
@@ -346,6 +352,7 @@ __all__ = [
     "TileContext",
     "TileRule",
     "Tiles",
+    "TwoRing",
     "VLLMAlias",
     "WeightDecl",
     "WeightSource",
@@ -395,6 +402,7 @@ __all__ = [
     "schedule",
     "spec",
     "ssm_to_raw_pages",
+    "stream",
     "validate",
     "vmem",
     "weights",
