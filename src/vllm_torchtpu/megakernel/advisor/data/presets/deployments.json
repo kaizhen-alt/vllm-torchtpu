@@ -212,6 +212,101 @@
           }
         }
       ]
+    },
+    "qwen3.8-flash-next": {
+      "source": "Qwen3.8-Flash-Next serving layout: disaggregated TP8 x EP8 x DCP4 decode with 3 draft tokens and whole-step megakernel (VLLM_TPU_MEGAKERNEL=whole=1 with wholerows=64 and buckets=8:16:32:48:64), PP8 prefill, and colocated TP8 x EP8 and TP8 x EP8 x DCP2 decode",
+      "prefill_windows": [
+        8192
+      ],
+      "unmodeled_notes": [
+        "MTP-1 draft layer forward pass (1 QSA+MoE layer plus shared lm_head)",
+        "Standalone fused hyper-connection decode kernel (TPU_QWEN4_HC_DECODE_FUSED=1) used by high-concurrency non-megakernel runs",
+        "Host dispatch gap between device steps",
+        "Non-uniform pipeline stage splits configured via VLLM_PP_LAYER_PARTITION"
+      ],
+      "decode": {
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "spec_tokens": 3,
+        "megakernel": {
+          "source": "Disaggregated decode megakernel on TP8 x EP8 x DCP4: one call serves up to 64 rows (wholerows=64, buckets=8:16:32:48:64), split calls serve up to 256 rows per step (64 sequences x 4 verify rows), split_kv exchanges partial attention across 4 DCP peers, and each expert runs on a masked batch",
+          "source_ref": "unpublished",
+          "scopes": [
+            "whole_step"
+          ],
+          "ranks": 8,
+          "max_rows": 64,
+          "max_total_rows": 256,
+          "phases": [
+            "decode",
+            "verify"
+          ],
+          "moe_layout": "masked",
+          "collectives": {
+            "steps": [
+              {
+                "kind": "split_kv",
+                "group_size": 4,
+                "calls_per_layer": 2
+              }
+            ]
+          }
+        }
+      },
+      "prefill": {
+        "tp": 1,
+        "ep": 1,
+        "pp": 8
+      },
+      "megakernel_layouts": [
+        {
+          "tp": 8,
+          "ep": 8,
+          "megakernel": {
+            "source": "Colocated decode megakernel on TP8 x EP8: one call serves up to 64 rows (covering both wholerows=32 and wholerows=64 serving configurations) with masked expert execution",
+            "source_ref": "unpublished",
+            "scopes": [
+              "whole_step"
+            ],
+            "ranks": 8,
+            "max_rows": 64,
+            "phases": [
+              "decode",
+              "verify"
+            ],
+            "moe_layout": "masked"
+          }
+        },
+        {
+          "tp": 8,
+          "ep": 8,
+          "dcp": 2,
+          "megakernel": {
+            "source": "Colocated decode megakernel on TP8 x EP8 x DCP2: one call serves up to 64 rows, split_kv exchanges partial attention across 2 DCP peers, and each expert runs on a masked batch",
+            "source_ref": "unpublished",
+            "scopes": [
+              "whole_step"
+            ],
+            "ranks": 8,
+            "max_rows": 64,
+            "phases": [
+              "decode",
+              "verify"
+            ],
+            "moe_layout": "masked",
+            "collectives": {
+              "steps": [
+                {
+                  "kind": "split_kv",
+                  "group_size": 2,
+                  "calls_per_layer": 2
+                }
+              ]
+            }
+          }
+        }
+      ]
     }
   }
 }

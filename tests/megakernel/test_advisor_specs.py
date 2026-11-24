@@ -53,7 +53,7 @@ EXPECTED_VECTOR_LOAD_CAP_TEXT = (
 )
 
 
-SHIPPED_PRESET_COUNT = 3
+SHIPPED_PRESET_COUNT = 4
 NEGATIVE_CONTROL_SNAPSHOTS = frozenset({"kimi-k3.1-pro", "qwen3.8-2.4t", "deepseek-v3"})
 HF_CONFIG_DIR = Path(__file__).resolve().parent / "data" / "advisor" / "hf_configs"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1245,7 +1245,12 @@ def test_config_notice_reports_preset_match(
 
 def test_shipped_presets_are_the_three_validated_models() -> None:
     """Verify models.json ships only the three validated presets and their aliases."""
-    expected_presets = {"qwen3.5-397b", "kimi-k3", "glm-5.2"}
+    expected_presets = {
+        "qwen3.5-397b",
+        "kimi-k3",
+        "glm-5.2",
+        "qwen3.8-flash-next",
+    }
     expected_aliases = {
         "qwen3.5-397b": "qwen3.5-397b",
         "qwen3.5-397b-a17b": "qwen3.5-397b",
@@ -1254,11 +1259,19 @@ def test_shipped_presets_are_the_three_validated_models() -> None:
         "glm-5.2": "glm-5.2",
         "glm-5.2-fp8": "glm-5.2",
         "glm5.2": "glm-5.2",
+        "qwen3.8-flash-next": "qwen3.8-flash-next",
+        "qwen3.8-flash-next-fp8": "qwen3.8-flash-next",
+        "qwen3.8-flash": "qwen3.8-flash-next",
     }
     assert set(models.MODEL_PRESETS) == expected_presets
     assert dict(models.REGISTERED_MODEL_ALIASES) == expected_aliases
     assert not hasattr(models, "RECOGNIZED_MODEL_TYPES")
-    for preset_name in ("qwen3.5-397b", "kimi-k3", "glm-5.2"):
+    for preset_name in (
+        "qwen3.5-397b",
+        "kimi-k3",
+        "glm-5.2",
+        "qwen3.8-flash-next",
+    ):
         snapshot = json.loads(
             (HF_CONFIG_DIR / f"{preset_name}.json").read_text(encoding="utf-8")
         )
@@ -1269,7 +1282,12 @@ def test_shipped_presets_are_the_three_validated_models() -> None:
 
 def test_authentic_kept_configs_resolve_to_shipped_presets() -> None:
     """Verify each kept authentic HF config snapshot resolves to its shipped preset."""
-    for preset_name in ("qwen3.5-397b", "kimi-k3", "glm-5.2"):
+    for preset_name in (
+        "qwen3.5-397b",
+        "kimi-k3",
+        "glm-5.2",
+        "qwen3.8-flash-next",
+    ):
         snapshot = json.loads(
             (HF_CONFIG_DIR / f"{preset_name}.json").read_text(encoding="utf-8")
         )
@@ -1283,6 +1301,7 @@ def test_unsupported_authentic_config_fails_closed() -> None:
         "Qwen/Qwen3.5-397B-A17B-FP8",
         "moonshotai/Kimi-K3",
         "zai-org/GLM-5.2-FP8",
+        "Qwen/Qwen3.8-Flash-Next-FP8",
     )
     for neg_name in ("kimi-k3.1-pro", "qwen3.8-2.4t", "deepseek-v3"):
         snapshot = json.loads(
@@ -1302,7 +1321,12 @@ def test_unsupported_authentic_config_fails_closed() -> None:
 
 def test_perturbed_supported_config_fails_closed() -> None:
     """Verify perturbing num_hidden_layers on any kept config fails closed."""
-    for preset_name in ("qwen3.5-397b", "kimi-k3", "glm-5.2"):
+    for preset_name in (
+        "qwen3.5-397b",
+        "kimi-k3",
+        "glm-5.2",
+        "qwen3.8-flash-next",
+    ):
         snapshot = json.loads(
             (HF_CONFIG_DIR / f"{preset_name}.json").read_text(encoding="utf-8")
         )

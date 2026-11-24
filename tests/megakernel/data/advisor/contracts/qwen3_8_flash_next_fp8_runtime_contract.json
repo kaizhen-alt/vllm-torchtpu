@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "model_id": "qwen4_exp",
+  "runtime_profile": "qwen38-full",
+  "hf_repo": "Qwen/Qwen3.8-Flash-Next-FP8",
+  "served_provenance": "mapped workspace tree, no commit recorded",
+  "reference_branch": "caojx/qwen38-flash-1121",
+  "reference_commit": "d8f139fada10cc04e8526e24298dccf78ee07b31",
+  "not_enumerated": ["pcp > 1"],
+  "rules": [
+    {
+      "id": 1,
+      "name": "expert_and_ffn_divisibility",
+      "status": "resolved",
+      "rule": "Experts, MoE intermediate, and shared intermediate sizes must divide their parallel groups.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:715-726"
+    },
+    {
+      "id": 2,
+      "name": "qsa_head_divisibility",
+      "status": "resolved",
+      "rule": "QSA query and KV heads must shard or replicate integrally over TP.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:745-756"
+    },
+    {
+      "id": 3,
+      "name": "max_context",
+      "status": "resolved",
+      "rule": "Context must not exceed max_position_embeddings (262144).",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:776-777"
+    },
+    {
+      "id": 4,
+      "name": "fp8_block_128_quantization",
+      "status": "resolved",
+      "rule": "Only the block-128 FP8 checkpoint with --quantization fp8 is supported.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:789-795"
+    },
+    {
+      "id": 5,
+      "name": "vllm_dcp_flag_stays_one",
+      "status": "resolved",
+      "rule": "vLLM decode_context_parallel_size CLI flag must remain 1; linear expert placement.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:799-809"
+    },
+    {
+      "id": 6,
+      "name": "pcp_unserved_not_enumerated",
+      "status": "resolved",
+      "rule": "PCP > 1 requires TP1, EP, unified pool, no main-KV DCP, unpacked keys/KV, spec off; unserved and not enumerated under qwen38-full.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:810-834"
+    },
+    {
+      "id": 7,
+      "name": "pp_rules_and_prefill_mtp_producer",
+      "status": "resolved",
+      "rule": "PP > 1 requires TP1, unified pool, unpacked compressed keys, and spec off, except a PD producer with PP > 1, TP1, TPU_RAIDEN_POOL_TAGS_PER_LAYER=1, QWEN4_EXP_PD_DRAFT_KV=1, and 1-token MTP.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:87-115,835-855"
+    },
+    {
+      "id": 8,
+      "name": "main_kv_dcp_env",
+      "status": "resolved",
+      "rule": "Main-KV DCP is set via VLLM_TPU_QSA_MAIN_KV_DCP and must divide TP // num_key_value_heads.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:856-872"
+    },
+    {
+      "id": 9,
+      "name": "block_size_dtype_and_step_cap",
+      "status": "resolved",
+      "rule": "--block-size must be 128, model dtype BF16, max_num_batched_tokens <= 8192.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:890-898"
+    },
+    {
+      "id": 10,
+      "name": "reject_disable_hybrid_kv_and_lora",
+      "status": "resolved",
+      "rule": "--disable-hybrid-kv-cache-manager and LoRA are rejected; prefix caching requires unified pool.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:908-918"
+    },
+    {
+      "id": 11,
+      "name": "mamba_cache_mode_align",
+      "status": "resolved",
+      "rule": "Unified pool + prefix caching requires mamba_cache_mode='align'; MTP accepts 'none' or 'align'.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:982-983,1256-1257"
+    },
+    {
+      "id": 12,
+      "name": "engram_ple_config_flags",
+      "status": "resolved",
+      "rule": "engram_config flags are booleans; dp_shared_memory requires cpu_offload, local DP > 1, nnodes == 1, and not embedding_across_dp.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:984-1002"
+    },
+    {
+      "id": 13,
+      "name": "mtp_constraints",
+      "status": "resolved",
+      "rule": "MTP requires method='mtp', unified pool, 1 full-attention MTP layer, shared embed/lm_head, window in [1, 5], draft TP == target TP, DP == 1.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:1184-1226"
+    },
+    {
+      "id": 14,
+      "name": "qsa_ring_rows_and_max_spec",
+      "status": "resolved",
+      "rule": "raw_ring has (indexer_compress_ratio + 7) // 8 * 8 = 8 rows (8,192 B), yielding max_qsa_speculative_tokens = 8 - 4 + 1 = 5.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:218-233"
+    },
+    {
+      "id": 15,
+      "name": "pd_decode_mtp_and_pool_tags",
+      "status": "resolved",
+      "rule": "PD decode MTP requires kv_consumer, TP >= 2, PP == 1, TPU_RAIDEN_POOL_TAGS_PER_LAYER=1 (required on both pair peers whenever PP > 1 or MTP is enabled), and prefix caching off or mamba_cache_mode='align'.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:1227-1255, src/vllm_torchtpu/models/vllm/qwen4_exp/pd_connector.py:1240",
+      "verbatim": "or not envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER"
+    },
+    {
+      "id": 16,
+      "name": "pp_stage_partition_and_last_stage_draft",
+      "status": "resolved",
+      "rule": "Stage owns get_pp_indices(VLLM_PP_LAYER_PARTITION) layers; MTP draft caches sit on the last stage.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/pp.py:31-67"
+    },
+    {
+      "id": 17,
+      "name": "ple_indexing_rows_state_and_h2d",
+      "status": "resolved",
+      "rule": "ple_layer_ids is 1-indexed (index + 1 in ple_layer_ids -> [2] attaches to layer 1); 16 prime head vocabs sum to 320,001,446 rounded to 128 -> 320,001,536 x 160 FP8 (47.684 GiB; 5.960 GiB/core at TP8); H2D = 2,560 B/tok (FP8 uint8); PLE conv state = (9, 10240) BF16 = 184,320 B.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:317, src/vllm_torchtpu/models/vllm/qwen4_exp/ple_geometry.py:11-26, src/vllm_torchtpu/models/vllm/qwen4_exp/ple_storage.py:265",
+      "verbatim": "if index + 1 in t.ple_layer_ids:"
+    },
+    {
+      "id": 18,
+      "name": "pair_leg_eight_cores_ep_fp8_raiden",
+      "status": "resolved",
+      "rule": "Each PD pair leg uses Qwen4ExpRaidenConnector (producer/consumer), covers exactly 8 cores (TP x DP x PP x PCP == 8), enables EP when TP x DP x PCP > 1, uses unified pool with FP8 KV, and sets TPU_KV_RESHARD_TRANSPORT=raiden.",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:929-975"
+    },
+    {
+      "id": 19,
+      "name": "ple_cpu_offload_single_host_and_sharding",
+      "status": "resolved",
+      "rule": "Host PLE offload requires single host with all DP local and at most one PLE layer; HBM-resident PLE table shards evenly over TP (or TP x DP when shared). Per-pool default: cpu_offload=True on PP8/TP1 prefill, False on TP8 decode (5.96 GiB/core HBM).",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:1003-1036, src/vllm_torchtpu/models/vllm/qwen4_exp/pooled_ple.py:53",
+      "verbatim": "if cpu_offload"
+    },
+    {
+      "id": 20,
+      "name": "unified_pool_page_tokens_and_bytes",
+      "status": "resolved",
+      "rule": "FP8 main KV = 1,024 B/tok/layer/chip (1 head slot for TP8 local_kv=1 and TP1 local_kv=2). GDN state = 8 conv + 384 ssm rows (400,896 B) at TP8 -> 512 tok/page (524,288 B/page); 64 conv + 3,072 ssm rows (3,207,168 B) at TP1 -> 3,200 tok/page (3,276,800 B/page). Compressed keys = 32 rows x 256 lanes x 2 B / 128 tok = 128 B/tok (409,600 B trimmed per 3,200-token page); stored per_rank (num_kv_heads=1).",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/pool_layout.py:280-305, src/vllm_torchtpu/models/vllm/qwen4_exp/qsa.py:138,157, src/vllm_torchtpu/models/vllm/qwen4_exp/pd_manifest.py:43-52",
+      "verbatim": "block_size = math.ceil(required_rows / QSA_BLOCK_SIZE) * QSA_BLOCK_SIZE"
+    },
+    {
+      "id": 21,
+      "name": "pd_transfer_payload",
+      "status": "resolved",
+      "rule": "Wire transfer per uncached token = 12 * (1,024 + 128) = 13,824 B/tok (14,976 B/tok with QWEN4_EXP_PD_DRAFT_KV=1), plus 49 fixed REQUEST_STATE pages (36 GDN + 1 PLE + 12 QSA rings = 160,563,200 B; 50 pages = 163,840,000 B with draft ring).",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/pd_manifest.py:51, src/vllm_torchtpu/models/vllm/qwen4_exp/pd.py:44",
+      "verbatim": "live = (layout.block_size // layout.kernel_block_size) * layout.compressed_kernel_bytes"
+    },
+    {
+      "id": 22,
+      "name": "host_offload_and_multi_connector",
+      "status": "resolved",
+      "rule": "Host KV offload requires TPURaidenOffloadingConnector, kv_role='kv_both', unified pool, prefix caching, mamba_cache_mode='align', positive cpu_bytes_to_use. TPUMultiConnector is admitted only as kv_producer wrapping [Qwen4ExpRaidenConnector, TPURaidenOffloadingConnector]. VLLM_TPU_OFFLOAD_TIER_CLASSES splits DRAM into per-kind tiers (key_row_bytes=409,600 B when VLLM_TPU_OFFLOAD_TIER_KEY_ROWS=1).",
+      "source": "src/vllm_torchtpu/models/vllm/qwen4_exp/config.py:1125,1171, src/vllm_torchtpu/offload/tier_classes.py:285",
+      "verbatim": "or sorted(names) != sorted([PD_CONNECTOR, OFFLOAD_CONNECTOR])"
+    }
+  ],
+  "verified_layout_bytes": {
+    "main_kv_b_per_tok_layer_chip": 1024,
+    "compressed_k_live_b_per_tok_layer": 128,
+    "pool_page_tokens_tp8": 512,
+    "pool_page_bytes_tp8": 524288,
+    "pool_page_tokens_tp1": 3200,
+    "pool_page_bytes_tp1": 3276800,
+    "ple_rows": 320001536,
+    "ple_dim": 160,
+    "ple_total_bytes": 51200245760,
+    "ple_h2d_fp8_b_per_tok": 2560,
+    "ple_state_bytes": 184320,
+    "pd_transfer_no_draft_b_per_tok": 13824,
+    "pd_transfer_with_draft_b_per_tok": 14976,
+    "pd_transfer_fixed_pages_no_draft": 49,
+    "pd_transfer_fixed_bytes_no_draft": 160563200,
+    "pd_transfer_fixed_pages_with_draft": 50,
+    "pd_transfer_fixed_bytes_with_draft": 163840000
+  }
+}

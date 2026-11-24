@@ -2088,6 +2088,7 @@ def test_cli_list_models_explicit_tiers(
         "glm-5.2": "priced_only",
         "kimi-k3": "declared",
         "qwen3.5-397b": "declared",
+        "qwen3.8-flash-next": "declared",
     }
     assert set(expected_tiers) == set(advisor.MODEL_PRESETS)
 
