@@ -368,6 +368,30 @@ def sharded_splash_attention(
     )
 
 
+def _live_rows(
+    num_tokens: int,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The request rows a step of `num_tokens` tokens can hold.
+
+    Every scheduled request holds at least one of the step's tokens, so rows
+    past `num_tokens` are padding. Dropping them keeps RPA from scalar-
+    prefetching the whole max_num_seqs page table into SMEM on every call
+    (512 KiB at 256 seqs x 512 pages: ~8 us per call, 128 calls per step).
+    """
+    num_rows = min(num_tokens, kv_lens.shape[0])
+    if num_rows == kv_lens.shape[0]:
+        return kv_lens, page_indices, cu_q_lens
+    pages_per_seq = page_indices.shape[0] // kv_lens.shape[0]
+    return (
+        kv_lens[:num_rows],
+        page_indices[: num_rows * pages_per_seq],
+        cu_q_lens[: num_rows + 1],
+    )
+
+
 def sharded_ragged_paged_attention(
     mesh: Mesh,
     q: jax.Array,
@@ -416,6 +440,9 @@ def sharded_ragged_paged_attention(
     )
     out_specs = (qkv_spec, kv_cache_spec)
 
+    kv_lens, page_indices, cu_q_lens = _live_rows(
+        q.shape[0], kv_lens, page_indices, cu_q_lens
+    )
     args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
 
     if use_hd64:
@@ -599,15 +626,22 @@ def attention_bundled(
         data_spec,  # query_start_loc
         data_spec,  # request_distribution
     )
+    # Inside the bundled RPA call the metadata are the step's JAX arrays.
+    seq_lens, block_tables, query_start_loc = _live_rows(
+        q.shape[0],
+        cast(jax.Array, md.seq_lens),
+        cast(jax.Array, md.block_tables),
+        cast(jax.Array, md.query_start_loc),
+    )
     args = (
         q,
         k,
         v,
         kv_cache_bundle,
         layer_idx,
-        md.seq_lens,
-        md.block_tables,
-        md.query_start_loc,
+        seq_lens,
+        block_tables,
+        query_start_loc,
         md.request_distribution,
     )
 

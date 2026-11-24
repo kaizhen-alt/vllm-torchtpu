@@ -20,6 +20,7 @@ during inference.
 """
 
 import functools
+import math
 from enum import Enum
 from typing import Any, cast
 
@@ -1583,10 +1584,14 @@ def get_default_block_sizes(
                 bkv_csz = min(512, align_to(max_kv // 2, page_size))
         case 7:
             if case == RpaCase.DECODE:
+                # A decode block is padded work for every shorter sequence, and
+                # 4 MiB still streams long contexts at full rate: 16 MiB cost
+                # +0.38 ms/token at 340 tokens, 1 MiB +0.7 ms at 64k.
+                bkv_decode = max(page_size, min_bkv_sz_to_peak // 4)
                 bq_sz = 1
-                bkv_sz = min(min_bkv_sz_to_peak, max_kv)
+                bkv_sz = min(bkv_decode, max_kv)
                 bq_csz = 1
-                bkv_csz = min(min_bkv_sz_to_peak, max_kv)
+                bkv_csz = min(bkv_decode, max_kv)
             else:
                 bq_sz = min(2048 // num_q_heads_per_kv_head, max_q // 2)
                 bkv_sz = min(2048, max_kv)
@@ -1719,10 +1724,7 @@ def ragged_paged_attention(
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
         mask_value = cast(float, jnp.finfo(out_dtype).min)
 
-    if vmem_limit_bytes is None:
-        # TODO(jevinjiang, jacobplatin): change this to use
-        # `get_vmem_estimate_bytes` when VREG spilling is fixed.
-        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+    vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
 
     static_validate_inputs(
         q,
@@ -1828,6 +1830,28 @@ def ragged_paged_attention(
             out_dtype,
         )
 
+        if vmem_limit_bytes is None:
+            # Twice the scratch covers Mosaic temporaries and VREG spills (too
+            # little fails at compile), and at least 16 MiB. Claiming all of
+            # VMEM evicts what XLA prefetched across the call: every layer's
+            # o_proj weight then streams from HBM at 1.9 of 2.9 TB/s.
+            scratch_bytes = sum(
+                buf.dtype.itemsize * math.prod(buf.shape)
+                for buf in (
+                    bkv_double_buf,
+                    bq_double_buf,
+                    bo_double_buf,
+                    l_scratch,
+                    m_scratch,
+                    acc_scratch,
+                )
+            )
+            launch_vmem_limit = min(
+                vmem_capacity_bytes, max(16 * 1024 * 1024, 2 * scratch_bytes)
+            )
+        else:
+            launch_vmem_limit = vmem_limit_bytes
+
         scratch_shapes = [
             bkv_double_buf,  # (bkv_x2_ref) Double buffering for kv block.
             bq_double_buf,  # (bq_x2_ref) Double buffering for q block.
@@ -1888,7 +1912,7 @@ def ragged_paged_attention(
                 # TODO(jevinjiang): since each sequence depends on the previous
                 # one, we need some extra work to support Megacore mode.
                 dimension_semantics=("arbitrary",),
-                vmem_limit_bytes=vmem_limit_bytes,
+                vmem_limit_bytes=launch_vmem_limit,
                 # Paged attention invokes multiple small DMAs for each pages
                 # instead of a single large DMA. Therefore, the overhead of bounds
                 # checking becomes too significant so we disable it.
@@ -1955,23 +1979,26 @@ def ragged_paged_attention(
         static_q_len=1,
         case=RpaCase.DECODE,
     )
-    if chunk_prefill_size is not None:
-        # Prefill-only
+    # One token holds at most one request, with q_len 1, so a 1-token step is
+    # decode only; the other cases would launch empty (1.35 us per call on v7).
+    if max_num_tokens > 1:
+        if chunk_prefill_size is not None:
+            # Prefill-only
+            q, kv_cache = run_rpa_kernel(
+                q,
+                kv_cache,
+                **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
+                static_q_len=chunk_prefill_size,
+                case=RpaCase.PREFILL,
+            )
+        # Mixed
         q, kv_cache = run_rpa_kernel(
             q,
             kv_cache,
-            **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
-            static_q_len=chunk_prefill_size,
-            case=RpaCase.PREFILL,
+            **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
+            static_q_len=None,
+            case=RpaCase.MIXED,
         )
-    # Mixed
-    q, kv_cache = run_rpa_kernel(
-        q,
-        kv_cache,
-        **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
-        static_q_len=None,
-        case=RpaCase.MIXED,
-    )
 
     return (
         prepare_outputs(

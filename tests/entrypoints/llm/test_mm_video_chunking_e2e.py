@@ -40,6 +40,7 @@ Run with:
 
 from __future__ import annotations
 
+import difflib
 import multiprocessing
 import os
 import queue as queue_lib
@@ -542,14 +543,17 @@ def _assert_bit_exact(
     # " holding"), argmax can flip at that token while the surrounding generation
     # remains semantically equivalent. Allow minor divergence if the prefix
     # before divergence is substantial (>= 6 tokens) and token agreement over the
-    # common length is high (>= 80%).
+    # common length is high (>= 80%). Agreement is aligned, not position by
+    # position: a flip that changes the token count (" reading it" vs " turning
+    # the pages") shifts every later token, and positional agreement then drops
+    # to ~0.5 over the same remaining text.
     min_len = min(len(reference.token_ids), len(chunked.token_ids))
-    matching_tokens = sum(
-        1
-        for r, c in zip(reference.token_ids[:min_len], chunked.token_ids[:min_len])
-        if r == c
-    )
-    token_sim = matching_tokens / max(1, min_len)
+    token_sim = difflib.SequenceMatcher(
+        None,
+        reference.token_ids[:min_len],
+        chunked.token_ids[:min_len],
+        autojunk=False,
+    ).ratio()
     if first_diff >= 6 and token_sim >= 0.8:
         return
 
