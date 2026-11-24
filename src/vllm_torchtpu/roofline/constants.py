@@ -207,7 +207,11 @@ EXPERT_DTYPE_BYTES: dict[str, float] = {
     "nvfp4": NVFP4_BYTES,
     "mxfp4": MXFP4_BYTES,
 }
-KV_DTYPE_BYTES: dict[str, float] = {"bf16": BF16_BYTES, "fp8": FP8_BYTES}
+KV_DTYPE_BYTES: dict[str, float] = {
+    "bf16": BF16_BYTES,
+    "fp8": FP8_BYTES,
+    "fp4": FP4_BYTES,
+}
 STATE_DTYPE_BYTES: dict[str, float] = {"fp32": FP32_BYTES, "bf16": BF16_BYTES}
 
 WEIGHT_ONLY_QUANT_METHODS: frozenset[str] = frozenset(

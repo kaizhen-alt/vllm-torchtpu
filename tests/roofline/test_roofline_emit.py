@@ -1728,3 +1728,57 @@ def test_qwen_gdn_disagg_dp_tp_decode_requires_hnd_on_both_peers() -> None:
     assert not any(
         "VLLM_KV_CACHE_LAYOUT=HND" in cmd for cmd in dp8_launched["commands"]
     )
+
+
+def test_emit_preserves_fp4_kv_dtype_string_without_clamping() -> None:
+    """Verify emit_launch_args, build_solve_payload, and pool_cli_args emit fp4 KV."""
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG, runtime_profile="hardware")
+    chip = CHIPS["tpu7x"]
+    fp4_kv_bytes = 0.5
+    dt = Dtypes(
+        w_dense=1.0,
+        w_expert=fp4_kv_bytes,
+        kv=fp4_kv_bytes,
+        act="a8",
+        w_dense_dtype="fp8",
+        w_expert_dtype="nvfp4",
+        kv_dtype="fp4",
+    )
+    scen = TrafficScenario(
+        name="fp4_kv_emit",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=None,
+        concurrencies=(8,),
+        kv_working_set_turns=1.0,
+    )
+    splan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen,
+        SolveOptions(max_chips=4),
+    )
+    assert splan.recommended is not None
+    launched = emit_launch_args(splan, dtypes=dt, chip=chip)
+    cli_args = launched["cli_args"]
+    assert cli_args[cli_args.index("--kv-cache-dtype") + 1] == "fp4"
+
+    payload = build_solve_payload(splan, chip=chip, dtypes=dt)
+    top_launch = payload["top_k"][0]["launch"]["cli_args"]
+    assert top_launch[top_launch.index("--kv-cache-dtype") + 1] == "fp4"
+
+    tq_dt = dc_replace(dt, kv_dtype="turboquant_4bit_nc")
+    launched_tq = emit_launch_args(splan, dtypes=tq_dt, chip=chip)
+    tq_args = launched_tq["cli_args"]
+    assert tq_args[tq_args.index("--kv-cache-dtype") + 1] == "fp4"
+
+    direct_args = pool_cli_args(
+        splan.recommended.decode_pool,
+        kv_dtype="fp4",
+        model_id=splan.model_id,
+        runtime_profile="hardware",
+    )
+    assert direct_args[direct_args.index("--kv-cache-dtype") + 1] == "fp4"

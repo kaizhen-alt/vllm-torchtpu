@@ -41,22 +41,27 @@ from .constants import (
     DEFAULT_GPU_MEMORY_UTILIZATION,
     DEFAULT_HBM_RESERVE_GB,
     DEFAULT_PREFILL_CHUNK,
+    DEFAULT_RUNTIME_PROFILE,
     DEFAULT_TOP_K,
     EXAMPLE_CONCURRENCIES,
     EXAMPLE_SLO_TIERS,
     EXPERT_DTYPE_BYTES,
+    FP4_BYTES,
     FP8_BYTES,
     INSPECT_SCHEMA,
     KV_DTYPE_BYTES,
     MIN_INSTANCES,
     MIN_TOP_K,
     STATE_DTYPE_BYTES,
+    SUPPORTED_MODELS,
     UNIT_GIBI,
     UNIT_GIGA,
     UNIT_KILO,
     UNIT_MEGA,
     UNIT_MICRO,
     WEIGHT_DTYPE_BYTES,
+    canonicalize_kv_dtype,
+    resolve_runtime_profile,
 )
 from .emit import (
     LaunchOptions,
@@ -86,7 +91,6 @@ from .hf_loader import (
     audit_hf_config,
     dtypes_from_hf_config,
     load_hf_config,
-    load_hf_config_with_identity,
 )
 from .modules import Dtypes, Parallel, StepShape
 from .occupancy import ExpertActivationModel, parse_activation_spec
@@ -109,6 +113,7 @@ from .step import FloorOptions, SpecShape, spec_cycle_floor, step_floor
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from .constants import ModelSpec, RuntimeProfile
     from .geometry import ModelGeometry
 
 _SERVE_STR_FLAGS: Final[dict[str, str]] = {
@@ -377,6 +382,15 @@ def _add_model_source(p: argparse.ArgumentParser) -> None:
         help=(
             "JSON object merged into loaded HF config before validation "
             "(unit: json_obj, scope: model)."
+        ),
+    )
+    p.add_argument(
+        "--runtime-profile",
+        type=str,
+        default=DEFAULT_RUNTIME_PROFILE,
+        help=(
+            "Runtime admission profile: 'main' for default runtime parity or "
+            "'hardware' for unbridled L1 ceiling (unit: enum, scope: model)."
         ),
     )
 
@@ -748,7 +762,10 @@ def _add_scenario_workload_args(p: argparse.ArgumentParser) -> None:
         "--think-time-s",
         type=float,
         default=None,
-        help="Client think time between turns in seconds (unit: s, scope: request).",
+        help=(
+            "Optional client think time between turns in seconds; omit for "
+            "open-loop mode (unit: s, scope: request)."
+        ),
     )
 
 
@@ -1004,6 +1021,7 @@ def build_parser() -> argparse.ArgumentParser:
         decode_topology=None,
         reference_layout=None,
         hf_overrides=None,
+        runtime_profile=DEFAULT_RUNTIME_PROFILE,
     )
     _add_shared_chip_flags(parser, is_root=True)
     sub = parser.add_subparsers(dest="cmd", required=False)
@@ -1141,11 +1159,7 @@ def _resolve_cmd_rates(
             serve_parsed["spec_accept_assumed"] = True
     elif eff_accept is None and from_cmd_mode:
         eff_accept = 1.0
-    eff_think = (
-        args.think_time_s
-        if args.think_time_s is not None
-        else (0.0 if from_cmd_mode else None)
-    )
+    eff_think = args.think_time_s
     eff_offload = (
         args.kv_offload_gb
         if args.kv_offload_gb is not None
@@ -1272,17 +1286,10 @@ def _build_cli_scenario(
             scen = replace(scen, accept_len=float(eff_spec + 1))
             serve_parsed["spec_accept_assumed"] = True
         return (scen, eff_gmu, cmd_max_len)
-    if (
-        eff_isl is None
-        or eff_osl is None
-        or eff_hit is None
-        or eff_accept is None
-        or eff_think is None
-    ):
+    if eff_isl is None or eff_osl is None or eff_hit is None or eff_accept is None:
         parser.error(
             "Either --example-scenario or all of --isl, --osl, "
-            "--prefix-hit-rate, --accept-len, and --think-time-s "
-            "are required."
+            "--prefix-hit-rate, and --accept-len are required."
         )
     scen = TrafficScenario(
         name="custom",
@@ -1552,7 +1559,13 @@ def _build_launch_options(
     render_ctx: _SolveRenderContext,
 ) -> LaunchOptions:
     """Construct LaunchOptions matching ServingPlan metadata."""
-    kv_str = "fp8" if render_ctx.dtypes.kv <= FP8_BYTES else "bfloat16"
+    dt = render_ctx.dtypes
+    if canonicalize_kv_dtype(dt.kv_dtype) == "fp4" or dt.kv <= FP4_BYTES:
+        kv_str = "fp4"
+    elif dt.kv <= FP8_BYTES:
+        kv_str = "fp8"
+    else:
+        kv_str = "bfloat16"
     return LaunchOptions(
         kv_dtype=kv_str,
         model=render_ctx.src,
@@ -1564,6 +1577,7 @@ def _build_launch_options(
         hbm_reserve_gb=splan.hbm_reserve_gb,
         topologies=render_ctx.topologies,
         is_hybrid=splan.is_hybrid,
+        runtime_profile=splan.runtime_profile,
     )
 
 
@@ -1616,12 +1630,55 @@ def _render_solve_output(
     return 0
 
 
+def _spec_for_cfg(cfg: Mapping[str, object] | None) -> ModelSpec | None:
+    """Return canonical ModelSpec matching ``cfg`` model_type when listed."""
+    if cfg is None:
+        return None
+    raw_tc = cfg.get("text_config")
+    tc = raw_tc if isinstance(raw_tc, Mapping) else cfg
+    model_type = (
+        str(tc.get("model_type") or cfg.get("model_type") or "").strip().lower()
+    )
+    if not model_type:
+        return None
+    for spec in SUPPORTED_MODELS.values():
+        if model_type in spec.model_types:
+            return spec
+    return None
+
+
+def _enforce_kv_dtype_profile(raw_kv: str, profile: RuntimeProfile) -> str:
+    """Validate KV dtype against ``profile.kv_dtypes`` and return canonical tag."""
+    canon_kv = canonicalize_kv_dtype(raw_kv)
+    if canon_kv not in profile.kv_dtypes:
+        allowed = ", ".join(profile.kv_dtypes)
+        msg = (
+            f"KV dtype {raw_kv!r} is not admitted under runtime_profile "
+            f"{profile.name!r} (allowed: {allowed})."
+        )
+        raise ValueError(msg)
+    return canon_kv
+
+
 def resolve_dtypes_from_args(
     args: argparse.Namespace,
     cfg: dict[str, object] | None = None,
+    *,
+    runtime_profile: str | None = None,
 ) -> Dtypes:
     """Apply optional CLI dtype overrides onto HF-derived L1 defaults via replace."""
-    dt = dtypes_from_hf_config(cfg) if cfg is not None else Dtypes()
+    # Synthetic Namespace callers in unit tests may omit parser defaults.
+    eff_profile = str(
+        runtime_profile
+        if runtime_profile is not None
+        else vars(args).get("runtime_profile", DEFAULT_RUNTIME_PROFILE)
+    )
+    profile = resolve_runtime_profile(_spec_for_cfg(cfg), eff_profile)
+    dt = (
+        dtypes_from_hf_config(cfg, runtime_profile=profile.name)
+        if cfg is not None
+        else Dtypes()
+    )
     if getattr(args, "weight_dtype", None) is not None:
         dt = replace(
             dt,
@@ -1639,6 +1696,7 @@ def resolve_dtypes_from_args(
     if getattr(args, "aux_dtype", None) is not None:
         dt = replace(dt, w_aux=WEIGHT_DTYPE_BYTES[args.aux_dtype])
     if getattr(args, "kv_dtype", None) is not None:
+        _enforce_kv_dtype_profile(str(args.kv_dtype), profile)
         dt = replace(
             dt,
             kv=KV_DTYPE_BYTES[args.kv_dtype],
@@ -1660,12 +1718,22 @@ def _resolve_solve_dtypes(
     args: argparse.Namespace,
     cfg: dict[str, object],
     serve_parsed: dict[str, object],
+    *,
+    runtime_profile: str | None = None,
 ) -> Dtypes:
     """Resolve effective Dtypes for solve/emit/ceiling with CLI priority."""
-    dt = resolve_dtypes_from_args(args, cfg)
+    eff_profile = (
+        runtime_profile if runtime_profile is not None else str(args.runtime_profile)
+    )
+    dt = resolve_dtypes_from_args(args, cfg, runtime_profile=eff_profile)
     if args.kv_dtype is None and "kv_cache_dtype" in serve_parsed:
-        s_dt = str(serve_parsed["kv_cache_dtype"]).lower()
-        if s_dt.startswith("fp8"):
+        raw_kv = str(serve_parsed["kv_cache_dtype"])
+        s_dt = raw_kv.lower()
+        profile = resolve_runtime_profile(_spec_for_cfg(cfg), eff_profile)
+        canon_kv = _enforce_kv_dtype_profile(s_dt, profile)
+        if canon_kv == "fp4":
+            dt = replace(dt, kv=FP4_BYTES, kv_dtype="fp4", kv_source="flag")
+        elif s_dt.startswith("fp8") or canon_kv == "fp8":
             dt = replace(dt, kv=FP8_BYTES, kv_dtype="fp8", kv_source="flag")
         elif s_dt in ("bf16", "bfloat16", "fp16", "float16"):
             dt = replace(dt, kv=BF16_BYTES, kv_dtype="bfloat16", kv_source="flag")
@@ -1845,7 +1913,12 @@ def _dispatch_solve_family(
     )
     try:
         scen, eff_gmu, cmd_max_model_len = _build_cli_scenario(args, parser, parsed)
-        dt_auto = _resolve_solve_dtypes(args, model_ctx.cfg, serve_parsed)
+        dt_auto = _resolve_solve_dtypes(
+            args,
+            model_ctx.cfg,
+            serve_parsed,
+            runtime_profile=model_ctx.geom.runtime_profile,
+        )
         solve_opts = SolveOptions(
             mode=args.mode,
             max_chips=eff_max_chips,
@@ -1893,6 +1966,8 @@ def _dispatch_solve_family(
 def _build_plan_par_dtypes(
     args: argparse.Namespace,
     cfg: dict[str, object] | None = None,
+    *,
+    runtime_profile: str | None = None,
 ) -> tuple[Parallel, Dtypes, float]:
     """Build Parallel, Dtypes, and latency override from plan/explain flags."""
     par = Parallel(
@@ -1904,7 +1979,7 @@ def _build_plan_par_dtypes(
         residual=args.residual,
         ar_algo=args.ar_algo,
     )
-    dt = resolve_dtypes_from_args(args, cfg)
+    dt = resolve_dtypes_from_args(args, cfg, runtime_profile=runtime_profile)
     lat_s = (args.collective_latency_us or 0.0) * UNIT_MICRO
     return (par, dt, lat_s)
 
@@ -1917,7 +1992,9 @@ def _dispatch_plan_cmd(
     """Execute plan for hard L1 floors and uncalibrated serial decode estimates."""
     if args.spec_window > 0 and args.accept_len is None:
         parser.error("--accept-len is required when --spec-window > 0")
-    par, dt, _ = _build_plan_par_dtypes(args, model_ctx.cfg)
+    par, dt, _ = _build_plan_par_dtypes(
+        args, model_ctx.cfg, runtime_profile=model_ctx.geom.runtime_profile
+    )
     concs_list = list(_parse_concurrencies(args.concurrency) or ())
     rows = plan(
         geom=model_ctx.geom,
@@ -1958,7 +2035,9 @@ def _dispatch_explain_cmd(
     model_ctx: _CliModelContext,
 ) -> int:
     """Execute the explain subcommand for per-module L1 physical step breakdowns."""
-    par, dt, lat_s = _build_plan_par_dtypes(args, model_ctx.cfg)
+    par, dt, lat_s = _build_plan_par_dtypes(
+        args, model_ctx.cfg, runtime_profile=model_ctx.geom.runtime_profile
+    )
     opts = FloorOptions(dt=dt, collective_latency_s=lat_s)
     sf = (
         spec_cycle_floor(
@@ -2029,6 +2108,7 @@ def _write_inspect_text(payload: Mapping[str, object]) -> None:
     lines = [
         f"schema_version: {payload['schema_version']}",
         f"chip: {payload['chip']}",
+        f"runtime_profile: {payload['runtime_profile']}",
         f"onboarding_tier: {payload['onboarding_tier']}",
         f"canonical_id: {payload['canonical_id'] or '<unlisted>'}",
         f"hf_repo: {payload['hf_repo'] or '<local>'}",
@@ -2058,7 +2138,9 @@ def _dispatch_inspect_cmd(
     chip: ChipSpec,
 ) -> int:
     """Audit HF config onboarding readiness before geometry loading fails."""
+    runtime_profile = str(args.runtime_profile)
     try:
+        resolve_runtime_profile(None, runtime_profile)
         overrides = _parse_hf_overrides(args.hf_overrides)
         cfg = load_hf_config(src)
         if overrides:
@@ -2067,11 +2149,13 @@ def _dispatch_inspect_cmd(
         sys.stderr.write(f"error: {exc}\n")
         return EXIT_ERROR
     model_ref = None if Path(src).exists() else src
-    audit = audit_hf_config(cfg, model_ref=model_ref)
+    audit = audit_hf_config(cfg, model_ref=model_ref, runtime_profile=runtime_profile)
     canonical_id: str | None = None
     hf_repo: str | None = None
     try:
-        identity = resolve_model_identity(cfg, model_ref=model_ref)
+        identity = resolve_model_identity(
+            cfg, model_ref=model_ref, runtime_profile=runtime_profile
+        )
         canonical_id = identity.canonical_id
         hf_repo = identity.hf_repo
     except UnsupportedArchitectureError:
@@ -2080,6 +2164,7 @@ def _dispatch_inspect_cmd(
     payload: dict[str, object] = {
         "schema_version": INSPECT_SCHEMA,
         "chip": chip.name,
+        "runtime_profile": runtime_profile,
         "onboarding_tier": audit.onboarding_tier,
         "canonical_id": canonical_id,
         "hf_repo": hf_repo,
@@ -2118,14 +2203,27 @@ def _load_cli_geometry(
     serve_parsed: dict[str, object],
     *,
     hf_overrides: dict[str, object] | None = None,
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
 ) -> tuple[dict[str, object], ModelGeometry, str | None]:
     """Load HF config and parse ModelGeometry with canonical identity validation."""
-    cfg, identity = load_hf_config_with_identity(src, hf_overrides=hf_overrides)
+    resolve_runtime_profile(None, runtime_profile)
+    cfg = load_hf_config(src)
+    if hf_overrides:
+        cfg = apply_hf_overrides(cfg, hf_overrides)
+    model_ref = None if Path(src).exists() else src
+    identity = resolve_model_identity(
+        cfg, model_ref=model_ref, runtime_profile=runtime_profile
+    )
     if "quantization" in serve_parsed and not _has_quantization_config(cfg):
         q_val = str(serve_parsed["quantization"]).lower()
         if q_val and q_val != "none":
             cfg = {**cfg, "quantization_config": {"quant_method": q_val}}
-    return (cfg, from_hf_config(cfg, model_ref=identity.hf_repo), identity.hf_repo)
+    geom = from_hf_config(
+        cfg,
+        model_ref=identity.hf_repo,
+        runtime_profile=runtime_profile,
+    )
+    return (cfg, geom, identity.hf_repo)
 
 
 def _resolve_cli_chip(
@@ -2208,9 +2306,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.cmd == "inspect":
         return _dispatch_inspect_cmd(args, src, chip)
     try:
+        runtime_profile = str(args.runtime_profile)
         overrides = _parse_hf_overrides(args.hf_overrides)
         cfg, geom, model_ref = _load_cli_geometry(
-            src, serve_parsed, hf_overrides=overrides
+            src,
+            serve_parsed,
+            hf_overrides=overrides,
+            runtime_profile=runtime_profile,
         )
         model_ctx = _CliModelContext(
             src=src,

@@ -33,7 +33,7 @@ from vllm_torchtpu.roofline import (
     plan,
 )
 from vllm_torchtpu.roofline.cli import _has_quantization_config, _parse_serve_cmd
-from vllm_torchtpu.roofline.constants import UNIT_GIBI
+from vllm_torchtpu.roofline.constants import FP4_BYTES, UNIT_GIBI
 
 QWEN35_CFG: dict[str, object] = {
     "model_type": "qwen3_5_moe",
@@ -1286,3 +1286,343 @@ def test_cli_inspect_fail_closed_and_canonical_identity(
         for opt in opt_strs
     }
     assert "--allow-unlisted-model-type" not in all_opts
+
+
+def _kv_flag_value(cli_args: Sequence[str]) -> str:
+    """Return value following ``--kv-cache-dtype`` in an emitted flag list."""
+    return str(cli_args[cli_args.index("--kv-cache-dtype") + 1])
+
+
+def test_cli_runtime_profile_hardware_enables_qwen4_and_fp4_kv_while_main_blocks(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify --runtime-profile gates 4-bit KV and experimental bringup across CLI."""
+    expected_error_rc = 2
+    fixtures_dir = Path(__file__).resolve().parent / "fixtures"
+    qwen38_path = fixtures_dir / "qwen3_8_flash_next_fp8.json"
+    qwen35_path = tmp_path / "qwen35_fp8.json"
+    raw_text = QWEN35_CFG["text_config"]
+    assert isinstance(raw_text, dict)
+    qwen35_path.write_text(
+        json.dumps(
+            {
+                **QWEN35_CFG,
+                "text_config": {
+                    **raw_text,
+                    "quantization_config": {"quant_method": "fp8"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Default 'main' profile blocks unmodified qwen4_exp on inspect/plan/solve.
+    assert (
+        cli.main(["inspect", "--config", str(qwen38_path), "--json"])
+        == expected_error_rc
+    )
+    assert json.loads(capsys.readouterr().out)["onboarding_tier"] != "tier0_ready"
+    for blocked_argv in (
+        ["plan", "--config", str(qwen38_path), "--tp", "8", "--concurrency", "1"],
+        [
+            "solve",
+            "--config",
+            str(qwen38_path),
+            "--example-scenario",
+            "chat-8k1k",
+            "--max-chips",
+            "4",
+        ],
+    ):
+        assert cli.main(blocked_argv) == expected_error_rc
+        assert "error:" in capsys.readouterr().err.lower()
+
+    # Hardware profile admits unmodified qwen4_exp across all 6 subcommands.
+    assert (
+        cli.main(
+            [
+                "inspect",
+                "--config",
+                str(qwen38_path),
+                "--runtime-profile",
+                "hardware",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    insp_hw = json.loads(capsys.readouterr().out)
+    assert insp_hw["onboarding_tier"] == "tier0_ready"
+    assert insp_hw["canonical_id"] == "qwen4_exp"
+    assert insp_hw["runtime_profile"] == "hardware"
+
+    for hw_argv in (
+        [
+            "plan",
+            "--config",
+            str(qwen38_path),
+            "--runtime-profile",
+            "hardware",
+            "--tp",
+            "8",
+            "--concurrency",
+            "1",
+            "--json",
+        ],
+        [
+            "explain",
+            "--config",
+            str(qwen38_path),
+            "--runtime-profile",
+            "hardware",
+            "--tp",
+            "8",
+            "--json",
+        ],
+        [
+            "solve",
+            "--config",
+            str(qwen38_path),
+            "--runtime-profile",
+            "hardware",
+            "--example-scenario",
+            "coding-agent",
+            "--max-chips",
+            "4",
+            "--json",
+        ],
+        [
+            "emit",
+            "--config",
+            str(qwen38_path),
+            "--runtime-profile",
+            "hardware",
+            "--example-scenario",
+            "coding-agent",
+            "--max-chips",
+            "4",
+            "--json",
+        ],
+        [
+            "ceiling",
+            "--config",
+            str(qwen38_path),
+            "--runtime-profile",
+            "hardware",
+            "--example-scenario",
+            "coding-agent",
+            "--max-chips",
+            "4",
+            "--json",
+        ],
+    ):
+        assert cli.main(hw_argv) == 0
+        assert json.loads(capsys.readouterr().out)
+
+    # 4-bit KV dtype is blocked on 'main' (both --kv-dtype and --from-serve-cmd).
+    for fp4_blocked in (
+        [
+            "plan",
+            "--config",
+            str(qwen35_path),
+            "--kv-dtype",
+            "fp4",
+            "--tp",
+            "8",
+            "--concurrency",
+            "1",
+        ],
+        [
+            "explain",
+            "--config",
+            str(qwen35_path),
+            "--kv-dtype",
+            "fp4",
+            "--tp",
+            "8",
+        ],
+        [
+            "solve",
+            "--config",
+            str(qwen35_path),
+            "--kv-dtype",
+            "fp4",
+            "--example-scenario",
+            "coding-agent",
+            "--max-chips",
+            "4",
+        ],
+        [
+            "emit",
+            "--config",
+            str(qwen35_path),
+            "--kv-dtype",
+            "fp4",
+            "--example-scenario",
+            "coding-agent",
+            "--max-chips",
+            "4",
+        ],
+        [
+            "ceiling",
+            "--config",
+            str(qwen35_path),
+            "--kv-dtype",
+            "fp4",
+            "--example-scenario",
+            "coding-agent",
+            "--max-chips",
+            "4",
+        ],
+        [
+            "solve",
+            "--from-serve-cmd",
+            (
+                f"vllm serve {qwen35_path} --tensor-parallel-size 8 "
+                "--kv-cache-dtype turboquant_4bit_nc"
+            ),
+            "--example-scenario",
+            "coding-agent",
+        ],
+    ):
+        assert cli.main(fp4_blocked) == expected_error_rc
+        assert "not admitted" in capsys.readouterr().err.lower()
+
+    # Under --runtime-profile hardware, fp4 KV emits 'fp4' without clamping to 'fp8'.
+    assert (
+        cli.main(
+            [
+                "emit",
+                "--config",
+                str(qwen35_path),
+                "--runtime-profile",
+                "hardware",
+                "--kv-dtype",
+                "fp4",
+                "--example-scenario",
+                "coding-agent",
+                "--max-chips",
+                "4",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    emit_fp4 = json.loads(capsys.readouterr().out)
+    assert _kv_flag_value(emit_fp4["cli_args"]) == "fp4"
+
+    assert (
+        cli.main(
+            [
+                "solve",
+                "--runtime-profile",
+                "hardware",
+                "--from-serve-cmd",
+                (
+                    f"vllm serve {qwen35_path} --tensor-parallel-size 8 "
+                    "--kv-cache-dtype turboquant_4bit_nc"
+                ),
+                "--example-scenario",
+                "coding-agent",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    solve_tq = json.loads(capsys.readouterr().out)
+    assert solve_tq["top_k"]
+    assert _kv_flag_value(solve_tq["top_k"][0]["launch"]["cli_args"]) == "fp4"
+
+    dt_hw = cli.resolve_dtypes_from_args(
+        argparse.Namespace(kv_dtype="fp4"),
+        json.loads(qwen35_path.read_text(encoding="utf-8")),
+        runtime_profile="hardware",
+    )
+    assert dt_hw.kv == pytest.approx(FP4_BYTES)
+    assert dt_hw.kv_dtype == "fp4"
+
+    for bad_prof_argv in (
+        ["inspect", "--config", str(qwen35_path), "--runtime-profile", "unknown"],
+        [
+            "solve",
+            "--config",
+            str(qwen35_path),
+            "--runtime-profile",
+            "unknown",
+            "--example-scenario",
+            "coding-agent",
+            "--max-chips",
+            "4",
+        ],
+    ):
+        assert cli.main(bad_prof_argv) == expected_error_rc
+        assert "runtime_profile" in capsys.readouterr().err
+
+
+def test_cli_omitted_think_time_uses_none_open_loop_without_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify omitting --think-time-s passes think_time_s=None and renders cleanly."""
+    cfg_path = tmp_path / "qwen35_fp8.json"
+    raw_text = QWEN35_CFG["text_config"]
+    assert isinstance(raw_text, dict)
+    cfg_path.write_text(
+        json.dumps(
+            {
+                **QWEN35_CFG,
+                "text_config": {
+                    **raw_text,
+                    "quantization_config": {"quant_method": "fp8"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    html_path = tmp_path / "open_loop.html"
+    rc_custom = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--isl",
+            "2048",
+            "--osl",
+            "256",
+            "--prefix-hit-rate",
+            "0.5",
+            "--accept-len",
+            "1.0",
+            "--concurrency",
+            "8",
+            "--max-chips",
+            "4",
+            "--html",
+            str(html_path),
+            "--json",
+        ]
+    )
+    assert rc_custom == 0
+    custom_payload = json.loads(capsys.readouterr().out)
+    assert custom_payload["scenario"]["think_time_s"] is None
+    assert custom_payload["frontier"]
+    assert html_path.read_text(encoding="utf-8")
+
+    rc_cmd = cli.main(
+        [
+            "solve",
+            "--from-serve-cmd",
+            f"vllm serve {cfg_path} --tensor-parallel-size 8",
+            "--from-bench-cmd",
+            (
+                "vllm bench serve --dataset-name random "
+                "--random-input-len 1024 --random-output-len 128 --max-concurrency 8"
+            ),
+            "--json",
+        ]
+    )
+    assert rc_cmd == 0
+    cmd_payload = json.loads(capsys.readouterr().out)
+    assert cmd_payload["scenario"]["think_time_s"] is None
+    assert cmd_payload["frontier"]
