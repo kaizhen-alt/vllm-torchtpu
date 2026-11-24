@@ -60,6 +60,7 @@ except ImportError as _exc:
     get_tpu_min_page_size = None
     TPUQwen4ExpConfig = None
     PcpStaticSupportValidator = None
+    _torch_tpu_builds_stage_meshes = None
     validate_pipeline_parallel_config = None
     TpuPlatform = None
     VllmConfigCls = None
@@ -91,6 +92,7 @@ else:
     from vllm_torchtpu.models.qwen4_exp.config import TPUQwen4ExpConfig
     from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
     from vllm_torchtpu.platforms.pp_validation import (
+        _torch_tpu_builds_stage_meshes,
         validate_pipeline_parallel_config,
     )
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
@@ -253,7 +255,7 @@ def test_pp_validation_parity_with_solver_prefill_legality() -> None:
             )
         )
 
-    # Solver matches: no PP>1 with TP>1, PCP>1, or spec_k=2; allows PP>1 at k=1 disagg.
+    # Solver matches: no PP>1 with TP>1 or spec_k=2; allows PP>1 and PP x PCP at k=1.
     pars_k2 = _candidate_prefill_parallels(
         q35_geom, topo, for_disagg=True, spec_k=2, chip=CHIPS["tpu7x"]
     )
@@ -261,8 +263,24 @@ def test_pp_validation_parity_with_solver_prefill_legality() -> None:
     pars_k1 = _candidate_prefill_parallels(
         q35_geom, topo, for_disagg=True, spec_k=1, chip=CHIPS["tpu7x"]
     )
-    assert all(not (p.pp > 1 and (p.tp > 1 or p.pcp > 1)) for p in pars_k1)
+    assert all(not (p.pp > 1 and p.tp > 1) for p in pars_k1)
+    assert any(p.pp > 1 and p.pcp > 1 for p in pars_k1)
     assert any(p.pp > 1 and p.tp == 1 and p.pcp == 1 for p in pars_k1)
+    assert _torch_tpu_builds_stage_meshes is not None
+    pp_pcp_vcfg = _make_vllm_config(
+        pp=2,
+        tp=1,
+        pcp=4,
+        ep=True,
+        kv_transfer_config=SimpleNamespace(
+            is_kv_producer=True, kv_connector="TPURaidenConnector"
+        ),
+    )
+    if _torch_tpu_builds_stage_meshes():
+        validate_pipeline_parallel_config(pp_pcp_vcfg)
+    else:
+        with pytest.raises(NotImplementedError):
+            validate_pipeline_parallel_config(pp_pcp_vcfg)
 
 
 def test_pcp_interleave_128_satisfies_live_pcp_validator() -> None:

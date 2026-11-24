@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal
 
@@ -273,13 +273,6 @@ UNDECIDED_SLO_WARNING: str = (
     "the layout out."
 )
 
-# Informational warning emitted when closed-loop think_time_s is zero.
-ZERO_THINK_TIME_WARNING: str = (
-    "Closed-loop scenario evaluated with zero think time (think_time_s = 0.0): "
-    "steady-state residency follows active request arrival bounded by HBM, "
-    "SMEM, and prefill capacity limits."
-)
-
 # Sub-1e-9 tok/s guard (~1e7 * float64 ulp at 1e5 tok/s) for 2D envelope ties.
 FRONTIER_2D_TIE_TOLERANCE: float = 1e-9
 # PCP KV interleave satisfying both pooled GDN (% 16) and HND (% 128).
@@ -307,6 +300,82 @@ MIN_FRONTIER_POINTS_FOR_POLYLINE: int = 2
 PREFIX_RANGE_PAIR_LEN: int = 2
 
 
+DEFAULT_RUNTIME_PROFILE: str = "main"
+
+_KV_DTYPE_ALIASES: Mapping[str, str] = MappingProxyType(
+    {
+        "auto": "bf16",
+        "bfloat16": "bf16",
+        "bf16": "bf16",
+        "fp16": "bf16",
+        "float16": "bf16",
+        "fp8": "fp8",
+        "fp8_e4m3": "fp8",
+        "fp8_e5m2": "fp8",
+        "float8_e4m3fn": "fp8",
+        "float8_e5m2": "fp8",
+        "fp4": "fp4",
+        "nvfp4": "fp4",
+        "mxfp4": "fp4",
+        "int4": "fp4",
+        "turboquant_4bit_nc": "fp4",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ParallelRules:
+    """Declarative parallelism and runtime admission constraints for one profile."""
+
+    max_pp: int | None = None
+    max_pcp: int | None = None
+    max_dcp: int | None = None
+    dcp_span: Literal["kv_heads", "tp_group"] = "kv_heads"
+    max_spec_tokens: int | None = None
+    pcp_allows_pp: bool = False
+    prefill_dcp_mode: Literal["none", "tp_match", "any_divisible"] = "none"
+    raiden_pair_rule: Literal["qwen_gdn", "glm_mla", "generic"] = "generic"
+    prefill_max_spec_tokens: int | None = 1
+    allows_fused_rs: bool = False
+    force_ple_disabled: bool = False
+    cap_context_at_indexer_budget: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeProfile:
+    """Runtime admission profile pairing ``ParallelRules`` with supported KV dtypes."""
+
+    name: str
+    parallel: ParallelRules = field(default_factory=ParallelRules)
+    kv_dtypes: tuple[str, ...] = ("bf16", "fp8")
+
+
+HARDWARE_PHYSICS_PROFILE: RuntimeProfile = RuntimeProfile(
+    name="hardware",
+    parallel=ParallelRules(
+        pcp_allows_pp=True,
+        prefill_dcp_mode="any_divisible",
+        raiden_pair_rule="generic",
+        prefill_max_spec_tokens=1,
+        allows_fused_rs=True,
+        cap_context_at_indexer_budget=False,
+    ),
+    kv_dtypes=("bf16", "fp8", "fp4"),
+)
+
+_DEFAULT_MAIN_PROFILE: RuntimeProfile = RuntimeProfile(
+    name=DEFAULT_RUNTIME_PROFILE,
+    parallel=ParallelRules(
+        pcp_allows_pp=True,
+        prefill_dcp_mode="none",
+        raiden_pair_rule="generic",
+        prefill_max_spec_tokens=1,
+        allows_fused_rs=False,
+    ),
+    kv_dtypes=("bf16", "fp8"),
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ModelSpec:
     """Canonical 1:1 HuggingFace repo specification for a modeled architecture."""
@@ -316,6 +385,7 @@ class ModelSpec:
     model_types: tuple[str, ...]
     architectures: tuple[str, ...]
     allowed_layer_kinds: frozenset[str]
+    profiles: tuple[RuntimeProfile, ...] = ()
 
 
 # Closed-world registry of verified public HuggingFace models with authentic fixtures.
@@ -333,6 +403,19 @@ SUPPORTED_MODELS: Mapping[str, ModelSpec] = MappingProxyType(
                 "Qwen3_5MoeForCausalLM",
             ),
             allowed_layer_kinds=frozenset({"gqa", "gdn"}),
+            profiles=(
+                RuntimeProfile(
+                    name=DEFAULT_RUNTIME_PROFILE,
+                    parallel=ParallelRules(
+                        pcp_allows_pp=True,
+                        prefill_dcp_mode="none",
+                        raiden_pair_rule="qwen_gdn",
+                        prefill_max_spec_tokens=1,
+                        allows_fused_rs=True,
+                    ),
+                    kv_dtypes=("bf16", "fp8"),
+                ),
+            ),
         ),
         "glm_moe_dsa": ModelSpec(
             canonical_id="glm_moe_dsa",
@@ -343,6 +426,18 @@ SUPPORTED_MODELS: Mapping[str, ModelSpec] = MappingProxyType(
             model_types=("glm_moe_dsa",),
             architectures=("GlmMoeDsaForCausalLM",),
             allowed_layer_kinds=frozenset({"mla", "dsa"}),
+            profiles=(
+                RuntimeProfile(
+                    name=DEFAULT_RUNTIME_PROFILE,
+                    parallel=ParallelRules(
+                        max_pcp=1,
+                        prefill_dcp_mode="tp_match",
+                        raiden_pair_rule="glm_mla",
+                        prefill_max_spec_tokens=1,
+                    ),
+                    kv_dtypes=("bf16", "fp8"),
+                ),
+            ),
         ),
         "qwen4_exp": ModelSpec(
             canonical_id="qwen4_exp",
@@ -353,9 +448,71 @@ SUPPORTED_MODELS: Mapping[str, ModelSpec] = MappingProxyType(
                 "Qwen4ExpForCausalLM",
             ),
             allowed_layer_kinds=frozenset({"gqa", "gdn"}),
+            profiles=(
+                RuntimeProfile(
+                    name=DEFAULT_RUNTIME_PROFILE,
+                    parallel=ParallelRules(
+                        max_pp=1,
+                        max_pcp=1,
+                        max_dcp=1,
+                        max_spec_tokens=0,
+                        prefill_max_spec_tokens=0,
+                        force_ple_disabled=True,
+                        cap_context_at_indexer_budget=True,
+                    ),
+                    kv_dtypes=("bf16", "fp8"),
+                ),
+            ),
         ),
     }
 )
+
+
+def canonicalize_kv_dtype(raw: str) -> str:
+    """Map KV cache dtype aliases to canonical buckets, preserving unknown tokens."""
+    norm = raw.strip().lower()
+    return _KV_DTYPE_ALIASES.get(norm, norm)
+
+
+def resolve_runtime_profile(
+    spec: ModelSpec | None,
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
+) -> RuntimeProfile:
+    """Resolve ``RuntimeProfile`` for ``spec`` by name, defaulting to ``'main'``."""
+    req = runtime_profile.strip().lower() or DEFAULT_RUNTIME_PROFILE
+    if req == "hardware":
+        return HARDWARE_PHYSICS_PROFILE
+    if spec is not None:
+        for prof in spec.profiles:
+            if prof.name == req:
+                return prof
+    if req == DEFAULT_RUNTIME_PROFILE:
+        return _DEFAULT_MAIN_PROFILE
+    msg = (
+        f"Unsupported runtime_profile {runtime_profile!r}; "
+        f"expected {DEFAULT_RUNTIME_PROFILE!r} or 'hardware'."
+    )
+    raise ValueError(msg)
+
+
+def resolve_model_profile(
+    model_id: str = "",
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
+) -> RuntimeProfile:
+    """Resolve ``RuntimeProfile`` by canonical ``model_id`` and profile name."""
+    key = model_id.strip().lower()
+    spec = SUPPORTED_MODELS.get(key) if key else None
+    return resolve_runtime_profile(spec, runtime_profile)
+
+
+def disagg_prefill_spec_k(spec_k: int, rules: ParallelRules) -> int:
+    """Clamp speculative draft token count for prefill admission and CLI flags."""
+    if spec_k <= 0:
+        return 0
+    if rules.prefill_max_spec_tokens is None:
+        return spec_k
+    return min(spec_k, rules.prefill_max_spec_tokens)
+
 
 SUPPORTED_MODEL_TYPES: frozenset[str] = frozenset(
     mt for spec in SUPPORTED_MODELS.values() for mt in spec.model_types

@@ -27,6 +27,7 @@ from .constants import (
     CAUSAL_MIDPOINT_HALF,
     DEFAULT_CORES_PER_CHIP,
     FP8_BYTES,
+    FP32_BYTES,
     GLU_MATMUL_COUNT,
     HBM_MIN_PACKING_DIVISOR,
     HBM_PACKING_NUMERATOR,
@@ -44,6 +45,7 @@ from .geometry import (
     aligned_moe_tp_shard_width,
     count_layer_types,
     layer_ffn_kinds,
+    resolve_geom_profile,
 )
 from .occupancy import (
     ExpertActivationModel,
@@ -510,21 +512,48 @@ def _attn_layer_collectives(
     if spec.is_full_attention and parallel.kv_split > 1:
         g = parallel.kv_split
         dec_rows = spec.batch * spec.rows_per_seq
-        if parallel.kv_merge == "ag_rs":
-            colls.append(
-                _make_coll(
-                    "dcp_q_ag",
-                    "ag",
-                    float(dec_rows * g * spec.nq * spec.head_dim * 2),
-                    g,
-                    parallel,
+        if dec_rows > 0:
+            if parallel.kv_merge == "ag_rs":
+                colls.append(
+                    _make_coll(
+                        "dcp_q_ag",
+                        "ag",
+                        float(dec_rows * g * spec.nq * spec.head_dim * 2),
+                        g,
+                        parallel,
+                    )
                 )
-            )
+                colls.append(
+                    _make_coll(
+                        "dcp_lse_ag",
+                        "ag",
+                        float(g * dec_rows * g * spec.nq * 4),
+                        g,
+                        parallel,
+                    )
+                )
+                colls.append(
+                    _make_coll(
+                        "dcp_out_rs",
+                        "rs",
+                        float(dec_rows * g * spec.nq * spec.head_dim * 4),
+                        g,
+                        parallel,
+                    )
+                )
+            else:
+                per_peer = float(
+                    (spec.batch + 1) * spec.rows_per_seq * spec.nq * spec.head_dim * 4
+                )
+                colls.append(
+                    _make_coll("merge_xchg", "push", (g - 1) * per_peer, g, parallel)
+                )
+        if spec.extra_rows > 0:
             colls.append(
                 _make_coll(
                     "dcp_lse_ag",
                     "ag",
-                    float(g * dec_rows * g * spec.nq * 4),
+                    float(g * spec.extra_rows * g * spec.nq * FP32_BYTES),
                     g,
                     parallel,
                 )
@@ -533,17 +562,16 @@ def _attn_layer_collectives(
                 _make_coll(
                     "dcp_out_rs",
                     "rs",
-                    float(dec_rows * g * spec.nq * spec.head_dim * 4),
+                    float(
+                        spec.extra_rows
+                        * g
+                        * spec.nq
+                        * spec.head_dim
+                        * ACTIVATION_BYTES_BF16
+                    ),
                     g,
                     parallel,
                 )
-            )
-        else:
-            per_peer = float(
-                (spec.batch + 1) * spec.rows_per_seq * spec.nq * spec.head_dim * 4
-            )
-            colls.append(
-                _make_coll("merge_xchg", "push", (g - 1) * per_peer, g, parallel)
             )
     if spec.is_full_attention and parallel.pcp > 1 and spec.extra_rows > 0:
         kv_payload_per_tok = (
@@ -809,9 +837,10 @@ def _validate_pass_costs_config(geom: ModelGeometry, parallel: Parallel) -> None
     if tp < 1:
         msg = f"Parallel.tp must be >= 1, got {tp}"
         raise ValueError(msg)
+    dcp_span = resolve_geom_profile(geom).parallel.dcp_span
     kv_group = (
         max(1, tp // geom.num_kv_heads)
-        if geom.num_kv_heads > 0 and geom.kv_lora_rank == 0
+        if geom.num_kv_heads > 0 and geom.kv_lora_rank == 0 and dcp_span != "tp_group"
         else max(1, tp)
     )
     if parallel.kv_split < 1 or kv_group % parallel.kv_split != 0:
@@ -962,9 +991,12 @@ def _compute_gqa_cost(
         * gqa_kv_scale
         / parallel.kv_split
     )
-    kv_pre_tokens = float(eval_context.cached_prefix) / float(
-        max(1, parallel.pcp)
-    ) + float(eval_context.eff_prefill)
+    cp_div = float(max(1, parallel.pcp * parallel.kv_split))
+    kv_split_div = float(max(1, parallel.kv_split))
+    kv_pre_tokens = (
+        float(eval_context.cached_prefix) / cp_div
+        + float(eval_context.eff_prefill) / kv_split_div
+    )
     kv_tokens_total = n_eff * (kv_dec_tokens + kv_pre_tokens)
     b_kv_phys = kv_bytes_per_token_per_layer(
         geom, dt, parallel, "gqa", physical=True, chip=eval_context.chip
@@ -1125,9 +1157,11 @@ def _compute_swa_cost(
         )
     )
     swa_kv_scale = (counts.eff_swa / float(n_swa)) if geom.compress_ratios else 1.0
+    cp_div = float(max(1, parallel.pcp * parallel.kv_split))
+    kv_split_div = float(max(1, parallel.kv_split))
     pre_kv_tokens = (
-        float(min(eval_context.cached_prefix, sw_cap)) / float(max(1, parallel.pcp))
-        + float(eval_context.eff_prefill)
+        float(min(eval_context.cached_prefix, sw_cap)) / cp_div
+        + float(eval_context.eff_prefill) / kv_split_div
         if eval_context.eff_prefill > 0
         else 0.0
     )
@@ -1472,11 +1506,13 @@ def _mla_weights_and_kv(
     )
     b_idx_min = float(geom.index_head_dim) * dt.kv if has_idx else 0.0
     fam_kv_scale = (kv_n_fam / float(n_fam)) if geom.compress_ratios else 1.0
+    cp_div = float(max(1, parallel.pcp * parallel.kv_split))
+    kv_split_div = float(max(1, parallel.kv_split))
     kv_tokens = float(
         eval_context.batch * att_ctx
     ) * fam_kv_scale / parallel.kv_split + (
-        float(eval_context.cached_prefix) / float(max(1, parallel.pcp))
-        + float(eval_context.eff_prefill)
+        float(eval_context.cached_prefix) / cp_div
+        + float(eval_context.eff_prefill) / kv_split_div
     )
     mla_kv_bytes = n_eff * kv_tokens * b_latent_phys
     mla_kv_bytes_min = n_eff * kv_tokens * b_latent_min
@@ -1680,7 +1716,11 @@ def _compute_gdn_cost(
         if eval_context.eff_prefill > 0
         else 0.0
     )
-    gdn_state_bytes = (dec_state_io + pre_state_io) * (rec_state + conv_state)
+    gdn_state_bytes = (
+        (dec_state_io + pre_state_io)
+        * (rec_state + conv_state)
+        / float(max(1, parallel.pcp))
+    )
     dense_buckets = _route_matmul_flops(
         eval_context.rows,
         gdn_dense_elems,
@@ -1794,7 +1834,9 @@ def _compute_kda_cost(
         if eval_context.eff_prefill > 0
         else 0.0
     )
-    kda_state_bytes = (dec_state_io + pre_state_io) * kda_rec
+    kda_state_bytes = (
+        (dec_state_io + pre_state_io) * kda_rec / float(max(1, parallel.pcp))
+    )
     kda_buckets = _route_matmul_flops(
         eval_context.rows,
         kda_w_elems,
@@ -2555,7 +2597,10 @@ def _compute_ple_cost(
     eval_context: _StepContext,
 ) -> ModuleCost | None:
     """Compute ModuleCost for Per-Layer Embedding (PLE)."""
-    if geom.model_id == "qwen4_exp" and not geom.ple_layer_ids:
+    if (
+        resolve_geom_profile(geom).parallel.force_ple_disabled
+        and not geom.ple_layer_ids
+    ):
         return None
     if "ple" not in geom.layer_types and geom.ple_dim <= 0:
         return None

@@ -25,6 +25,7 @@ from .constants import (
     DEFAULT_GPU_MEMORY_UTILIZATION,
     DEFAULT_HBM_RESERVE_GB,
     DEFAULT_PREFILL_CHUNK,
+    DEFAULT_RUNTIME_PROFILE,
     SLO_VERDICT_ESTIMATE_MEETS,
     SLO_VERDICT_RULED_OUT,
     TOPOLOGY_AXES,
@@ -243,6 +244,7 @@ class ServingPlan:
     activation_model: ExpertActivationModel = field(
         default_factory=ExpertActivationModel
     )
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE
 
 
 class PointLaunchPayload(TypedDict):

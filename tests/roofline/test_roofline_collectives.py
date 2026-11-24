@@ -20,7 +20,18 @@ from dataclasses import replace
 
 import pytest
 
-from vllm_torchtpu.roofline import CHIPS, TOPOLOGIES, SliceTopology, torus_collective_s
+from vllm_torchtpu.roofline import (
+    CHIPS,
+    TOPOLOGIES,
+    Dtypes,
+    FloorOptions,
+    ModelGeometry,
+    Parallel,
+    SliceTopology,
+    StepShape,
+    step_floor,
+    torus_collective_s,
+)
 from vllm_torchtpu.roofline import collectives as rf_collectives
 from vllm_torchtpu.roofline.collectives import (
     CollectiveConfig,
@@ -207,3 +218,76 @@ def test_a2a_cut_never_exceeds_torus_and_enforces_bisection() -> None:
                     )
                     assert cut_s <= torus_s
                     assert cut_s >= 0.0
+
+
+def test_outer_submesh_offsets_pp_p2p_outside_pcp() -> None:
+    """Verify outer_submesh_for_group packs PP ranks outside inner TP x PCP axes."""
+    expected_pp4_pcp2 = (1, 2, 2, 1)
+    expected_pp2_pcp4 = (1, 1, 2, 1)
+    expected_pp8_pcp1 = (2, 2, 2, 1)
+    assert (
+        rf_collectives.outer_submesh_for_group(4, 2, TOPOLOGIES["2x2x1"], 2)
+        == expected_pp4_pcp2
+    )
+    assert (
+        rf_collectives.outer_submesh_for_group(2, 4, TOPOLOGIES["2x2x1"], 2)
+        == expected_pp2_pcp4
+    )
+    assert (
+        rf_collectives.outer_submesh_for_group(8, 1, TOPOLOGIES["2x2x1"], 2)
+        == expected_pp8_pcp1
+    )
+
+    # Pure linear-attention PP2 x PCP4 isolates pp_p2p with tp=1 and zero pcp_kv_ag.
+    geom_lin = ModelGeometry(
+        hidden=1024,
+        num_layers=2,
+        layer_types=("linear_attention", "linear_attention"),
+        num_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        linear_k_heads=4,
+        linear_v_heads=8,
+        linear_k_dim=64,
+        linear_v_dim=64,
+        conv_kernel=4,
+        attn_output_gate=False,
+        num_experts=0,
+        top_k=0,
+        moe_inter=0,
+        shared_inter=0,
+        dense_inter=2048,
+        vocab=32000,
+        mtp_layers=0,
+    )
+    par = Parallel(tp=1, pp=2, pcp=4)
+    shape = StepShape(batch=0, rows_per_seq=0, prefill_tokens=2048)
+    fl = step_floor(
+        geom_lin,
+        CHIPS["tpu7x"],
+        par,
+        shape,
+        FloorOptions(dt=Dtypes(kv=1.0), topology=TOPOLOGIES["2x2x1"]),
+    )
+    assert fl.coll_bound_s > 0.0
+    assert fl.latency_assumed_s > 0.0
+    assert fl.chain_s > 0.0
+
+    # Verify outer_submesh adds expected cross-chip ICI hops (2 vs 1, and 1 vs 0).
+    pp4_coll = make("pp_p2p", "p2p", 1024.0, 4)
+    pp2_coll = make("pp_p2p", "p2p", 1024.0, 2)
+    hops_two = 2
+    assert (
+        rf_collectives.collective_ici_hops(
+            pp4_coll, TOPOLOGIES["2x2x1"], 2, expected_pp4_pcp2
+        )
+        == hops_two
+    )
+    assert rf_collectives.collective_ici_hops(pp4_coll, TOPOLOGIES["2x2x1"], 2) == 1
+    assert (
+        rf_collectives.collective_ici_hops(
+            pp2_coll, TOPOLOGIES["2x2x1"], 2, expected_pp2_pcp4
+        )
+        == 1
+    )
+    assert rf_collectives.collective_ici_hops(pp2_coll, TOPOLOGIES["2x2x1"], 2) == 0

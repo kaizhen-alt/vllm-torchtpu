@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 from .constants import (
     BLOCK_PARALLEL_ENABLED,
+    DEFAULT_RUNTIME_PROFILE,
     GLU_MATMUL_COUNT,
     HF_REPO_TO_CANONICAL_ID,
     HYBRID_PATTERN_MAP,
@@ -32,6 +33,9 @@ from .constants import (
     VALID_LAYER_TOKENS,
     WEIGHT_BLOCK_DIM_LEN,
     ModelSpec,
+    RuntimeProfile,
+    resolve_model_profile,
+    resolve_runtime_profile,
 )
 
 __all__ = [
@@ -42,6 +46,7 @@ __all__ = [
     "UnsupportedArchitectureError",
     "count_layer_types",
     "from_hf_config",
+    "resolve_geom_profile",
     "resolve_model_identity",
     "supports",
 ]
@@ -279,11 +284,17 @@ class ModelGeometry:
     hc_lowrank: int = 0
     ple_layer_ids: tuple[int, ...] = ()
     max_position_embeddings: int = 0
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE
 
     def ffn_layer_counts(self) -> tuple[int, int]:
         """Return (n_moe_ffn, n_dense_ffn) counted from layer_ffn_kinds."""
         kinds = layer_ffn_kinds(self)
         return (kinds.count("moe"), kinds.count("dense"))
+
+
+def resolve_geom_profile(geom: ModelGeometry) -> RuntimeProfile:
+    """Return the active ``RuntimeProfile`` for ``geom``."""
+    return resolve_model_profile(geom.model_id, geom.runtime_profile)
 
 
 def _resolve_layer_family(
@@ -547,6 +558,7 @@ def resolve_model_identity(
     cfg: Mapping[str, object],
     *,
     model_ref: str | None = None,
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
 ) -> ModelIdentity:
     """Resolve and validate canonical model identity from HF config and repo ref."""
     text_cfg = _validate_text_config(cfg)
@@ -580,7 +592,8 @@ def resolve_model_identity(
     _validate_listed_model_spec(
         spec, model_type, architectures, hf_repo, repo_canonical
     )
-    if spec.canonical_id == "qwen4_exp":
+    profile = resolve_runtime_profile(spec, runtime_profile)
+    if profile.parallel.force_ple_disabled:
         _validate_qwen4_exp_bringup(text_cfg, cfg)
     return ModelIdentity(
         canonical_id=spec.canonical_id,
@@ -1102,8 +1115,10 @@ def _resolve_indexer_types(
 def _validate_qwen4_exp_bringup_fields(
     scopes: Sequence[Mapping[str, object]],
     ple_layer_ids: tuple[int, ...],
+    *,
+    require_ple_disabled: bool = True,
 ) -> None:
-    """Validate Qwen4Exp QSA/PLE/MTP fields stripped or inactive on TPU bring-up."""
+    """Validate Qwen4Exp QSA/PLE/MTP fields and consume structural tracking keys."""
     for qsa_key in (
         "indexer_compress_ratio",
         "indexer_n_heads",
@@ -1114,7 +1129,7 @@ def _validate_qwen4_exp_bringup_fields(
         if val is not None and _as_int(val, 0) <= 0:
             msg = f"Qwen4Exp {qsa_key} must be positive, got {val!r}"
             raise ValueError(msg)
-    if ple_layer_ids:
+    if require_ple_disabled and ple_layer_ids:
         msg = (
             "Qwen4Exp PLE parameters cannot be ignored when ple_layer_ids is non-empty"
         )
@@ -1159,14 +1174,21 @@ def _extract_extended_fields(
     cfg: Mapping[str, object],
     canonical_id: str,
     num_layers: int,
+    *,
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
 ) -> _ExtendedGeometryFields:
     """Parse MTP, PLE, IndexShare, HC, vocab, and block-quant dimensions."""
     scopes = (tc, cfg) if tc is not cfg else (tc,)
     mtp_layers = _resolve_mtp_layers(tc, cfg)
     ple_layer_ids = _resolve_ple_layer_ids(tc, cfg)
+    profile = resolve_model_profile(canonical_id, runtime_profile)
     if canonical_id == "qwen4_exp":
-        _validate_qwen4_exp_bringup_fields(scopes, ple_layer_ids)
-        # TPU Qwen4Exp bring-up strips MTP weights and forbids speculative_config.
+        _validate_qwen4_exp_bringup_fields(
+            scopes,
+            ple_layer_ids,
+            require_ple_disabled=profile.parallel.force_ple_disabled,
+        )
+    if profile.parallel.max_spec_tokens == 0:
         mtp_layers = 0
     dedicated_mtp_emb = _first_non_none(scopes, "mtp_use_dedicated_embeddings")
     if dedicated_mtp_emb is True and mtp_layers > 0:
@@ -1224,6 +1246,8 @@ def _extract_extended_fields(
 def _extract_geometry_for_identity(
     cfg: Mapping[str, object],
     identity: ModelIdentity,
+    *,
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
 ) -> ModelGeometry:
     """Extract ModelGeometry from cfg after identity and structural checks."""
     sub = _as_mapping(cfg.get("text_config"))
@@ -1273,7 +1297,9 @@ def _extract_geometry_for_identity(
             tc, layer_types, (num_heads, num_kv_heads, head_dim)
         )
     )
-    ext = _extract_extended_fields(tc, cfg, identity.canonical_id, num_layers)
+    ext = _extract_extended_fields(
+        tc, cfg, identity.canonical_id, num_layers, runtime_profile=runtime_profile
+    )
 
     return ModelGeometry(
         hidden=hidden,
@@ -1326,6 +1352,7 @@ def _extract_geometry_for_identity(
         hc_lowrank=ext.hc_lowrank,
         ple_layer_ids=ext.ple_layer_ids,
         max_position_embeddings=ext.max_position_embeddings,
+        runtime_profile=runtime_profile,
     )
 
 
@@ -1348,11 +1375,16 @@ def from_hf_config(
     cfg: Mapping[str, object],
     *,
     model_ref: str | None = None,
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
 ) -> ModelGeometry:
     """Build ModelGeometry from a canonical CDK HF config mapping."""
-    identity = resolve_model_identity(cfg, model_ref=model_ref)
+    identity = resolve_model_identity(
+        cfg, model_ref=model_ref, runtime_profile=runtime_profile
+    )
     _validate_structural_support(cfg)
-    geom = _extract_geometry_for_identity(cfg, identity)
+    geom = _extract_geometry_for_identity(
+        cfg, identity, runtime_profile=runtime_profile
+    )
     _validate_family_layer_kinds(
         identity, geom.layer_types, geom.kv_lora_rank, geom.index_topk
     )

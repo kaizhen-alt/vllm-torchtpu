@@ -25,6 +25,7 @@ from .collectives import (
     collective_cut_bound_s,
     collective_ici_hops,
     make,
+    outer_submesh_for_group,
     submesh_for_group,
     torus_collective_s,
 )
@@ -367,11 +368,21 @@ def combine_modules(
     user_chain_lat_s = 0.0
     for collective_key, c in coll_samples:
         call_count = call_counts[collective_key]
-        c_axes = (
-            mesh_axes
-            if (eff_parallel is not None and c.group == eff_parallel.tp)
-            else None
-        )
+        c_axes: tuple[int, int, int, int] | None = None
+        if eff_parallel is not None:
+            if (
+                c.name == "pp_p2p"
+                and eff_parallel.pp > 1
+                and eff_parallel.tp * eff_parallel.pcp > 1
+            ):
+                c_axes = outer_submesh_for_group(
+                    eff_parallel.pp,
+                    eff_parallel.tp * eff_parallel.pcp,
+                    topology,
+                    ranks_per_chip,
+                )
+            elif c.group == eff_parallel.tp:
+                c_axes = mesh_axes
         hop_s, anal_s, cut_s = _unit_coll_times(
             c, topology, ranks_per_chip, c_axes, chip
         )

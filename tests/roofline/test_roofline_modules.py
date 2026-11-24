@@ -15,9 +15,11 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from dataclasses import replace as dc_replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -29,10 +31,12 @@ if TYPE_CHECKING:
 from vllm_torchtpu.roofline import (
     CHIPS,
     Dtypes,
+    FloorOptions,
     ModelGeometry,
     Parallel,
     SeqKvLayout,
     StepShape,
+    count_layer_types,
     dtypes_from_hf_config,
     from_hf_config,
     hbm_breakdown_per_core_bytes,
@@ -49,6 +53,7 @@ from vllm_torchtpu.roofline.constants import (
     VECTOR_SUB_BYTE_ELEMENTS_PER_WORD,
 )
 from vllm_torchtpu.roofline.geometry import _from_hf_config_dry_run
+from vllm_torchtpu.roofline.memory import compute_w_rec
 from vllm_torchtpu.roofline.modules import (
     ep_busiest_experts,
     experts_touched,
@@ -1567,3 +1572,161 @@ def test_block_parallel_sp_collectives_per_moe_dispatch() -> None:
     moe_ag = next(m for m in costs_ag if m.name == "moe")
     assert "out_rs" in {c.name for c in attn_ag.collectives}
     assert "dispatch_ag" in {c.name for c in moe_ag.collectives}
+
+
+def test_gdn_state_shards_by_tp_times_pcp_while_weights_shard_by_tp() -> None:
+    """Verify GDN weights shard by tp while HBM and I/O state scale by tp * pcp."""
+    cfg_path = Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    geom = from_hf_config(cfg)
+    dt = dtypes_from_hf_config(cfg)
+    counts = count_layer_types(geom)
+
+    w_tp1_pcp1 = compute_w_rec(geom, dt, Parallel(tp=1, pcp=1), counts)
+    w_tp1_pcp2 = compute_w_rec(geom, dt, Parallel(tp=1, pcp=2), counts)
+    w_tp2_pcp1 = compute_w_rec(geom, dt, Parallel(tp=2, pcp=1), counts)
+    w_tp2_pcp4 = compute_w_rec(geom, dt, Parallel(tp=2, pcp=4), counts)
+    assert w_tp1_pcp2 == pytest.approx(w_tp1_pcp1, rel=1e-12)
+    assert w_tp2_pcp4 == pytest.approx(w_tp2_pcp1, rel=1e-12)
+
+    layout = SeqKvLayout(seqs_per_dp=4, context=1024)
+    bd_11 = hbm_breakdown_per_core_bytes(geom, dt, Parallel(tp=1, pcp=1), layout)
+    bd_12 = hbm_breakdown_per_core_bytes(geom, dt, Parallel(tp=1, pcp=2), layout)
+    bd_21 = hbm_breakdown_per_core_bytes(geom, dt, Parallel(tp=2, pcp=1), layout)
+    bd_24 = hbm_breakdown_per_core_bytes(geom, dt, Parallel(tp=2, pcp=4), layout)
+    pcp_two = 2.0
+    pcp_four = 4.0
+    assert bd_12.state == pytest.approx(bd_11.state / pcp_two, rel=1e-12)
+    assert bd_24.state == pytest.approx(bd_21.state / pcp_four, rel=1e-12)
+
+    def _prefill_state_io_bytes(parallel: Parallel) -> float:
+        """Isolate per-rank GDN state I/O by differencing cached vs uncached prefill."""
+        hit_mods = {
+            m.name: m
+            for m in pass_costs(
+                geom,
+                parallel,
+                StepShape(
+                    batch=0,
+                    rows_per_seq=0,
+                    context=8192,
+                    prefill_tokens=8192,
+                    prefix_hit_rate=0.5,
+                ),
+                dt,
+            )
+        }
+        miss_mods = {
+            m.name: m
+            for m in pass_costs(
+                geom,
+                parallel,
+                StepShape(
+                    batch=0,
+                    rows_per_seq=0,
+                    context=8192,
+                    prefill_tokens=8192,
+                    prefix_hit_rate=0.0,
+                ),
+                dt,
+            )
+        }
+        return hit_mods["gdn"].hbm_bytes - miss_mods["gdn"].hbm_bytes
+
+    io_11 = _prefill_state_io_bytes(Parallel(tp=1, pcp=1))
+    io_12 = _prefill_state_io_bytes(Parallel(tp=1, pcp=2))
+    io_21 = _prefill_state_io_bytes(Parallel(tp=2, pcp=1))
+    io_24 = _prefill_state_io_bytes(Parallel(tp=2, pcp=4))
+    assert io_12 == pytest.approx(io_11 / pcp_two, rel=1e-12)
+    assert io_24 == pytest.approx(io_21 / pcp_four, rel=1e-12)
+
+
+def _assert_decode_dcp_retention(
+    geom: ModelGeometry,
+    par16: Parallel,
+    dt: Dtypes,
+    attn_name: str,
+) -> None:
+    """Assert decode batch=4 with kv_split=16 keeps legacy DCP byte formulas."""
+    dec_batch = 4
+    dec_shape = StepShape(
+        batch=dec_batch, rows_per_seq=1, context=8192, prefill_tokens=0
+    )
+    dec_mods = {m.name: m for m in pass_costs(geom, par16, dec_shape, dt)}
+    assert dec_mods[attn_name].unique_collectives is not None
+    dec_colls = {c.name: c for c, _ in dec_mods[attn_name].unique_collectives}
+    assert set(dec_colls) == {"out_ar", "dcp_q_ag", "dcp_lse_ag", "dcp_out_rs"}
+    dec_nq = geom.num_heads // par16.tp
+    dec_bf16_bytes = 2
+    dec_f32_bytes = 4
+    dec_dcp = par16.kv_split
+    assert dec_colls["dcp_q_ag"].payload == pytest.approx(
+        float(dec_batch * dec_dcp * dec_nq * geom.kv_lora_rank * dec_bf16_bytes),
+        rel=1e-12,
+    )
+    assert dec_colls["dcp_out_rs"].payload == pytest.approx(
+        float(dec_batch * dec_dcp * dec_nq * geom.kv_lora_rank * dec_f32_bytes),
+        rel=1e-12,
+    )
+    dec_floor = step_floor(geom, CHIPS["tpu7x"], par16, dec_shape, FloorOptions(dt=dt))
+    assert dec_floor.hard_floor_s > 0.0
+
+
+def test_prefill_dcp_shards_kv_hbm_and_charges_bf16_lse_merge_collectives() -> None:
+    """Verify prefill DCP shards KV HBM and emits bf16 LSE-merge collectives only."""
+    cfg_path = Path(__file__).resolve().parent / "fixtures" / "glm_5_2_fp8.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    geom = from_hf_config(cfg)
+    dt = dtypes_from_hf_config(cfg)
+
+    par1 = Parallel(tp=16, kv_split=1)
+    par16 = Parallel(tp=16, kv_split=16)
+    pre_shape = StepShape(
+        batch=0,
+        rows_per_seq=0,
+        context=8192,
+        prefill_tokens=8192,
+        prefix_hit_rate=0.75,
+    )
+    weight_only_shape = StepShape(batch=1, rows_per_seq=1, context=0)
+
+    mods1 = {m.name: m for m in pass_costs(geom, par1, pre_shape, dt)}
+    mods16 = {m.name: m for m in pass_costs(geom, par16, pre_shape, dt)}
+    weights1 = {m.name: m for m in pass_costs(geom, par1, weight_only_shape, dt)}
+    attn_names = tuple(name for name in ("mla", "dsa") if name in mods1)
+    assert attn_names
+
+    dcp_group = 16
+    eff_prefill = math.ceil(8192 * (1.0 - 0.75))
+    nq = geom.num_heads // par16.tp
+    f32_bytes = 4
+    bf16_bytes = 2
+    for name in attn_names:
+        m1, m16 = mods1[name], mods16[name]
+        assert m16.bf16_flops == pytest.approx(m1.bf16_flops, rel=1e-12)
+        assert m16.fp8_flops == pytest.approx(m1.fp8_flops, rel=1e-12)
+        assert m16.strict_bf16_flops == pytest.approx(m1.strict_bf16_flops, rel=1e-12)
+        assert m16.strict_fp8_flops == pytest.approx(m1.strict_fp8_flops, rel=1e-12)
+        assert m16.unique_collectives is not None
+        colls = {c.name: c for c, _ in m16.unique_collectives}
+        assert set(colls) == {"out_ar", "dcp_lse_ag", "dcp_out_rs"}
+        assert {k for k in colls if k.startswith("dcp_")} == {
+            "dcp_lse_ag",
+            "dcp_out_rs",
+        }
+        assert all(c.wire_bytes > 0.0 and c.payload > 0.0 for c in m16.collectives)
+        assert colls["dcp_lse_ag"].kind == "ag"
+        assert colls["dcp_lse_ag"].payload == pytest.approx(
+            float(dcp_group * eff_prefill * dcp_group * nq * f32_bytes), rel=1e-12
+        )
+        assert colls["dcp_out_rs"].kind == "rs"
+        assert colls["dcp_out_rs"].payload == pytest.approx(
+            float(eff_prefill * dcp_group * nq * geom.kv_lora_rank * bf16_bytes),
+            rel=1e-12,
+        )
+
+    kv_hbm_1 = sum(mods1[n].hbm_bytes - weights1[n].hbm_bytes for n in attn_names)
+    kv_hbm_16 = sum(mods16[n].hbm_bytes - weights1[n].hbm_bytes for n in attn_names)
+    kv_split_sixteen = 16.0
+    assert kv_hbm_16 == pytest.approx(kv_hbm_1 / kv_split_sixteen, rel=1e-12)
+    _assert_decode_dcp_retention(geom, par16, dt, attn_names[0])

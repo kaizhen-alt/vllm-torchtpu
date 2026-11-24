@@ -31,6 +31,7 @@ from .constants import (
     DEFAULT_MAX_INSTANCES,
     EXAMPLE_CONCURRENCIES,
     EXAMPLE_SLO_TIERS,
+    FP4_BYTES,
     FP8_BYTES,
     LINEAR_ATTENTION_LAYER_TOKENS,
     MIN_DISAGG_INSTANCES,
@@ -44,8 +45,12 @@ from .constants import (
     UNIT_GIGA,
     UNIT_MILLIS_PER_SECOND,
     ZERO_THINK_TIME_WARNING,
+    ParallelRules,
     SloVerdict,
+    canonicalize_kv_dtype,
+    disagg_prefill_spec_k,
 )
+from .geometry import resolve_geom_profile
 from .memory import (
     HbmBreakdown,
     KvFitInput,
@@ -293,6 +298,34 @@ def _valid_raiden_gdn_pair(
     return deg_p == 1 or deg_p % deg_d == 0
 
 
+def _valid_glm_mla_raiden_pair(
+    prefill_parallel: Parallel,
+    decode_parallel: Parallel,
+) -> bool:
+    """Enforce exact GLM-MLA Raiden P/D pairing rules matching runtime tpu_connector."""
+    if prefill_parallel.dp != 1 or prefill_parallel.pcp != 1:
+        return False
+    pp_p = prefill_parallel.pp
+    tp_p = prefill_parallel.tp
+    dcp_p = prefill_parallel.kv_split
+    tp_d = decode_parallel.tp
+    dp_d = decode_parallel.dp
+    dcp_d = decode_parallel.kv_split
+    tp_dcp_match = (
+        pp_p == 1 and tp_p == dcp_p > 1 and dp_d == 1 and tp_d == dcp_d == tp_p
+    )
+    pp_to_dcp = (
+        pp_p > 1
+        and tp_p == 1
+        and dcp_p == 1
+        and dp_d == 1
+        and tp_d > 1
+        and tp_d == dcp_d
+    )
+    tp_to_dp = pp_p == 1 and dcp_p == 1 and tp_d == 1 and dcp_d == 1
+    return tp_dcp_match or pp_to_dcp or tp_to_dp
+
+
 def _valid_raiden_kv_pair(
     geom: ModelGeometry,
     prefill_parallel: Parallel,
@@ -301,9 +334,16 @@ def _valid_raiden_kv_pair(
     """Check runtime disaggregated KV cache shard compatibility between P and D."""
     if geom.num_kv_heads <= 0:
         return True
+    rule = resolve_geom_profile(geom).parallel.raiden_pair_rule
+    if rule == "glm_mla":
+        return _valid_glm_mla_raiden_pair(prefill_parallel, decode_parallel)
     deg_p = max(1, prefill_parallel.tp * prefill_parallel.pcp)
     deg_d = max(1, decode_parallel.tp * decode_parallel.pcp)
-    return deg_p % deg_d == 0 or deg_d % deg_p == 0
+    divisible = deg_p % deg_d == 0 or deg_d % deg_p == 0
+    if rule == "qwen_gdn":
+        return prefill_parallel.kv_split == 1 and divisible
+    dcp_match = prefill_parallel.kv_split in {1, decode_parallel.kv_split}
+    return dcp_match and divisible
 
 
 def classify_multihost_mp_mode(
@@ -524,7 +564,8 @@ def _candidate_decode_parallels(
     cores = topo.num_cores
     out: list[Parallel] = []
     has_kv_cache = geom.num_kv_heads > 0 or geom.kv_lora_rank > 0
-    disallow_dcp = geom.model_id == "qwen4_exp"
+    rules = resolve_geom_profile(geom).parallel
+    disallow_dcp = rules.max_dcp is not None and rules.max_dcp <= 1
     for tp in _divisors(cores):
         if not _valid_head_tp(geom, tp) or not _valid_gdn_degree(geom, tp):
             continue
@@ -537,10 +578,17 @@ def _candidate_decode_parallels(
             # Hardware KV group divisibility for decode head sharding.
             kv_group = (
                 max(1, tp // geom.num_kv_heads)
-                if geom.num_kv_heads > 0 and geom.kv_lora_rank == 0
+                if geom.num_kv_heads > 0
+                and geom.kv_lora_rank == 0
+                and rules.dcp_span != "tp_group"
                 else tp
             )
-            kv_splits = _divisors(kv_group) if kv_group > 1 else (1,)
+            raw_splits = _divisors(kv_group) if kv_group > 1 else (1,)
+            kv_splits = (
+                tuple(k for k in raw_splits if k <= rules.max_dcp)
+                if rules.max_dcp is not None
+                else raw_splits
+            )
         moe_mode: Literal["tp_slice", "ep"] = (
             "ep"
             if geom.num_experts > 0 and cores > 1 and geom.num_experts >= cores
@@ -595,7 +643,8 @@ def _prefill_pp_allowed(
     spec_k: int,
 ) -> bool:
     """Check runtime PP stage count, disagg full-attention, and spec rules."""
-    if geom.num_layers < pp or (geom.model_id == "qwen4_exp" and pp > 1):
+    rules = resolve_geom_profile(geom).parallel
+    if geom.num_layers < pp or (rules.max_pp is not None and pp > rules.max_pp):
         return False
     if for_disagg and 0 < n_full_attn < geom.num_layers and pp > n_full_attn:
         return False
@@ -611,7 +660,12 @@ def _pcp_allowed(
     """Check PCP legality against runtime PP, model, and MTP spec_k rules."""
     if pcp <= 1:
         return True
-    return geom.model_id != "qwen4_exp" and pp == 1 and spec_k <= 1
+    rules = resolve_geom_profile(geom).parallel
+    if rules.max_pcp is not None and pcp > rules.max_pcp:
+        return False
+    if pp > 1 and not rules.pcp_allows_pp:
+        return False
+    return spec_k <= 1
 
 
 def _prefill_axes_allowed(
@@ -633,6 +687,76 @@ def _prefill_axes_allowed(
     return _valid_head_tp(geom, tp) and _valid_gdn_degree(geom, tp * pcp)
 
 
+def _candidate_prefill_kv_splits(
+    geom: ModelGeometry,
+    axes: tuple[int, int, int],
+    rules: ParallelRules,
+    *,
+    for_disagg: bool,
+) -> tuple[int, ...]:
+    """Return legal prefill DCP degrees governed by ``rules.prefill_dcp_mode``."""
+    tp, pp, pcp = axes
+    has_kv_cache = geom.num_kv_heads > 0 or geom.kv_lora_rank > 0
+    if (
+        not for_disagg
+        or not has_kv_cache
+        or rules.prefill_dcp_mode == "none"
+        or pp > 1
+        or pcp > 1
+        or tp <= 1
+    ):
+        return (1,)
+    if rules.prefill_dcp_mode == "tp_match":
+        if rules.max_dcp is not None and tp > rules.max_dcp:
+            return (1,)
+        return (1, tp)
+    kv_group = (
+        max(1, tp // geom.num_kv_heads)
+        if geom.num_kv_heads > 0
+        and geom.kv_lora_rank == 0
+        and rules.dcp_span != "tp_group"
+        else tp
+    )
+    raw_splits = _divisors(kv_group) if kv_group > 1 else (1,)
+    if rules.max_dcp is None:
+        return raw_splits
+    return tuple(k for k in raw_splits if k <= rules.max_dcp)
+
+
+def _append_prefill_candidates(
+    out: list[Parallel],
+    topo: SliceTopology,
+    axes: tuple[int, int, int],
+    kv_splits: tuple[int, ...],
+    moe_modes: Sequence[tuple[Literal["tp_slice", "ep"], int]],
+) -> None:
+    """Expand prefill candidates across legal DCP and MoE dispatch combinations."""
+    tp, pp, pcp = axes
+    mesh_ax = submesh_for_group(tp, topo, topo.cores_per_chip)
+    for moe_mode, ep_val in moe_modes:
+        dispatches: tuple[Literal["allreduce", "ag_ep"], ...] = (
+            ("ag_ep",)
+            if (moe_mode == "ep" and tp == 1)
+            else (("allreduce", "ag_ep") if moe_mode == "ep" else ("allreduce",))
+        )
+        for kvs in kv_splits:
+            out.extend(
+                Parallel(
+                    tp=tp,
+                    kv_split=kvs,
+                    moe=moe_mode,
+                    moe_dispatch=disp,
+                    ranks_per_chip=topo.cores_per_chip,
+                    dp=1,
+                    ep=ep_val,
+                    pp=pp,
+                    pcp=pcp,
+                    mesh_axes=mesh_ax,
+                )
+                for disp in dispatches
+            )
+
+
 def _candidate_prefill_parallels(
     geom: ModelGeometry,
     topo: SliceTopology,
@@ -642,9 +766,11 @@ def _candidate_prefill_parallels(
     chip: ChipSpec | None = None,
 ) -> list[Parallel]:
     """Enumerate legal prefill parallelism configurations for a given topology."""
-    if not _valid_moe_block_quant_hidden(geom) or (
-        geom.model_id == "qwen4_exp" and spec_k > 0
-    ):
+    rules = resolve_geom_profile(geom).parallel
+    spec_disallowed = (
+        rules.max_spec_tokens is not None and spec_k > rules.max_spec_tokens
+    )
+    if not _valid_moe_block_quant_hidden(geom) or spec_disallowed:
         return []
     cores = topo.num_cores
     n_full_attn = count_full_attn_layers(geom)
@@ -661,30 +787,11 @@ def _candidate_prefill_parallels(
                 geom, topo, (tp, pp, pcp), spec_k=spec_k, chip=chip
             ):
                 continue
-            mesh_ax = submesh_for_group(tp, topo, topo.cores_per_chip)
-            for moe_mode, ep_val in _candidate_prefill_moe_modes(geom, tp, pcp):
-                dispatches: tuple[Literal["allreduce", "ag_ep"], ...] = (
-                    ("ag_ep",)
-                    if (moe_mode == "ep" and tp == 1)
-                    else (
-                        ("allreduce", "ag_ep") if moe_mode == "ep" else ("allreduce",)
-                    )
-                )
-                out.extend(
-                    Parallel(
-                        tp=tp,
-                        kv_split=1,
-                        moe=moe_mode,
-                        moe_dispatch=disp,
-                        ranks_per_chip=topo.cores_per_chip,
-                        dp=1,
-                        ep=ep_val,
-                        pp=pp,
-                        pcp=pcp,
-                        mesh_axes=mesh_ax,
-                    )
-                    for disp in dispatches
-                )
+            kv_splits = _candidate_prefill_kv_splits(
+                geom, (tp, pp, pcp), rules, for_disagg=for_disagg
+            )
+            moe_modes = _candidate_prefill_moe_modes(geom, tp, pcp)
+            _append_prefill_candidates(out, topo, (tp, pp, pcp), kv_splits, moe_modes)
     return out
 
 
@@ -814,6 +921,7 @@ class _PrefillOption:
     offload_b_per_core: float = 0.0
     logit_peak_b: float = 0.0
     fixed_kv_per_seq_b: float = 0.0
+    pp_stage_partition: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -1802,8 +1910,8 @@ def _resolve_prefill_pp_breakdown(
     eval_context: _SolveContext,
     par: Parallel,
     logit_peak_b: float,
-) -> tuple[HbmBreakdown, float, tuple[int, ...] | None] | None:
-    """Resolve prefill stage HBM breakdown and optional uneven PP partition."""
+) -> tuple[HbmBreakdown, float, tuple[int, ...] | None, tuple[int, ...] | None] | None:
+    """Resolve prefill stage HBM breakdown, stage partition, and uneven partition."""
     if par.pp <= 1:
         hbm_bd = hbm_breakdown_per_core_bytes(
             eval_context.geom,
@@ -1812,7 +1920,7 @@ def _resolve_prefill_pp_breakdown(
             SeqKvLayout(1, eval_context.scenario.isl),
             chip=eval_context.chip,
         )
-        return (hbm_bd, hbm_bd.total, None)
+        return (hbm_bd, hbm_bd.total, None, None)
     even_cap = max(1, math.ceil(eval_context.geom.num_layers / par.pp))
     is_hybrid = (
         0 < count_full_attn_layers(eval_context.geom) < eval_context.geom.num_layers
@@ -1850,7 +1958,7 @@ def _resolve_prefill_pp_breakdown(
     if not pp_feas or not pp_part:
         return None
     pp_part_opt = pp_part if len(set(pp_part)) > 1 else None
-    return (hbm_bd, last_stage_b, pp_part_opt)
+    return (hbm_bd, last_stage_b, pp_part, pp_part_opt)
 
 
 def _find_prefill_options(
@@ -1868,6 +1976,9 @@ def _find_prefill_options(
             * float(eval_context.scenario.isl)
         ),
     )
+    prefill_spec_k = disagg_prefill_spec_k(
+        eval_context.spec_k, resolve_geom_profile(eval_context.geom).parallel
+    )
     for topo in topos:
         if (
             eval_context.prefill_topology is not None
@@ -1878,7 +1989,7 @@ def _find_prefill_options(
             eval_context.geom,
             topo,
             for_disagg=True,
-            spec_k=eval_context.spec_k,
+            spec_k=prefill_spec_k,
             chip=eval_context.chip,
         ):
             logit_peak_b = _peak_prefill_logit_bytes(
@@ -1891,7 +2002,7 @@ def _find_prefill_options(
             stage_info = _resolve_prefill_pp_breakdown(eval_context, par, logit_peak_b)
             if stage_info is None:
                 continue
-            hbm_bd, last_stage_b, pp_part_opt = stage_info
+            hbm_bd, last_stage_b, pp_part, pp_part_opt = stage_info
             hbm_b = hbm_bd.total
             if (
                 hbm_b > eval_context.hbm_limit_b
@@ -1903,7 +2014,7 @@ def _find_prefill_options(
                 topo,
                 par,
                 eval_context.scenario.prefix_hit_rate,
-                pp_part_opt,
+                pp_part,
             )
             pp_factor = 1.0 + float(par.pp - 1) / float(max(1, eval_context.n_chunks))
             ttft_ms = sf_p.serial_estimate_s * pp_factor * UNIT_MILLIS_PER_SECOND
@@ -1923,12 +2034,12 @@ def _find_prefill_options(
             min_req_ttft_ms = min(min_req_ttft_ms, bound_ttft_val + xfer_min_ms)
             rate_p = 1.0 / max(_RATE_FLOOR_EPS, sf_p.serial_estimate_s)
             pref_w_base_b = hbm_bd.total - hbm_bd.kv - hbm_bd.state
-            if par.pp > 1 and pp_part_opt:
+            if par.pp > 1 and pp_part:
                 pref_b_kv_phys, pref_fixed_kv_b = pp_stage_kv_parts(
                     eval_context.geom,
                     eval_context.dtypes,
                     par,
-                    (pp_part_opt, eval_context.scenario.isl),
+                    (pp_part, eval_context.scenario.isl),
                     chip=eval_context.chip,
                 )
             else:
@@ -1960,6 +2071,7 @@ def _find_prefill_options(
                     offload_b_per_core=pref_offload_b,
                     logit_peak_b=logit_peak_b,
                     fixed_kv_per_seq_b=pref_fixed_kv_b,
+                    pp_stage_partition=pp_part,
                 )
             )
     return prefill_options, min_req_ttft_ms
@@ -2722,7 +2834,7 @@ def _resolve_effective_prefill(
         1, math.ceil(eff_isl_p / max(1, eval_context.scenario.prefill_chunk))
     )
     sf_p_eff = _prefill_stage_step_floor(
-        eval_context, pref.topo, pref.par, h_eff, pref.pp_part
+        eval_context, pref.topo, pref.par, h_eff, pref.pp_stage_partition
     )
     ttft_p_eff = (
         sf_p_eff.serial_estimate_s
@@ -3119,24 +3231,38 @@ def _resolve_solve_topologies(
     return topologies
 
 
-def _qwen4_scenario_warnings(
+def _profile_scenario_warnings(
     geom: ModelGeometry,
+    dtypes: Dtypes,
     ctx_full: int,
     spec_k: int,
 ) -> tuple[str, ...]:
-    """Enforce TPUQwen4ExpConfig scenario limits (context budget and spec decode)."""
-    if geom.model_id != "qwen4_exp":
-        return ()
+    """Enforce profile-driven context, spec-decode, and KV dtype limits."""
+    profile = resolve_geom_profile(geom)
+    rules = profile.parallel
+    model_label = geom.model_id or "model"
     msgs: list[str] = []
-    if geom.qsa_budget > 0 and ctx_full > geom.qsa_budget:
+    if (
+        rules.cap_context_at_indexer_budget
+        and geom.qsa_budget > 0
+        and ctx_full > geom.qsa_budget
+    ):
         msgs.append(
-            f"UNSUPPORTED_CONFIG: qwen4_exp max_model_len={ctx_full} exceeds "
+            f"UNSUPPORTED_CONFIG: {model_label} max_model_len={ctx_full} exceeds "
             f"indexer_budget={geom.qsa_budget} on dense bring-up path."
         )
-    if spec_k > 0:
+    if rules.max_spec_tokens is not None and spec_k > rules.max_spec_tokens:
         msgs.append(
-            "UNSUPPORTED_CONFIG: qwen4_exp does not support speculative decoding "
+            f"UNSUPPORTED_CONFIG: {model_label} does not support speculative decoding "
             f"(spec_tokens={spec_k})."
+        )
+    canonical_kv = canonicalize_kv_dtype(dtypes.kv_dtype)
+    if canonical_kv not in profile.kv_dtypes or (
+        dtypes.kv <= FP4_BYTES and "fp4" not in profile.kv_dtypes
+    ):
+        msgs.append(
+            f"UNSUPPORTED_CONFIG: kv_dtype={dtypes.kv_dtype!r} ({dtypes.kv:g} B) "
+            f"is not supported under runtime_profile={profile.name!r}."
         )
     return tuple(msgs)
 
@@ -3180,10 +3306,14 @@ def _explain_decode_rejection(
 ) -> str | None:
     """Return rejection reason if decode layout is invalid or not enumerated."""
     reason: str | None = None
+    rules = resolve_geom_profile(geom).parallel
     if decode_axes.get("pp", 1) > 1 or decode_axes.get("pcp", 1) > 1:
         reason = "decode pools are enumerated with PP1 and PCP1"
-    elif geom.model_id == "qwen4_exp" and decode_axes.get("kv_split", 1) > 1:
-        reason = "qwen4_exp bring-up path does not support DCP > 1"
+    elif rules.max_dcp is not None and decode_axes.get("kv_split", 1) > rules.max_dcp:
+        reason = (
+            f"{geom.model_id or 'model'} profile {geom.runtime_profile!r} limits "
+            f"DCP <= {rules.max_dcp}"
+        )
     if reason is not None:
         return reason
 
@@ -3246,15 +3376,18 @@ def _explain_prefill_rejection(
     spec: _PrefillExplainSpec,
 ) -> str | None:
     """Return rejection reason if prefill layout is invalid or not enumerated."""
+    rules = resolve_geom_profile(geom).parallel
+    eff_pre_spec = disagg_prefill_spec_k(spec.spec_k, rules)
     prefill_tp = prefill_axes.get("tp", 1)
     prefill_pp = prefill_axes.get("pp", 1)
     prefill_pcp = prefill_axes.get("pcp", 1)
     prefill_ep = prefill_axes.get("ep", 1)
-    if not _pcp_allowed(geom, prefill_pp, prefill_pcp, spec.spec_k):
-        return "PCP > 1 is not permitted with PP > 1, qwen4_exp, or spec_k > 1"
+    prefill_dcp = prefill_axes.get("kv_split", 1)
+    if not _pcp_allowed(geom, prefill_pp, prefill_pcp, eff_pre_spec):
+        return "PCP > 1 is not permitted with PP > 1, this profile, or spec_k > 1"
     n_full_attn = count_full_attn_layers(geom)
     if not _prefill_pp_allowed(
-        geom, prefill_pp, n_full_attn, for_disagg=True, spec_k=spec.spec_k
+        geom, prefill_pp, n_full_attn, for_disagg=True, spec_k=eff_pre_spec
     ):
         return f"PP{prefill_pp} is not permitted for this model and scenario"
     prefill_found = any(
@@ -3262,12 +3395,13 @@ def _explain_prefill_rejection(
         and parallel_candidate.pp == prefill_pp
         and parallel_candidate.pcp == prefill_pcp
         and parallel_candidate.ep == prefill_ep
+        and parallel_candidate.kv_split == prefill_dcp
         for slice_topology in spec.topologies
         for parallel_candidate in _candidate_prefill_parallels(
             geom,
             slice_topology,
             for_disagg=True,
-            spec_k=spec.spec_k,
+            spec_k=eff_pre_spec,
             chip=spec.chip,
         )
     )
@@ -3332,8 +3466,16 @@ def explain_layout_rejection(
 
     if "prefill" in layout:
         prefill_axes = layout["prefill"]
-        if prefill_axes.get("dp", 1) > 1 or prefill_axes.get("kv_split", 1) > 1:
-            return "prefill pools are enumerated with DP1 and DCP1"
+        rules = resolve_geom_profile(geom).parallel
+        dcp_disallowed = (
+            prefill_axes.get("kv_split", 1) > 1 and rules.prefill_dcp_mode == "none"
+        )
+        if prefill_axes.get("dp", 1) > 1 or dcp_disallowed:
+            return (
+                "prefill pools are enumerated with DP1 and DCP1"
+                if rules.prefill_dcp_mode == "none"
+                else "prefill pools are enumerated with DP1"
+            )
 
     decode_reason = _explain_decode_rejection(
         geom, layout["decode"], decode_topologies, chip=chip
@@ -3491,8 +3633,8 @@ def solve_serving_plan(
         activation_model=opts.activation_model,
     )
 
-    qwen4_warnings = _qwen4_scenario_warnings(geom, ctx_full, spec_k)
-    if qwen4_warnings:
+    profile_warnings = _profile_scenario_warnings(geom, dtypes, ctx_full, spec_k)
+    if profile_warnings:
         return ServingPlan(
             model_layers=geom.num_layers,
             chip=chip.name,
@@ -3500,7 +3642,7 @@ def solve_serving_plan(
             mode=opts.mode,
             recommended=None,
             frontier=(),
-            warnings=qwen4_warnings,
+            warnings=profile_warnings,
             candidates=(),
             gpu_memory_utilization=opts.gpu_memory_utilization,
             collective_latency_s=opts.collective_latency_s,
@@ -3516,6 +3658,7 @@ def solve_serving_plan(
             max_instances=opts.max_instances,
             pins=pins,
             activation_model=opts.activation_model,
+            runtime_profile=geom.runtime_profile,
         )
     prefill_options, min_prefill_ttft_ms = _find_prefill_options(eval_context, topos)
     mixed_candidates, min_c1_tpot_ms, min_mixed_ttft_ms = _evaluate_mixed_candidates(
@@ -3604,4 +3747,5 @@ def solve_serving_plan(
         max_instances=opts.max_instances,
         pins=pins,
         activation_model=opts.activation_model,
+        runtime_profile=geom.runtime_profile,
     )

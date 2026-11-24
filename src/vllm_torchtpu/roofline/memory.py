@@ -468,6 +468,7 @@ def _compute_kv_and_state(
     kv_bytes = (kv_gqa + kv_swa + kv_mla) * stage_scale / kv_div
 
     st_bytes = 0.0
+    pcp_div = float(max(1, parallel.pcp))
     if counts.gdn > 0:
         key_heads = max(1, geom.linear_k_heads // tp)
         value_heads = max(1, geom.linear_v_heads // tp)
@@ -481,6 +482,7 @@ def _compute_kv_and_state(
                 + float(qkv_rank_width * max(0, geom.conv_kernel - 1)) * dt.conv
             )
             * stage_scale
+            / pcp_div
         )
     if counts.kda > 0:
         value_heads = max(1, (geom.linear_v_heads or geom.num_heads) // tp)
@@ -492,6 +494,7 @@ def _compute_kv_and_state(
             )
             * dt.state
             * stage_scale
+            / pcp_div
         )
     return kv_bytes, st_bytes
 

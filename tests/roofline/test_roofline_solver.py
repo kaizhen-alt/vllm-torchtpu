@@ -30,22 +30,35 @@ from tests.roofline.conftest import (
 )
 from vllm_torchtpu.roofline import (
     CHIPS,
+    TOPOLOGIES,
     Dtypes,
     FloorOptions,
     KvFitInput,
+    LaunchOptions,
     Parallel,
     ScenarioOverrides,
     SeqKvLayout,
     SolveOptions,
     SpecShape,
+    StepShape,
+    TrafficScenario,
     cli,
     dsa_indexer_layer_weight_elems,
+    dtypes_from_hf_config,
+    emit_launch_args,
+    explain_layout_rejection,
+    from_hf_config,
     hbm_breakdown_per_core_bytes,
     hbm_footprint_per_core_bytes,
+    point_launch_args,
+    scale_pp_stage_floor,
     solve_serving_plan,
 )
 from vllm_torchtpu.roofline.constants import DEFAULT_GPU_MEMORY_UTILIZATION, UNIT_GIGA
-from vllm_torchtpu.roofline.geometry import _from_hf_config_dry_run
+from vllm_torchtpu.roofline.geometry import (
+    UnsupportedArchitectureError,
+    _from_hf_config_dry_run,
+)
 from vllm_torchtpu.roofline.memory import (
     compute_w_attn,
     compute_w_ffn,
@@ -64,10 +77,12 @@ from vllm_torchtpu.roofline.solver import (
     _decode_capacity_profile,
     _find_prefill_options,
     _pareto_filter,
+    _prefill_stage_step_floor,
     _SolveContext,
     _valid_gdn_degree,
     _valid_head_tp,
     _valid_raiden_gdn_pair,
+    _valid_raiden_kv_pair,
 )
 
 QWEN35_CFG: dict[str, object] = {
@@ -547,9 +562,17 @@ def test_physical_kv_page_capacity_and_unpruned_regimes() -> None:
         SolveOptions(mode="disagg", max_chips=12),
     )
     assert all(p.concurrency == target_concurrency for p in disagg.frontier)
-    # spec_k=2 disallows PP>1 per pp_validation; spec_k=1 producer allows PP=8.
+    # Disagg prefill runs spec_k <= 1 so PP>1 is admitted even when decode spec_k=2;
+    # direct _candidate_prefill_parallels(..., spec_k=2) still rejects PP>1.
+    assert any(
+        p.prefill_pool is not None and p.prefill_pool.pp >= min_pp_stages
+        for p in disagg.candidates
+    )
     assert all(
-        p.prefill_pool is not None and p.prefill_pool.pp == 1 for p in disagg.candidates
+        p.pp == 1
+        for p in _candidate_prefill_parallels(
+            q35_geom, rf.TOPOLOGIES["2x2x1"], for_disagg=True, spec_k=2, chip=chip
+        )
     )
     disagg_k1 = rf.solve_serving_plan(
         q35_geom,
@@ -842,7 +865,7 @@ def test_runtime_legality_heads_pp_tp_pcp_ep_gdn_and_smem_cap() -> None:
 
     pre_pars = _candidate_prefill_parallels(uneven_geom, rf.TOPOLOGIES["2x2x1"])
     assert all(not (p.pp > 1 and p.tp > 1) for p in pre_pars)
-    assert all(not (p.pp > 1 and p.pcp > 1) for p in pre_pars)
+    assert any(p.pp > 1 and p.pcp > 1 for p in pre_pars)
     assert any(p.pp > 1 and p.tp == 1 and p.pcp == 1 for p in pre_pars)
 
     hybrid_8l = rf.from_hf_config(
@@ -866,7 +889,11 @@ def test_runtime_legality_heads_pp_tp_pcp_ep_gdn_and_smem_cap() -> None:
     disagg_pre = _candidate_prefill_parallels(
         hybrid_8l, rf.TOPOLOGIES["2x2x1"], for_disagg=True
     )
-    assert all(p.pp == 1 for p in disagg_pre)
+    hybrid_full_attn = 2
+    assert all(
+        not (p.pp > 1 and p.tp > 1) and p.pp <= hybrid_full_attn for p in disagg_pre
+    )
+    assert any(p.pp > 1 and p.pcp > 1 for p in disagg_pre)
     assert not _valid_gdn_degree(dc_replace(hybrid_8l, linear_v_heads=64), 6)
     assert not _valid_raiden_gdn_pair(
         hybrid_8l, rf.Parallel(tp=2, pcp=1), rf.Parallel(tp=8, pcp=1)
@@ -1591,10 +1618,18 @@ def test_pcp_rejected_when_spec_k_exceeds_one() -> None:
         geom, dt, chip, scen_k3, SolveOptions(mode="disagg", max_chips=16)
     )
     assert plan_k3.candidates
-    assert all(
-        (pt.prefill_pool is None or pt.prefill_pool.pcp == 1)
-        and pt.decode_pool.pcp == 1
+    assert all(pt.decode_pool.pcp == 1 for pt in plan_k3.candidates)
+    assert any(
+        pt.prefill_pool is not None and pt.prefill_pool.pcp > 1
         for pt in plan_k3.candidates
+    )
+    plan_mixed_k3 = rf.solve_serving_plan(
+        geom, dt, chip, scen_k3, SolveOptions(mode="mixed", max_chips=16)
+    )
+    assert plan_mixed_k3.candidates
+    assert all(
+        pt.prefill_pool is None and pt.decode_pool.pcp == 1
+        for pt in plan_mixed_k3.candidates
     )
 
     scen_k1 = dc_replace(scen_k3, accept_len=1.5, spec_tokens=1)
@@ -1997,3 +2032,404 @@ def test_disagg_dcn_and_pcie_offload_affect_ttft_on_cdk_fixtures() -> None:
     assert disagg_fast.recommended is not None
     assert disagg_slow_dcn.recommended is not None
     assert disagg_slow_dcn.recommended.est_ttft_ms > disagg_fast.recommended.est_ttft_ms
+
+
+def test_disagg_prefill_uses_min_one_spec_k_and_allows_pp_with_pcp() -> None:
+    """Verify disagg clamps prefill spec_k to 1, admits PPxPCP, and sets HND."""
+    cfg_path = Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    geom = from_hf_config(cfg)
+    dt = dtypes_from_hf_config(cfg)
+    chip = CHIPS["tpu7x"]
+    scen = TrafficScenario(
+        name="q35-disagg-spec3",
+        isl=4096,
+        osl=256,
+        prefix_hit_rate=0.5,
+        accept_len=1.5,
+        think_time_s=0.0,
+        concurrencies=(16,),
+        kv_working_set_turns=1.0,
+        spec_tokens=3,
+    )
+    max_disagg_chips = 32
+    plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen,
+        SolveOptions(mode="disagg", max_chips=max_disagg_chips),
+    )
+    assert plan.candidates
+    pre_axes = {
+        (p.prefill_pool.pp, p.prefill_pool.pcp, p.prefill_pool.tp)
+        for p in plan.candidates
+        if p.prefill_pool is not None
+    }
+    assert (8, 1, 1) in pre_axes
+    assert (4, 2, 1) in pre_axes
+    assert (1, 4, 2) in pre_axes
+
+    def _launched_spec(cli_args: list[str]) -> int:
+        """Read num_speculative_tokens from emitted --speculative-config JSON flag."""
+        idx = cli_args.index("--speculative-config") + 1
+        return int(json.loads(cli_args[idx])["num_speculative_tokens"])
+
+    def _find_candidate(
+        *,
+        pre_match: tuple[int, int, int] | None = None,
+        dec_match: tuple[int, int] | None = None,
+    ) -> rf.ParetoPoint:
+        """Return first disagg candidate matching prefill (pp,pcp,tp) or decode."""
+        for cand in plan.candidates:
+            if cand.prefill_pool is None:
+                continue
+            pre = (cand.prefill_pool.pp, cand.prefill_pool.pcp, cand.prefill_pool.tp)
+            dec = (cand.decode_pool.tp, cand.decode_pool.kv_split)
+            if (pre_match is None or pre == pre_match) and (
+                dec_match is None or dec == dec_match
+            ):
+                return cand
+        msg = f"Missing candidate pre={pre_match}, dec={dec_match}"
+        raise AssertionError(msg)
+
+    expected_pre_k = 1
+    expected_dec_k = 3
+    launch_opts = LaunchOptions(
+        kv_dtype="fp8",
+        gpu_memory_utilization=plan.gpu_memory_utilization,
+        model="Qwen/Qwen3.5-397B-A17B-FP8",
+        chip=chip,
+        model_id=plan.model_id,
+        spec_k=expected_dec_k,
+        spec_tokens=expected_dec_k,
+        mtp_layers=geom.mtp_layers,
+        is_hybrid=True,
+    )
+    for pre_key in ((8, 1, 1), (4, 2, 1), (1, 4, 2), (1, 1, 8)):
+        pt = _find_candidate(pre_match=pre_key)
+        launched = point_launch_args(pt, launch_opts)
+        assert _launched_spec(launched["prefill_cli_args"]) == expected_pre_k
+        assert _launched_spec(launched["cli_args"]) == expected_dec_k
+        if pre_key != (8, 1, 1):
+            assert "VLLM_KV_CACHE_LAYOUT=HND" in launched["commands"][0]
+
+    pt_dec_dcp = _find_candidate(dec_match=(8, 4))
+    launched_dcp = point_launch_args(pt_dec_dcp, launch_opts)
+    assert "VLLM_KV_CACHE_LAYOUT=HND" in launched_dcp["commands"][-1]
+
+
+def test_uniform_pp_stage_floor_prices_heterogeneous_layer_mix() -> None:
+    """Verify uniform PP layer counts preserve per-stage max floor scaling."""
+    fixtures_dir = Path(__file__).resolve().parent / "fixtures"
+    q35_cfg = json.loads((fixtures_dir / "qwen3_5_397b_fp8.json").read_text())
+    glm_cfg = json.loads((fixtures_dir / "glm_5_2_fp8.json").read_text())
+    base_chip = CHIPS["tpu7x"]
+    ms_per_s = 1000.0
+    unit_topo = rf.SliceTopology("s1x1x1", (1, 1, 1))
+    large_hbm_chip = dc_replace(base_chip, hbm_bytes=512 * 1024**3)
+
+    cases = (
+        (
+            q35_cfg,
+            Parallel(tp=1, pp=4, pcp=2),
+            (15, 15, 15, 15),
+            TOPOLOGIES["2x2x1"],
+            base_chip,
+        ),
+        (glm_cfg, Parallel(tp=1, pp=2, pcp=1), (39, 39), unit_topo, large_hbm_chip),
+    )
+    for cfg, target_par, exp_part, topo, case_chip in cases:
+        geom = from_hf_config(cfg)
+        dt = dtypes_from_hf_config(cfg)
+        scen = TrafficScenario(
+            name=f"pp-mix-{geom.model_id}",
+            isl=4096,
+            osl=256,
+            prefix_hit_rate=0.5,
+            accept_len=1.0,
+            think_time_s=0.0,
+            concurrencies=(16,),
+            kv_working_set_turns=1.0,
+        )
+        ctx = _SolveContext(
+            geom=geom,
+            dtypes=dt,
+            chip=case_chip,
+            scenario=scen,
+            mode="disagg",
+            max_chips=8,
+            max_instances=None,
+            gpu_memory_utilization=DEFAULT_GPU_MEMORY_UTILIZATION,
+            hbm_limit_b=case_chip.hbm_bytes * DEFAULT_GPU_MEMORY_UTILIZATION,
+            hbm_limit_gb=(case_chip.hbm_bytes * DEFAULT_GPU_MEMORY_UTILIZATION)
+            / UNIT_GIGA,
+            eff_al=1.0,
+            spec_k=0,
+            ctx_full=scen.isl + scen.osl,
+            ctx_mid=scen.isl + scen.osl // 2,
+            eff_isl=2048,
+            n_chunks=1,
+            page_size=default_rpa_page_size(
+                scen.isl + scen.osl, is_mla=geom.kv_lora_rank > 0
+            ),
+            c_max=16,
+        )
+        pre_opts, _ = _find_prefill_options(ctx, [topo])
+        pp_opts = [
+            opt
+            for opt in pre_opts
+            if opt.par.pp == target_par.pp
+            and opt.par.pcp == target_par.pcp
+            and opt.par.tp == target_par.tp
+        ]
+        assert pp_opts
+        assert all(opt.pp_part is None for opt in pp_opts)
+
+        shape = StepShape(
+            batch=0,
+            rows_per_seq=0,
+            context=0,
+            state_writes=0,
+            prefill_tokens=scen.isl,
+            prefix_hit_rate=scen.prefix_hit_rate,
+        )
+        exact_sf = scale_pp_stage_floor(
+            geom,
+            case_chip,
+            pp_opts[0].par,
+            (shape, FloorOptions(dt=dt, topology=topo)),
+            exp_part,
+        )
+        avg_sf = _prefill_stage_step_floor(
+            ctx, topo, pp_opts[0].par, scen.prefix_hit_rate, None
+        )
+        assert exact_sf.hard_floor_s != pytest.approx(avg_sf.hard_floor_s, rel=1e-6)
+        assert pp_opts[0].bound_ttft_ms == pytest.approx(
+            exact_sf.hard_floor_s * ms_per_s, rel=1e-9
+        )
+
+    # Full solve_serving_plan on qwen3_5 keeps PoolMeshPlan.pp_layer_partition as None.
+    q35_geom = from_hf_config(q35_cfg)
+    q35_dt = dtypes_from_hf_config(q35_cfg)
+    q35_scen = TrafficScenario(
+        name="pp4-uniform-check",
+        isl=4096,
+        osl=256,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(16,),
+        kv_working_set_turns=1.0,
+    )
+    plan = solve_serving_plan(
+        q35_geom, q35_dt, base_chip, q35_scen, SolveOptions(mode="disagg", max_chips=16)
+    )
+    target_pp = 4
+    matched = [
+        pt
+        for pt in plan.candidates
+        if pt.prefill_pool is not None and pt.prefill_pool.pp == target_pp
+    ]
+    assert matched
+    assert all(
+        pt.prefill_pool.pp_layer_partition is None
+        for pt in matched
+        if pt.prefill_pool is not None
+    )
+
+
+def test_glm_raiden_main_admits_tp_match_dcp_and_blocks_mismatched_pairs() -> None:
+    """Verify GLM-5.2 main profile enforces Raiden P/D rules vs hardware profile."""
+    cfg_path = Path(__file__).resolve().parent / "fixtures" / "glm_5_2_fp8.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    geom_main = from_hf_config(cfg)
+    geom_hw = from_hf_config(cfg, runtime_profile="hardware")
+    dt = dtypes_from_hf_config(cfg)
+    chip = CHIPS["tpu7x"]
+
+    assert _valid_raiden_kv_pair(
+        geom_main, Parallel(tp=16, kv_split=16), Parallel(tp=16, kv_split=16)
+    )
+    assert not _valid_raiden_kv_pair(
+        geom_main, Parallel(tp=16, kv_split=1), Parallel(tp=16, kv_split=16)
+    )
+    assert not _valid_raiden_kv_pair(
+        geom_main, Parallel(tp=16, kv_split=8), Parallel(tp=16, kv_split=8)
+    )
+    assert _valid_raiden_kv_pair(
+        geom_hw, Parallel(tp=16, kv_split=8), Parallel(tp=16, kv_split=8)
+    )
+
+    scen = TrafficScenario(
+        name="glm-raiden-dcp",
+        isl=8192,
+        osl=256,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(16,),
+        kv_working_set_turns=1.0,
+    )
+    opts = SolveOptions(mode="disagg", max_chips=16)
+    plan_main = solve_serving_plan(geom_main, dt, chip, scen, opts)
+    main_pairs = {
+        (
+            p.prefill_pool.tp,
+            p.prefill_pool.kv_split,
+            p.decode_pool.tp,
+            p.decode_pool.kv_split,
+        )
+        for p in plan_main.candidates
+        if p.prefill_pool is not None
+    }
+    assert (16, 16, 16, 16) in main_pairs
+    assert (16, 1, 16, 16) not in main_pairs
+    assert (16, 8, 16, 8) not in main_pairs
+
+    reason = explain_layout_rejection(
+        geom_main,
+        {
+            "prefill": {"tp": 16, "dp": 1, "pp": 1, "pcp": 1, "kv_split": 16},
+            "decode": {"tp": 16, "dp": 1, "pp": 1, "pcp": 1, "kv_split": 16},
+        },
+        [TOPOLOGIES["2x2x2"]],
+        opts,
+        chip=chip,
+    )
+    assert "DP1 and DCP1" not in reason
+
+    plan_hw = solve_serving_plan(geom_hw, dt, chip, scen, opts)
+    hw_pairs = {
+        (
+            p.prefill_pool.tp,
+            p.prefill_pool.kv_split,
+            p.decode_pool.tp,
+            p.decode_pool.kv_split,
+        )
+        for p in plan_hw.candidates
+        if p.prefill_pool is not None
+    }
+    assert (16, 8, 16, 8) in hw_pairs
+
+
+def test_qwen4_exp_main_vs_hardware_profile_and_fp4_kv_gate() -> None:
+    """Verify qwen4_exp bring-up limits on main vs unlocked hardware + fp4 KV."""
+    raw_path = (
+        Path(__file__).resolve().parent / "fixtures" / "qwen3_8_flash_next_fp8.json"
+    )
+    raw_cfg = json.loads(raw_path.read_text(encoding="utf-8"))
+    with pytest.raises(UnsupportedArchitectureError, match="ple_layer_ids"):
+        from_hf_config(raw_cfg)
+
+    bringup_cfg = load_qwen3_8_bringup_config()
+    geom_main = from_hf_config(bringup_cfg)
+    dt_main = dtypes_from_hf_config(bringup_cfg)
+    chip = CHIPS["tpu7x"]
+
+    over_ctx = TrafficScenario(
+        name="q38-over-ctx",
+        isl=2048,
+        osl=128,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(1,),
+        kv_working_set_turns=1.0,
+    )
+    plan_over = solve_serving_plan(
+        geom_main, dt_main, chip, over_ctx, SolveOptions(mode="mixed", max_chips=4)
+    )
+    assert plan_over.recommended is None
+    assert any("indexer_budget" in w for w in plan_over.warnings)
+
+    with_spec = TrafficScenario(
+        name="q38-spec3",
+        isl=512,
+        osl=128,
+        prefix_hit_rate=0.0,
+        accept_len=1.5,
+        think_time_s=0.0,
+        concurrencies=(1,),
+        kv_working_set_turns=1.0,
+        spec_tokens=3,
+    )
+    plan_spec = solve_serving_plan(
+        geom_main, dt_main, chip, with_spec, SolveOptions(mode="mixed", max_chips=4)
+    )
+    assert plan_spec.recommended is None
+    assert any("speculative" in w.lower() for w in plan_spec.warnings)
+
+    fp4_cfg = {
+        **raw_cfg,
+        "quantization_config": {
+            **dict(raw_cfg["quantization_config"]),
+            "kv_cache_scheme": "fp4",
+        },
+    }
+    with pytest.raises(ValueError, match="Unsupported 4-bit/FP4 KV"):
+        dtypes_from_hf_config(fp4_cfg)
+
+    fp4_dt = Dtypes(
+        w_dense=dt_main.w_dense,
+        w_expert=dt_main.w_expert,
+        kv=0.5,
+        kv_dtype="fp4",
+        w_dense_dtype=dt_main.w_dense_dtype,
+        w_expert_dtype=dt_main.w_expert_dtype,
+    )
+    short_scen = dc_replace(with_spec, spec_tokens=0, accept_len=1.0)
+    plan_fp4_blocked = solve_serving_plan(
+        geom_main, fp4_dt, chip, short_scen, SolveOptions(mode="mixed", max_chips=4)
+    )
+    assert plan_fp4_blocked.recommended is None
+    assert any("fp4" in w.lower() for w in plan_fp4_blocked.warnings)
+
+    # Explicit hardware profile unlocks full model, 100K ctx, MTP, PP8->TP8xDCP4, FP4.
+    geom_hw = from_hf_config(raw_cfg, runtime_profile="hardware")
+    assert geom_hw.runtime_profile == "hardware"
+    assert geom_hw.ple_layer_ids == (2,)
+    assert geom_hw.mtp_layers == 1
+    dt_hw_fp4 = dtypes_from_hf_config(fp4_cfg, runtime_profile="hardware")
+    expected_fp4_bytes = 0.5
+    assert dt_hw_fp4.kv == pytest.approx(expected_fp4_bytes)
+    assert dt_hw_fp4.kv_dtype == "fp4"
+
+    hw_scen = TrafficScenario(
+        name="q38-hw-100k",
+        isl=98304,
+        osl=4096,
+        prefix_hit_rate=0.5,
+        accept_len=1.5,
+        think_time_s=0.0,
+        concurrencies=(8,),
+        kv_working_set_turns=1.0,
+        spec_tokens=3,
+    )
+    plan_hw = solve_serving_plan(
+        geom_hw,
+        dt_hw_fp4,
+        chip,
+        hw_scen,
+        SolveOptions(mode="disagg", max_chips=16),
+    )
+    assert plan_hw.recommended is not None
+    assert plan_hw.runtime_profile == "hardware"
+    expected_prefill_pp = 8
+    expected_decode_tp = 8
+    expected_decode_dcp = 4
+    assert any(
+        p.prefill_pool is not None
+        and p.prefill_pool.pp == expected_prefill_pp
+        and p.decode_pool.tp == expected_decode_tp
+        and p.decode_pool.kv_split == expected_decode_dcp
+        for p in plan_hw.candidates
+    )
+    launched = emit_launch_args(
+        plan_hw, dtypes=dt_hw_fp4, model="Qwen/Qwen3.8-Flash-Next-FP8"
+    )
+    assert "--hf-overrides" not in launched["cli_args"]
+    assert "--hf-overrides" not in launched["prefill_cli_args"]
+    assert "--kv-cache-dtype" in launched["cli_args"]
+    kv_idx = launched["cli_args"].index("--kv-cache-dtype") + 1
+    assert launched["cli_args"][kv_idx] == "fp4"

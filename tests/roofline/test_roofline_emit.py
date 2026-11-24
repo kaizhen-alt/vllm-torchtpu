@@ -827,14 +827,20 @@ def test_emit_speculative_config_for_mtp_scenario_and_omit_when_zero() -> None:
     )
     assert "--speculative-config" not in out_plain["cli_args"]
 
-    # Disaggregated MTP with spec_k=3 must not emit PCP > 1 prefill pools.
+    # Disaggregated MTP clamps prefill spec_k=1 (allowing PCP > 1) and decode=3.
     disagg_spec = solve_serving_plan(
         geom, dt, CHIPS["tpu7x"], spec_scen, SolveOptions(mode="disagg", max_chips=16)
     )
     out_disagg = emit_launch_args(
         disagg_spec, dtypes=dt, model="Qwen/Qwen3.5-397B-A17B-FP8"
     )
-    assert "--prefill-context-parallel-size" not in out_disagg["prefill_cli_args"]
+    assert "--prefill-context-parallel-size" not in out_disagg["cli_args"]
+    p_cli = out_disagg["prefill_cli_args"]
+    d_cli = out_disagg["cli_args"]
+    prefill_spec = json.loads(p_cli[p_cli.index("--speculative-config") + 1])
+    decode_spec = json.loads(d_cli[d_cli.index("--speculative-config") + 1])
+    assert prefill_spec == {"method": "mtp", "num_speculative_tokens": 1}
+    assert decode_spec == {"method": "mtp", "num_speculative_tokens": expected_spec_k}
 
 
 def test_top_layouts_distinct_and_led_by_recommended() -> None:

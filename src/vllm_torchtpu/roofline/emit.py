@@ -33,7 +33,9 @@ from .constants import (
     DEFAULT_CORES_PER_CHIP,
     DEFAULT_HBM_RESERVE_GB,
     DEFAULT_PCP_KV_INTERLEAVE_SIZE,
+    DEFAULT_RUNTIME_PROFILE,
     DEFAULT_TOP_K,
+    FP4_BYTES,
     FRONTIER_2D_TIE_TOLERANCE,
     KV_DTYPE_BYTES,
     MIN_TOP_LAYOUTS_FOR_BOUND_BEST,
@@ -47,6 +49,9 @@ from .constants import (
     UNIT_GIBI,
     UNIT_GIGA,
     UNIT_MICRO,
+    canonicalize_kv_dtype,
+    disagg_prefill_spec_k,
+    resolve_model_profile,
 )
 from .families import (
     attach_reference_report,
@@ -155,6 +160,7 @@ class LaunchOptions:
     hbm_reserve_gb: float = DEFAULT_HBM_RESERVE_GB
     topologies: Mapping[str, SliceTopology] | None = None
     is_hybrid: bool = False
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE
 
 
 class _PointLaunchKwargs(TypedDict, total=False):
@@ -171,6 +177,17 @@ class _PointLaunchKwargs(TypedDict, total=False):
     hbm_reserve_gb: float
     topologies: Mapping[str, SliceTopology] | None
     is_hybrid: bool
+    runtime_profile: str
+
+
+class _PoolCliKwargs(TypedDict, total=False):
+    """Keyword-argument options accepted by ``pool_cli_args``."""
+
+    kv_dtype: str
+    gpu_memory_utilization: float | None
+    model_id: str
+    spec_k: int
+    runtime_profile: str
 
 
 class _BuildSolvePayloadOpts(TypedDict, total=False):
@@ -230,17 +247,18 @@ def _append_pool_runtime_flags(
     pool: PoolMeshPlan,
     *,
     gpu_memory_utilization: float | None,
-    model_id: str,
+    model_meta: tuple[str, str],
     spec_k: int,
 ) -> None:
     """Append memory, override, speculative, and disagg transfer flags."""
+    model_id, runtime_profile = model_meta
     if pool.max_model_len is not None:
         args.extend(["--max-model-len", str(pool.max_model_len)])
     if pool.max_num_seqs is not None:
         args.extend(["--max-num-seqs", str(pool.max_num_seqs)])
     if gpu_memory_utilization is not None:
         args.extend(["--gpu-memory-utilization", f"{gpu_memory_utilization:g}"])
-    if model_id == "qwen4_exp":
+    if resolve_model_profile(model_id, runtime_profile).parallel.force_ple_disabled:
         args.extend(["--hf-overrides", _QWEN4_BRINGUP_OVERRIDES])
     if spec_k > 0:
         spec_json = json.dumps({"method": "mtp", "num_speculative_tokens": spec_k})
@@ -252,13 +270,14 @@ def _append_pool_runtime_flags(
 
 def pool_cli_args(
     pool: PoolMeshPlan,
-    *,
-    kv_dtype: str = "auto",
-    gpu_memory_utilization: float | None = None,
-    model_id: str = "",
-    spec_k: int = 0,
+    **kwargs: Unpack[_PoolCliKwargs],
 ) -> list[str]:
     """Translate one ``PoolMeshPlan`` into ``vllm serve`` CLI flags."""
+    kv_dtype = kwargs.get("kv_dtype", "auto")
+    gpu_memory_utilization = kwargs.get("gpu_memory_utilization")
+    model_id = kwargs.get("model_id", "")
+    spec_k = kwargs.get("spec_k", 0)
+    runtime_profile = kwargs.get("runtime_profile", DEFAULT_RUNTIME_PROFILE)
     args = [
         "--tensor-parallel-size",
         str(pool.tp),
@@ -292,7 +311,7 @@ def pool_cli_args(
         args,
         pool,
         gpu_memory_utilization=gpu_memory_utilization,
-        model_id=model_id,
+        model_meta=(model_id, runtime_profile),
         spec_k=spec_k,
     )
     return args
@@ -310,19 +329,31 @@ def _env_prefix(
     *,
     model_id: str = "",
     is_hybrid: bool = False,
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
 ) -> str:
     """Return validated runtime environment variable prefix for ``pool``."""
+    rules = resolve_model_profile(model_id, runtime_profile).parallel
     env_parts: list[str] = []
     if pool.moe_dispatch == "a2a_push":
         env_parts.append("USE_MOE_FUSED_EP_KERNEL=1")
     elif pool.moe_dispatch == "fused_rs":
-        if model_id != "qwen3_5_moe" or pool.pp != 1:
+        if not rules.allows_fused_rs or pool.pp != 1:
             msg = (
-                "TPU_MOE_SEQUENCE_PARALLEL=1 is supported only for qwen3_5_moe "
-                f"with pp == 1; got model_id={model_id!r}, pp={pool.pp}."
+                "TPU_MOE_SEQUENCE_PARALLEL=1 is supported only when fused_rs is "
+                f"enabled with pp == 1; got model_id={model_id!r}, pp={pool.pp}."
             )
             raise ValueError(msg)
         env_parts.append("TPU_MOE_SEQUENCE_PARALLEL=1 USE_MOE_FUSED_EP_KERNEL=1")
+    if (
+        rules.raiden_pair_rule == "qwen_gdn"
+        and pool.role in {"prefill", "decode"}
+        and (
+            (pool.dp == 1 and pool.pp == 1 and pool.tp > 1)
+            or (pool.pp > 1 and pool.pcp > 1)
+            or pool.kv_split > 1
+        )
+    ):
+        env_parts.append("VLLM_KV_CACHE_LAYOUT=HND")
     if pool.pp_layer_partition is not None and len(set(pool.pp_layer_partition)) > 1:
         part_str = ",".join(str(x) for x in pool.pp_layer_partition)
         env_parts.append(f"VLLM_PP_LAYER_PARTITION={part_str}")
@@ -431,11 +462,16 @@ def _format_pool_commands(
     model: str | None,
     *,
     chip: ChipSpec | None = None,
-    model_meta: tuple[str, bool] = ("", False),
+    model_meta: tuple[str, bool, str] = ("", False, DEFAULT_RUNTIME_PROFILE),
 ) -> list[str]:
     """Render single-host or per-host Mode A/B launch commands for one pool."""
-    model_id, is_hybrid = model_meta
-    prefix = _env_prefix(pool, model_id=model_id, is_hybrid=is_hybrid)
+    model_id, is_hybrid, runtime_profile = model_meta
+    prefix = _env_prefix(
+        pool,
+        model_id=model_id,
+        is_hybrid=is_hybrid,
+        runtime_profile=runtime_profile,
+    )
     host_args = _multihost_host_arg_lists(pool, base_args, chip)
     is_disagg = pool.role in ("prefill", "decode")
     is_multihost = len(host_args) > 1
@@ -646,14 +682,18 @@ def point_launch_args(
     spec_tokens = kwargs.get("spec_tokens", base.spec_tokens)
     mtp_layers = kwargs.get("mtp_layers", base.mtp_layers)
     is_hybrid = kwargs.get("is_hybrid", base.is_hybrid)
+    runtime_profile = kwargs.get("runtime_profile", base.runtime_profile)
     raw_spec = spec_tokens if spec_tokens > 0 else spec_k
     eff_spec = 0 if (mtp_layers is not None and mtp_layers <= 0) else raw_spec
+    rules = resolve_model_profile(model_id, runtime_profile).parallel
+    prefill_spec = disagg_prefill_spec_k(eff_spec, rules)
     decode_args = pool_cli_args(
         pt.decode_pool,
         kv_dtype=kv_dtype,
         gpu_memory_utilization=gpu_memory_utilization,
         model_id=model_id,
         spec_k=eff_spec,
+        runtime_profile=runtime_profile,
     )
     prefill_args = (
         pool_cli_args(
@@ -661,7 +701,8 @@ def point_launch_args(
             kv_dtype=kv_dtype,
             gpu_memory_utilization=gpu_memory_utilization,
             model_id=model_id,
-            spec_k=eff_spec,
+            spec_k=prefill_spec,
+            runtime_profile=runtime_profile,
         )
         if pt.prefill_pool is not None
         else []
@@ -674,7 +715,7 @@ def point_launch_args(
                 prefill_args,
                 model,
                 chip=chip,
-                model_meta=(model_id, is_hybrid),
+                model_meta=(model_id, is_hybrid, runtime_profile),
             )
         )
     commands.extend(
@@ -683,7 +724,7 @@ def point_launch_args(
             decode_args,
             model,
             chip=chip,
-            model_meta=(model_id, is_hybrid),
+            model_meta=(model_id, is_hybrid, runtime_profile),
         )
     )
     return {
@@ -702,6 +743,17 @@ def _plan_dict(plan: ServingPlan) -> dict[str, object]:
     return data
 
 
+def _resolve_emit_kv_dtype(dtypes: Dtypes | None) -> str:
+    """Resolve ``--kv-cache-dtype`` CLI flag string from ``Dtypes``."""
+    if dtypes is None:
+        return "auto"
+    if canonicalize_kv_dtype(dtypes.kv_dtype) == "fp4" or dtypes.kv <= FP4_BYTES:
+        return "fp4"
+    if dtypes.kv <= KV_DTYPE_BYTES["fp8"]:
+        return "fp8"
+    return "auto"
+
+
 def emit_launch_args(
     plan: ServingPlan,
     *,
@@ -711,9 +763,7 @@ def emit_launch_args(
     topologies: Mapping[str, SliceTopology] | None = None,
 ) -> LaunchPayload:
     """Emit ``vllm serve`` CLI flags and commands for the top-ranked L1 candidate."""
-    kv_str = (
-        "fp8" if (dtypes is not None and dtypes.kv <= KV_DTYPE_BYTES["fp8"]) else "auto"
-    )
+    kv_str = _resolve_emit_kv_dtype(dtypes)
     eff_chip = chip if chip is not None else CHIPS.get(plan.chip)
     warnings = list(plan.warnings)
     rec = plan.recommended
@@ -753,6 +803,7 @@ def emit_launch_args(
             hbm_reserve_gb=plan.hbm_reserve_gb,
             topologies=topologies,
             is_hybrid=plan.is_hybrid,
+            runtime_profile=plan.runtime_profile,
         ),
     )
     if rec.prefill_pool is not None:
@@ -953,9 +1004,7 @@ def build_solve_payload(
     model = opts.get("model")
     top_k = opts.get("top_k", DEFAULT_TOP_K)
     topologies = opts.get("topologies")
-    kv_str = (
-        "fp8" if (dtypes is not None and dtypes.kv <= KV_DTYPE_BYTES["fp8"]) else "auto"
-    )
+    kv_str = _resolve_emit_kv_dtype(dtypes)
     top_pts = top_layouts(plan, top_k)
     eff_spec = (
         plan.spec_tokens
@@ -979,6 +1028,7 @@ def build_solve_payload(
         hbm_reserve_gb=plan.hbm_reserve_gb,
         topologies=topo_map,
         is_hybrid=plan.is_hybrid,
+        runtime_profile=plan.runtime_profile,
     )
     top_entries: list[TopKEntry] = [
         {

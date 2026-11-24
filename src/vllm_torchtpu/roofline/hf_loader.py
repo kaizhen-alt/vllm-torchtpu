@@ -30,9 +30,11 @@ from .constants import (
     BENIGN_HF_METADATA_KEYS,
     DEFAULT_HTTP_PORT,
     DEFAULT_HTTPS_PORT,
+    DEFAULT_RUNTIME_PROFILE,
     DEFAULT_SSM_STATE_BYTES,
     EIGHT_BITS,
     FOUR_BITS,
+    FP4_BYTES,
     FP8_BLOCK_SCALE_BYTES,
     FP8_BYTES,
     HTTP_OK,
@@ -42,8 +44,12 @@ from .constants import (
     NVFP4_BYTES,
     SIXTEEN_BITS,
     SUPPORTED_MODEL_TYPES,
+    SUPPORTED_MODELS,
     WEIGHT_BLOCK_DIM_LEN,
     WEIGHT_ONLY_QUANT_METHODS,
+    ModelSpec,
+    canonicalize_kv_dtype,
+    resolve_runtime_profile,
 )
 from .geometry import (
     KeyTracker,
@@ -812,20 +818,41 @@ def _fp8_block_bytes(qcfg: Mapping[str, object], qp: _QuantParams) -> float:
     return FP8_BYTES
 
 
+def _spec_for_model_type(model_type: str) -> ModelSpec | None:
+    """Return the registered ``ModelSpec`` matching ``model_type``, if any."""
+    if not model_type:
+        return None
+    for spec in SUPPORTED_MODELS.values():
+        if model_type in spec.model_types:
+            return spec
+    return None
+
+
+def _is_fp4_kv_token(raw_tok: str) -> bool:
+    """Return whether ``raw_tok`` identifies a 4-bit or FP4 KV cache scheme."""
+    norm = raw_tok.strip().lower()
+    if norm == "int4_per_token_head":
+        return False
+    return canonicalize_kv_dtype(norm) == "fp4" or any(
+        tok in norm for tok in ("fp4", "nvfp4", "mxfp4", "int4")
+    )
+
+
 def _parse_mapping_kv_scheme(
     raw_kv: Mapping[str, object],
     base_b: float,
     base_name: str,
+    *,
+    allow_fp4: bool = False,
 ) -> tuple[float, str, bool]:
-    """Parse a Mapping kv_cache_scheme entry and fail closed on 4-bit/FP4 KV."""
+    """Parse a Mapping kv_cache_scheme entry and enforce 4-bit/FP4 admission."""
     kv_type = str(
         raw_kv.get("type") or raw_kv.get("dtype") or raw_kv.get("quant_algo") or ""
     ).lower()
     kv_bits = _to_int(raw_kv.get("num_bits", 0))
-    if (
-        any(tok in kv_type for tok in ("fp4", "nvfp4", "mxfp4", "int4"))
-        or kv_bits == FOUR_BITS
-    ):
+    if _is_fp4_kv_token(kv_type) or kv_bits == FOUR_BITS:
+        if allow_fp4:
+            return (FP4_BYTES, "fp4", True)
         msg = f"Unsupported 4-bit/FP4 KV cache scheme: {dict(raw_kv)!r}"
         raise ValueError(msg)
     if "int8" in kv_type:
@@ -848,8 +875,10 @@ def _parse_kv_cache_scheme(
     qcfg: Mapping[str, object],
     base_b: float,
     base_name: str,
+    *,
+    allow_fp4: bool = False,
 ) -> tuple[float, str, bool]:
-    """Parse kv_cache_scheme / kv_cache_dtype, failing closed on 4-bit/FP4 KV."""
+    """Parse kv_cache_scheme / kv_cache_dtype, enforcing 4-bit/FP4 admission."""
     raw_kv = (
         qcfg.get("kv_cache_scheme")
         or qcfg.get("kv_cache_dtype")
@@ -858,10 +887,12 @@ def _parse_kv_cache_scheme(
     if raw_kv is None or raw_kv == "":
         return (base_b, base_name, False)
     if isinstance(raw_kv, Mapping):
-        return _parse_mapping_kv_scheme(raw_kv, base_b, base_name)
+        return _parse_mapping_kv_scheme(raw_kv, base_b, base_name, allow_fp4=allow_fp4)
 
     kv_scheme = str(raw_kv).lower()
-    if any(tok in kv_scheme for tok in ("fp4", "nvfp4", "mxfp4", "int4")):
+    if _is_fp4_kv_token(kv_scheme):
+        if allow_fp4:
+            return (FP4_BYTES, "fp4", True)
         msg = f"Unsupported 4-bit/FP4 KV cache scheme: {raw_kv!r}"
         raise ValueError(msg)
     if "fp8" in kv_scheme or "8" in kv_scheme:
@@ -871,10 +902,17 @@ def _parse_kv_cache_scheme(
     return (base_b, kv_scheme, True)
 
 
-def dtypes_from_hf_config(cfg: Mapping[str, object]) -> Dtypes:
+def dtypes_from_hf_config(
+    cfg: Mapping[str, object],
+    *,
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
+) -> Dtypes:
     """Derive Dtypes from torch_dtype, quantization_config, and ignored module lists."""
     tc = _as_mapping(cfg.get("text_config")) or cfg
     scopes = (tc, cfg) if tc is not cfg else (tc,)
+    raw_mt = str(_first_non_none(scopes, "model_type") or "").strip().lower()
+    profile = resolve_runtime_profile(_spec_for_model_type(raw_mt), runtime_profile)
+    allow_fp4 = "fp4" in profile.kv_dtypes
     qcfg = _as_mapping(_first_non_none(scopes, "quantization_config"))
     nested_q = _as_mapping(qcfg.get("quantization"))
     if nested_q and not qcfg.get("quant_method") and not qcfg.get("quant_algo"):
@@ -920,7 +958,9 @@ def dtypes_from_hf_config(cfg: Mapping[str, object]) -> Dtypes:
         attn_ignored=attn_ignored,
     )
 
-    kv_b, kv_dt, kv_explicit = _parse_kv_cache_scheme(qcfg, base_b, base_name)
+    kv_b, kv_dt, kv_explicit = _parse_kv_cache_scheme(
+        qcfg, base_b, base_name, allow_fp4=allow_fp4
+    )
 
     quant_conv = bool(qcfg.get("quantize_conv", False))
     conv_b = w_dense if quant_conv else base_b
@@ -1037,6 +1077,7 @@ def _run_tracked_extraction(
     *,
     dry_run: bool = False,
     model_ref: str | None = None,
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
 ) -> tuple[
     ModelGeometry,
     Dtypes,
@@ -1049,9 +1090,11 @@ def _run_tracked_extraction(
     geom = (
         _from_hf_config_dry_run(tracker)
         if dry_run
-        else from_hf_config(tracker, model_ref=model_ref)
+        else from_hf_config(
+            tracker, model_ref=model_ref, runtime_profile=runtime_profile
+        )
     )
-    dtypes = dtypes_from_hf_config(tracker)
+    dtypes = dtypes_from_hf_config(tracker, runtime_profile=runtime_profile)
     counts = count_layer_types(geom)
     params = param_counts(geom)
     unmapped = _collect_unmapped_structural_keys(raw_cfg, tracker.consumed_keys)
@@ -1123,12 +1166,14 @@ def _finalize_tracked_audit(
     model_type: str,
     ignored_non_text: tuple[str, ...],
     model_ref: str | None,
+    *,
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
 ) -> ConfigAudit:
     """Run tracked extraction and require zero unmapped keys for tier0_ready."""
     model_type_status = _resolve_model_type_status(model_type)
     try:
         geom, dtypes, counts, params, unmapped = _run_tracked_extraction(
-            raw_cfg, model_ref=model_ref
+            raw_cfg, model_ref=model_ref, runtime_profile=runtime_profile
         )
     except UnsupportedArchitectureError as exc:
         return _blocked_audit(
@@ -1182,9 +1227,18 @@ def audit_hf_config(
     cfg: Mapping[str, object],
     *,
     model_ref: str | None = None,
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
 ) -> ConfigAudit:
     """Audit HF config onboarding readiness, key coverage, and parameter counts."""
     raw_cfg, model_type, ignored_non_text = _extract_audit_scope(cfg)
+    try:
+        resolve_model_identity(
+            raw_cfg, model_ref=model_ref, runtime_profile=runtime_profile
+        )
+    except UnsupportedArchitectureError as gate_exc:
+        return _dry_run_blocked_audit(
+            raw_cfg, model_type, ignored_non_text, str(gate_exc)
+        )
     try:
         _validate_structural_support(raw_cfg)
     except UnsupportedArchitectureError as exc:
@@ -1200,10 +1254,10 @@ def audit_hf_config(
             _resolve_model_type_status(model_type),
             ((), ignored_non_text, tuple(reasons)),
         )
-    try:
-        resolve_model_identity(raw_cfg, model_ref=model_ref)
-    except UnsupportedArchitectureError as gate_exc:
-        return _dry_run_blocked_audit(
-            raw_cfg, model_type, ignored_non_text, str(gate_exc)
-        )
-    return _finalize_tracked_audit(raw_cfg, model_type, ignored_non_text, model_ref)
+    return _finalize_tracked_audit(
+        raw_cfg,
+        model_type,
+        ignored_non_text,
+        model_ref,
+        runtime_profile=runtime_profile,
+    )

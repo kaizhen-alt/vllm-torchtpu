@@ -154,6 +154,47 @@ def submesh_for_group(
     return (submesh_axes[0], submesh_axes[1], submesh_axes[2], submesh_axes[3])
 
 
+def outer_submesh_for_group(
+    group: int,
+    inner_group: int,
+    topology: SliceTopology | None,
+    ranks_per_chip: int | None = None,
+) -> tuple[int, int, int, int]:
+    """Pack `group` outer ranks across `(d2d, x, y, z)` after `inner_group` ranks."""
+    eff_ranks = ranks_per_chip if ranks_per_chip is not None else DEFAULT_CORES_PER_CHIP
+    if group <= 1:
+        return (1, 1, 1, 1)
+    eff_inner = max(1, inner_group)
+    if topology is not None:
+        bounds = (topology.cores_per_chip, *topology.chip_axes)
+    else:
+        intra_chip_degree = math.gcd(eff_inner * group, eff_ranks)
+        bounds = (
+            intra_chip_degree,
+            (eff_inner * group) // max(1, intra_chip_degree),
+            1,
+            1,
+        )
+    rem_inner = eff_inner
+    rem_outer = group
+    out_axes: list[int] = []
+    for axis_limit in bounds:
+        avail = max(1, axis_limit)
+        skip = math.gcd(rem_inner, avail)
+        rem_inner //= skip
+        free_on_axis = avail // skip
+        take = math.gcd(rem_outer, free_on_axis)
+        out_axes.append(take)
+        rem_outer //= take
+    if rem_inner > 1 or rem_outer > 1:
+        msg = (
+            f"Collective outer group {group} after inner_group={inner_group} "
+            f"cannot pack within bounds {bounds}"
+        )
+        raise ValueError(msg)
+    return (out_axes[0], out_axes[1], out_axes[2], out_axes[3])
+
+
 def collective_ici_hops(
     collective: Collective,
     topology: SliceTopology | None = None,
