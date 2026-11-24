@@ -1095,3 +1095,47 @@ def test_ple_table_finalize_weights_chunks_large_table(
         assert table._weight_chunks is not None
         assert len(table._weight_chunks) > 1
         torch.testing.assert_close(table.local_rows(ids), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+def test_ple_table_finalize_weights_lane_packs_160_to_640(
+    monkeypatch, fp8: bool
+) -> None:
+    """embedding_dim=160 packs 4 rows into 640-wide (128-lane-aligned) chunks."""
+    from vllm.models.qwen4_exp.common.ngram_embedding import (
+        Qwen4ExpPLEEmbeddingMethod,
+    )
+
+    from vllm_torchtpu.models.qwen4_exp.ple import Qwen4ExpPLETable
+
+    _set_tp(monkeypatch, 0, 1)
+    quant_config = (
+        VllmFp8Config.from_config(
+            {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": [128, 128],
+            }
+        )
+        if fp8
+        else None
+    )
+    torch.manual_seed(1)
+    method = Qwen4ExpPLEEmbeddingMethod.from_quant_config(quant_config, "ple", None)
+    # 13 rows is not divisible by 4, exercising tail padding on the last chunk.
+    table = Qwen4ExpPLETable(
+        13, 160, embedding_method=method, padding_size=1, prefix="ple"
+    )
+    with torch.no_grad():
+        raw = torch.randn(table.weight.shape)
+        table.weight.copy_(raw.to(table.weight.dtype))
+        if fp8:
+            table.weight_scale.fill_(0.25)
+    ids = torch.arange(13).unsqueeze(0)
+    expected = table.local_rows(ids)
+
+    table.finalize_weights(max_elements=160 * 9)  # 8-row aligned chunk + 5-row tail
+    assert table.weight is None
+    assert table._weight_chunks is not None
+    assert [c.shape for c in table._weight_chunks] == [(2, 640), (2, 640)]
+    torch.testing.assert_close(table.local_rows(ids), expected, rtol=0, atol=0)

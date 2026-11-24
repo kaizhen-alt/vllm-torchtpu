@@ -83,6 +83,31 @@ def test_round_trip_is_bit_exact(pool_dtype) -> None:
 
 
 @_POOL_DTYPES
+def test_single_page_block_round_trip_preserves_special_bits(pool_dtype) -> None:
+    """pages_per_block=1 preserves -0.0, subnormals, +/-Inf, and negative int32."""
+    pool = jnp.zeros((6, 48, 1, 4, 128), dtype=pool_dtype)
+    blocks = jnp.asarray([2, 4], jnp.int32)
+    # Cover normal values, -0.0 (0x8000), subnormal (0x0001), +/-Inf, and -1.
+    rng = np.random.default_rng(2)
+    base = jnp.asarray(rng.standard_normal((2, *_WINDOW)), jnp.bfloat16)
+    bits = np.asarray(base.view(jnp.uint16)).copy()
+    bits[0, 0, :5] = np.array([0x0000, 0x8000, 0x0001, 0x7F80, 0xFF80], dtype=np.uint16)
+    window = jnp.asarray(bits).view(jnp.bfloat16)
+    context = jnp.asarray([[-1, 0x7FFFFFFF], [42, -12345]], jnp.int32)
+    new_pool = _write_states(pool, blocks, window, context, pages_per_block=1)
+    got_window, got_context = _read_states(
+        new_pool,
+        blocks,
+        pages_per_block=1,
+        window_shape=_WINDOW,
+        window_dtype=jnp.bfloat16,
+        context_len=2,
+    )
+    np.testing.assert_array_equal(np.asarray(got_window.view(jnp.uint16)), bits)
+    np.testing.assert_array_equal(np.asarray(got_context), np.asarray(context))
+
+
+@_POOL_DTYPES
 def test_write_touches_only_the_given_blocks(pool_dtype) -> None:
     pool = _random_pool(pool_dtype)
     new_pool, *_ = _write_three_states(pool)
