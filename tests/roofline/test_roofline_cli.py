@@ -22,18 +22,35 @@ from pathlib import Path
 
 import pytest
 
-from tests.roofline.conftest import SMALL_HYBRID_MOE_CFG
+from tests.roofline.conftest import (
+    SMALL_HYBRID_MOE_CFG,
+    load_qwen3_8_bringup_config,
+)
 from vllm_torchtpu.roofline import (
     CHIPS,
     Dtypes,
     Parallel,
     ServingRequest,
+    SolveOptions,
+    TrafficScenario,
+    UnsupportedArchitectureError,
     cli,
     from_hf_config,
+    kv_cli_dtype_str,
+    load_hf_config_with_identity,
     plan,
+    solve_serving_plan,
+    supports,
+    top_layouts,
 )
-from vllm_torchtpu.roofline.cli import _has_quantization_config, _parse_serve_cmd
+from vllm_torchtpu.roofline.cli import (
+    _has_quantization_config,
+    _parse_serve_cmd,
+    _render_solve_ascii_table,
+    _SolveRenderContext,
+)
 from vllm_torchtpu.roofline.constants import FP4_BYTES, UNIT_GIBI
+from vllm_torchtpu.roofline.families import reference_layout_report
 
 QWEN35_CFG: dict[str, object] = {
     "model_type": "qwen3_5_moe",
@@ -1626,3 +1643,121 @@ def test_cli_omitted_think_time_uses_none_open_loop_without_error(
     cmd_payload = json.loads(capsys.readouterr().out)
     assert cmd_payload["scenario"]["think_time_s"] is None
     assert cmd_payload["frontier"]
+
+
+def test_cli_reference_layout_prints_ruled_out_not_unenumerated(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Print 'enumerated, ruled out by SLO' when ref_report is ruled_out."""
+    q35_path = Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+    cfg_path = tmp_path / "small_hybrid.json"
+    cfg_path.write_text(json.dumps(SMALL_HYBRID_MOE_CFG), encoding="utf-8")
+
+    # Partial SLO miss: TP2 x DP4 x EP8 ruled out while frontier stays non-empty.
+    rc = cli.main(
+        [
+            "solve",
+            "--config",
+            str(q35_path),
+            "--isl",
+            "8192",
+            "--osl",
+            "1024",
+            "--prefix-hit-rate",
+            "0.5",
+            "--accept-len",
+            "1.0",
+            "--concurrency",
+            "32",
+            "--tpot-slo-ms",
+            "1.0",
+            "--max-chips",
+            "16",
+            "--max-instances",
+            "1",
+            "--mode",
+            "mixed",
+            "--reference-layout",
+            "TP2 x DP4 x EP8",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "enumerated, ruled out by SLO" in out
+    assert "not enumerated" not in out
+
+    # All-ruled-out frontier: found=True and ruled_out=True must still print ruled out.
+    geom = from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt = Dtypes()
+    chip = CHIPS["tpu7x"]
+    scen = TrafficScenario(
+        name="ruled-out-ascii",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(8,),
+        ttft_slo_ms=0.01,
+        tpot_slo_ms=0.01,
+        kv_working_set_turns=1.0,
+    )
+    splan = solve_serving_plan(
+        geom, dt, chip, scen, SolveOptions(mode="mixed", max_chips=4)
+    )
+    assert splan.candidates
+    ref = reference_layout_report(
+        splan, top_layouts(splan, 5), "TP1 x DP8 x EP8", "not enumerated"
+    )
+    assert ref["found"] is True
+    assert ref["ruled_out"] is True
+    rctx = _SolveRenderContext(
+        src=str(cfg_path),
+        chip=chip,
+        dtypes=dt,
+        topologies=cli.topologies_for_chip(chip),
+    )
+    _render_solve_ascii_table(splan, 5, rctx, ref_report=ref)
+    ascii_out = capsys.readouterr().out
+    assert "enumerated, ruled out by SLO" in ascii_out
+    assert "not enumerated" not in ascii_out
+
+
+def test_geometry_supports_and_loader_accept_hardware_runtime_profile(
+    tmp_path: Path,
+) -> None:
+    """Thread runtime_profile cleanly through supports, loader, and kv_cli_dtype_str."""
+    q38_path = Path(__file__).resolve().parent / "fixtures" / "qwen3_8_flash_fp8.json"
+    if not q38_path.exists():
+        q38_path = tmp_path / "qwen3_8.json"
+        raw_cfg = load_qwen3_8_bringup_config()
+        raw_cfg["text_config"]["ple_layer_ids"] = [2]
+        q38_path.write_text(json.dumps(raw_cfg), encoding="utf-8")
+    else:
+        raw_cfg = json.loads(q38_path.read_text(encoding="utf-8"))
+
+    with pytest.raises(UnsupportedArchitectureError, match="ple_layer_ids"):
+        supports(
+            raw_cfg,
+            model_ref="Qwen/Qwen3.8-Flash-Next-FP8",
+            runtime_profile="main",
+        )
+    supports(
+        raw_cfg,
+        model_ref="Qwen/Qwen3.8-Flash-Next-FP8",
+        runtime_profile="hardware",
+    )
+
+    cfg, identity = load_hf_config_with_identity(
+        str(q38_path),
+        runtime_profile="hardware",
+    )
+    assert identity.canonical_id == "qwen4_exp"
+    assert isinstance(cfg, Mapping)
+    assert kv_cli_dtype_str(Dtypes(kv=2.0), default_bf16="bfloat16") == "bfloat16"
+    assert kv_cli_dtype_str(Dtypes(kv=1.0), default_bf16="bfloat16") == "fp8"
+    assert (
+        kv_cli_dtype_str(Dtypes(kv=FP4_BYTES, kv_dtype="fp4"), default_bf16="bfloat16")
+        == "fp4"
+    )

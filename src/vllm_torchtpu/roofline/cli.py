@@ -53,7 +53,6 @@ from .constants import (
     MIN_INSTANCES,
     MIN_TOP_K,
     STATE_DTYPE_BYTES,
-    SUPPORTED_MODELS,
     UNIT_GIBI,
     UNIT_GIGA,
     UNIT_KILO,
@@ -62,6 +61,7 @@ from .constants import (
     WEIGHT_DTYPE_BYTES,
     canonicalize_kv_dtype,
     resolve_runtime_profile,
+    spec_for_model_type,
 )
 from .emit import (
     LaunchOptions,
@@ -69,6 +69,7 @@ from .emit import (
     emit_ceiling_rows,
     emit_launch_args,
     format_solve_json,
+    kv_cli_dtype_str,
     point_launch_args,
     pool_label,
     top_layout_roles,
@@ -91,6 +92,7 @@ from .hf_loader import (
     audit_hf_config,
     dtypes_from_hf_config,
     load_hf_config,
+    load_hf_config_with_identity,
 )
 from .modules import Dtypes, Parallel, StepShape
 from .occupancy import ExpertActivationModel, parse_activation_spec
@@ -1523,7 +1525,12 @@ def _render_solve_ascii_table(
             f"{reference_candidate.est_ttft_ms:>11.1f}  "
             f"{reference_candidate.est_tpot_ms:>11.2f}\n",
         )
-    if ref_report is not None and not bool(ref_report.get("found")):
+    if ref_report is not None and bool(ref_report.get("ruled_out")):
+        sys.stdout.write(
+            f"# reference layout {ref_report['layout']}: "
+            f"enumerated, ruled out by SLO ({ref_report['rejected_by']})\n"
+        )
+    elif ref_report is not None and not bool(ref_report.get("found")):
         sys.stdout.write(
             f"# reference layout {ref_report['layout']}: "
             f"not enumerated ({ref_report['rejected_by']})\n"
@@ -1559,13 +1566,7 @@ def _build_launch_options(
     render_ctx: _SolveRenderContext,
 ) -> LaunchOptions:
     """Construct LaunchOptions matching ServingPlan metadata."""
-    dt = render_ctx.dtypes
-    if canonicalize_kv_dtype(dt.kv_dtype) == "fp4" or dt.kv <= FP4_BYTES:
-        kv_str = "fp4"
-    elif dt.kv <= FP8_BYTES:
-        kv_str = "fp8"
-    else:
-        kv_str = "bfloat16"
+    kv_str = kv_cli_dtype_str(render_ctx.dtypes, default_bf16="bfloat16")
     return LaunchOptions(
         kv_dtype=kv_str,
         model=render_ctx.src,
@@ -1636,15 +1637,8 @@ def _spec_for_cfg(cfg: Mapping[str, object] | None) -> ModelSpec | None:
         return None
     raw_tc = cfg.get("text_config")
     tc = raw_tc if isinstance(raw_tc, Mapping) else cfg
-    model_type = (
-        str(tc.get("model_type") or cfg.get("model_type") or "").strip().lower()
-    )
-    if not model_type:
-        return None
-    for spec in SUPPORTED_MODELS.values():
-        if model_type in spec.model_types:
-            return spec
-    return None
+    model_type = str(tc.get("model_type") or cfg.get("model_type") or "")
+    return spec_for_model_type(model_type)
 
 
 def _enforce_kv_dtype_profile(raw_kv: str, profile: RuntimeProfile) -> str:
@@ -2207,12 +2201,11 @@ def _load_cli_geometry(
 ) -> tuple[dict[str, object], ModelGeometry, str | None]:
     """Load HF config and parse ModelGeometry with canonical identity validation."""
     resolve_runtime_profile(None, runtime_profile)
-    cfg = load_hf_config(src)
-    if hf_overrides:
-        cfg = apply_hf_overrides(cfg, hf_overrides)
-    model_ref = None if Path(src).exists() else src
-    identity = resolve_model_identity(
-        cfg, model_ref=model_ref, runtime_profile=runtime_profile
+    resolved_src = str(Path(src).resolve()) if Path(src).exists() else src
+    cfg, identity = load_hf_config_with_identity(
+        resolved_src,
+        hf_overrides=hf_overrides,
+        runtime_profile=runtime_profile,
     )
     if "quantization" in serve_parsed and not _has_quantization_config(cfg):
         q_val = str(serve_parsed["quantization"]).lower()
