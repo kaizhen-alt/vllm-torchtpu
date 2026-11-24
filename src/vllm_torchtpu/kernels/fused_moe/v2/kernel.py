@@ -41,6 +41,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     PACK4,
     QB4,
     ROWBLK,
+    align_up,
 )
 
 # The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
@@ -2370,27 +2371,33 @@ COMBINE_GROUP = 16
 # live at once. Unrolled straight-line over a whole step, the list scheduler
 # hoists every arrival load and spills.
 COMBINE_CHUNK = 16
-# Below this many local tokens XLA does not offload the gather at all (b64 and
-# b32 emit no OFFLOAD_GATHER), so there is no round trip to remove and a second
-# Mosaic call's fixed cost would be the whole effect.
-COMBINE_MIN_TOKENS = 256
 COMBINE_PARITIES = 4
 # Steps of row lead. A step's rows are waited at its head, so at one step of
 # lead the DMA queue drains to empty at every boundary and refills from cold;
 # more lead keeps descriptors in flight across it. Must divide the rotation:
 # 0 < COMBINE_LEAD < COMBINE_PARITIES.
 COMBINE_LEAD = 2
+# Up to this many tokens the steps fit one rotation and unroll whole: every
+# step owns a buffer and has a static size, so the last step may be short and
+# any t_local runs as it is. Past it the loop runs whole rotations of equal
+# steps, and a t_local that has none takes the layer's XLA epilogue.
+COMBINE_UNROLLED_TOKENS = COMBINE_PARITIES * COMBINE_TOKENS
 
 
 def combine_step_tokens(t_local):
-    """Tokens a combine step stages, or 0 where this path does not apply.
+    """Tokens a combine step stages, or 0 where no schedule fits t_local.
 
-    The step loop is unrolled by parity so that every VMEM store has a static
-    buffer index, which needs an even step count; the group width has to divide
-    the step; and the fixed cost is only worth paying above COMBINE_MIN_TOKENS.
+    Unrolled, a step is the smallest whole number of groups that covers
+    t_local in one rotation, so the rows pipeline over as many steps as there
+    are buffers. The rotation loop is unrolled by parity so that every VMEM
+    store has a static buffer index, which needs a whole number of rotations;
+    and the group width has to divide the step.
     """
-    if t_local < COMBINE_MIN_TOKENS:
-        return 0
+    if t_local <= COMBINE_UNROLLED_TOKENS:
+        return min(
+            COMBINE_TOKENS,
+            align_up(pl.cdiv(t_local, COMBINE_PARITIES), COMBINE_GROUP),
+        )
     tb = COMBINE_TOKENS
     while tb >= COMBINE_GROUP:
         steps = t_local // tb
@@ -2407,13 +2414,19 @@ def combine_step_tokens(t_local):
 
 
 def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype):
-    """out[i] = sum_k coef[i, k] * arrivals[pos[i * topk + k]].
+    """out[i] = routes[i] ? sum_k coef[i, k] * arrivals[pos[i * topk + k]] : 0.
 
     `pos` is a scalar-prefetch table of arrival rows, already clamped into the
     buffer; `coef` is the arrival row's scale folded with the router weight and
     rides SMEM beside it, so a slot's weight reaches the vector unit as a
     scalar splat. The result is [t_local, hidden] in the layer's own output
     layout.
+
+    `routes` is the per-token routing mask, also in SMEM. A token that routed
+    nowhere has zero weights but reads arrival rows nobody wrote, and zero
+    times an unwritten NaN is not zero, so its sum is selected away rather
+    than weighted away -- in the kernel, since after it the select would be an
+    XLA pass that reads the sum back from HBM and writes it again.
 
     An arrival row is [lane blocks, 128] -- one register -- while the output
     is [tokens, hidden], which is that layout transposed: a token's hidden
@@ -2423,13 +2436,25 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
     packed-f8 rows, and the live accumulator is one token wide.
     """
     tb = combine_step_tokens(t_local)
-    steps = t_local // tb
+    if not tb:
+        raise ValueError(f"the combine has no schedule for {t_local} tokens")
+    steps = pl.cdiv(t_local, tb)
+    unrolled = t_local <= COMBINE_UNROLLED_TOKENS
+    buffers = steps if unrolled else COMBINE_PARITIES
     gt = COMBINE_GROUP
-    groups = tb // gt
     lanes = HIDDEN_LANE_BLOCK
 
     def kernel(
-        pos_sm, coef_sm, arr_hbm, out_hbm, rows_vm, tile_vm, out_vm, row_sems, out_sems
+        pos_sm,
+        coef_sm,
+        routes_sm,
+        arr_hbm,
+        out_hbm,
+        rows_vm,
+        tile_vm,
+        out_vm,
+        row_sems,
+        out_sems,
     ):
         def start_row(base, parity, i, k):
             # Alternate queues by slot: this kernel is one 4 KiB descriptor per
@@ -2452,76 +2477,124 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
                     * coef_sm[(base + i) * topk + k]
                 )
                 acc = term if acc is None else acc + term
-            tile_vm[i] = cast(jax.Array, acc).astype(out_dtype)
+            # The flag is splatted as an int and compared on the vector unit,
+            # so the select's mask is a vector compare, not a broadcast i1.
+            acc = cast(jax.Array, acc)
+            routed = jnp.full(acc.shape, routes_sm[base + i], jnp.int32) != 0
+            tile_vm[i] = jnp.where(routed, acc, 0.0).astype(out_dtype)
 
-        def one_step(step, parity):
-            # The step's rows were started a step ago; the next step's are
-            # started beside this one's reduction, so their descriptor issue
-            # rides in slots the vector work leaves empty. The last step
-            # re-starts its own rows rather than branching -- the copy is never
-            # read and is drained below.
-            nxt = jnp.minimum(step + COMBINE_LEAD, steps - 1) * tb
-            base = step * tb
-            npar = (parity + COMBINE_LEAD) % COMBINE_PARITIES
-            pltpu.make_async_copy(
-                rows_vm.at[parity], rows_vm.at[parity], row_sems.at[parity]
-            ).wait()
+        def token_run(lo, hi, reduce_at=None, start_at=None):
+            """Tokens [lo, hi) of a step, each reduced at `reduce_at` and/or
+            its rows started at `start_at` -- both (base, parity)."""
 
-            @pl.when(step >= COMBINE_PARITIES)
-            def _():
-                pltpu.make_async_copy(
-                    out_vm.at[parity], out_vm.at[parity], out_sems.at[parity]
-                ).wait()
+            def one_token(i):
+                if start_at is not None:
+                    base, parity = start_at
+                    for k in range(topk):
+                        start_row(base, parity, i, k)
+                if reduce_at is not None:
+                    base, parity = reduce_at
+                    reduce_token(base, parity, i)
 
             def one_chunk(chunk, carry):
                 for u in range(COMBINE_CHUNK):
-                    i = chunk * COMBINE_CHUNK + u
-                    for k in range(topk):
-                        start_row(nxt, npar, i, k)
-                    reduce_token(base, parity, i)
+                    one_token(lo + chunk * COMBINE_CHUNK + u)
                 return carry
 
-            lax.fori_loop(0, tb // COMBINE_CHUNK, one_chunk, jnp.int32(0))
-            for g in range(groups):
+            chunks = max(hi - lo, 0) // COMBINE_CHUNK
+            if chunks:
+                lax.fori_loop(0, chunks, one_chunk, jnp.int32(0))
+            for i in range(lo + chunks * COMBINE_CHUNK, hi):
+                one_token(i)
+
+        def start_step(base, parity, n):
+            for i in range(n):
+                for k in range(topk):
+                    start_row(base, parity, i, k)
+
+        def wait_rows(parity, n):
+            rows = rows_vm.at[parity, pl.ds(0, topk * n)]
+            pltpu.make_async_copy(rows, rows, row_sems.at[parity]).wait()
+
+        def wait_out(parity, n):
+            out = out_vm.at[parity, pl.ds(0, n)]
+            pltpu.make_async_copy(out, out, out_sems.at[parity]).wait()
+
+        def one_step(step, parity, n, nxt, n_nxt):
+            # The step's n tokens had their rows started COMBINE_LEAD steps
+            # ago; the n_nxt tokens of the step at `nxt` are started beside
+            # this one's reduction, so their descriptor issue rides in slots
+            # the vector work leaves empty.
+            base = step * tb
+            npar = (parity + COMBINE_LEAD) % COMBINE_PARITIES
+            wait_rows(parity, n)
+
+            @pl.when(step >= COMBINE_PARITIES)
+            def _():
+                wait_out(parity, tb)
+
+            both = min(n, n_nxt)
+            token_run(0, both, (base, parity), (nxt, npar))
+            token_run(both, n, reduce_at=(base, parity))
+            token_run(both, n_nxt, start_at=(nxt, npar))
+            # A short step's last group relays out rows past n too; they are
+            # never stored.
+            for g in range(pl.cdiv(n, gt)):
                 out_vm[parity, pl.ds(g * gt, gt)] = tile_vm[pl.ds(g * gt, gt)].reshape(
                     gt, hidden
                 )
             pltpu.make_async_copy(
-                out_vm.at[parity], out_hbm.at[pl.ds(step * tb, tb)], out_sems.at[parity]
+                out_vm.at[parity, pl.ds(0, n)],
+                out_hbm.at[pl.ds(base, n)],
+                out_sems.at[parity],
             ).start()
+
+        if unrolled:
+            # Every step has its own buffer and starts its rows COMBINE_LEAD
+            # steps ahead; only the last may be short.
+            sizes = [min(tb, t_local - s * tb) for s in range(steps)]
+            for s in range(min(COMBINE_LEAD, steps)):
+                start_step(s * tb, s, sizes[s])
+            for s in range(steps):
+                ahead = s + COMBINE_LEAD
+                n_ahead = sizes[ahead] if ahead < steps else 0
+                one_step(s, s, sizes[s], ahead * tb, n_ahead)
+            for s in range(steps):
+                wait_out(s, sizes[s])
+            return
 
         def step_pair(pair, carry):
             for parity in range(COMBINE_PARITIES):
-                one_step(pair * COMBINE_PARITIES + parity, parity)
+                step = pair * COMBINE_PARITIES + parity
+                # The last steps re-start the final step's rows rather than
+                # branching -- the copy is never read and is drained below.
+                nxt = jnp.minimum(step + COMBINE_LEAD, steps - 1) * tb
+                one_step(step, parity, tb, nxt, tb)
             return carry
 
         for p in range(COMBINE_LEAD):
-            for i in range(tb):
-                for k in range(topk):
-                    start_row(p * tb, p, i, k)
+            start_step(p * tb, p, tb)
         lax.fori_loop(0, steps // COMBINE_PARITIES, step_pair, jnp.int32(0))
         # The last COMBINE_LEAD steps re-start the final step's rows into the
         # buffers the loop no longer reads; drain them, and the stores.
         for p in range(COMBINE_LEAD):
-            pltpu.make_async_copy(rows_vm.at[p], rows_vm.at[p], row_sems.at[p]).wait()
+            wait_rows(p, tb)
         for p in range(COMBINE_PARITIES):
-            pltpu.make_async_copy(out_vm.at[p], out_vm.at[p], out_sems.at[p]).wait()
+            wait_out(p, tb)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=3,
             in_specs=[hbm],
             out_specs=hbm,
             scratch_shapes=(
-                pltpu.VMEM(
-                    (COMBINE_PARITIES, topk * tb, lane_blocks, lanes), wire_dtype
-                ),
+                pltpu.VMEM((buffers, topk * tb, lane_blocks, lanes), wire_dtype),
                 pltpu.VMEM((tb, lane_blocks, lanes), out_dtype),
-                pltpu.VMEM((COMBINE_PARITIES, tb, hidden), out_dtype),
-                pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
-                pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
+                pltpu.VMEM((buffers, tb, hidden), out_dtype),
+                pltpu.SemaphoreType.DMA((buffers,)),
+                pltpu.SemaphoreType.DMA((buffers,)),
             ),
             grid=(),
         ),
@@ -2532,7 +2605,7 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
         name=f"moe_v2_combine_t{t_local}_k{topk}_b{tb}",
     )
 
-    def fn(arrivals, coef, pos):
+    def fn(arrivals, coef, pos, routes):
         # Both tables flatten TOKEN-major, so a token's topk entries are one
         # contiguous SMEM run and its 2 * topk scalar reads share a single
         # address computation. That is also the order the plan builds them in,
@@ -2543,7 +2616,17 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
                 f"[{t_local}, {topk}] tables, got pos "
                 f"{pos.shape} and coef {coef.shape}"
             )
-        return call(pos.astype(jnp.int32).reshape(-1), coef.reshape(-1), arrivals)
+        if routes.size != t_local:
+            raise ValueError(
+                f"the combine takes one route flag per token ({t_local}), "
+                f"got {routes.shape}"
+            )
+        return call(
+            pos.astype(jnp.int32).reshape(-1),
+            coef.reshape(-1),
+            routes.astype(jnp.int32).reshape(-1),
+            arrivals,
+        )
 
     return fn
 

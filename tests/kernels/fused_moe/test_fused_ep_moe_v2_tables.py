@@ -670,13 +670,34 @@ def test_slab_run_copy_fits_its_vmem_budget(t_local, vmem, fits):
     assert host.slab_run_copy_fits(t_local, topk, ep, stride, info) is fits
 
 
+@pytest.mark.parametrize(
+    ("t_local", "tb"),
+    [(320, 16), (384, 32), (512, 64), (2048, 64), (264, 0), (288, 0)],
+)
+def test_combine_rotated_schedule_past_one_rotation(t_local, tb):
+    """Past one unrolled rotation a t_local needs whole rotations of equal
+    steps; without them the layer takes the XLA epilogue."""
+    assert kernel.combine_step_tokens(t_local) == tb
+
+
+def test_combine_unrolls_every_token_count_up_to_one_rotation():
+    """Up to one rotation every t_local has a schedule of at most one step
+    per buffer."""
+    for t_local in range(1, kernel.COMBINE_UNROLLED_TOKENS + 1):
+        tb = kernel.combine_step_tokens(t_local)
+        assert tb and not tb % kernel.COMBINE_GROUP, t_local
+        assert -(-t_local // tb) <= kernel.COMBINE_PARITIES, t_local
+
+
 def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens():
     """NaN arrival rows stay isolated to padded rows and zero out via row_routes."""
     from vllm_torchtpu.kernels.fused_moe.v2.layer import _combine_arrivals
 
-    # Use t_local=8 so combine_step_tokens(t_local) is 0 and the XLA epilogue runs
-    # on CPU without invoking the Pallas TPU combine kernel.
-    t_local, topk, lane_blocks, lanes, tile_m = 8, 4, 2, 128, 128
+    # 264 has no rotated combine schedule, so the XLA epilogue runs on CPU
+    # without invoking the Pallas TPU combine kernel.
+    t_local, topk, lane_blocks, lanes, tile_m = 264, 4, 2, 128, 128
+    assert kernel.combine_step_tokens(t_local) == 0
+    active = t_local - 4
     recv_rows = 32
     arrivals = np.ones((recv_rows, lane_blocks, lanes), dtype=np.float32)
     arrival_scales = np.ones((4, tile_m), dtype=np.float32)
@@ -692,11 +713,12 @@ def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens():
     mirror_pos = np.full((t_local, topk), 16, dtype=np.int32)
     topk_weights = np.full((t_local, topk), 0.25, dtype=np.float32)
 
-    # Mark rows 4..7 as padded: pos and mirror_pos span [0, 16), topk_weights=0.0.
-    pos[4:] = sentinel_ranks
-    mirror_pos[4:] = sentinel_ranks
-    topk_weights[4:] = 0.0
-    row_routes = jnp.asarray([[True]] * 4 + [[False]] * 4)
+    # Mark the last 4 rows as padded: pos and mirror_pos span [0, 16),
+    # topk_weights=0.0.
+    pos[active:] = sentinel_ranks
+    mirror_pos[active:] = sentinel_ranks
+    topk_weights[active:] = 0.0
+    row_routes = jnp.asarray([[True]] * active + [[False]] * 4)
 
     combined = _combine_arrivals(
         jnp.asarray(arrivals),
@@ -708,9 +730,9 @@ def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens():
     )
     out = np.asarray(jnp.where(row_routes, combined, jnp.zeros_like(combined)))
     assert np.isfinite(out).all()
-    np.testing.assert_allclose(out[:4].astype(np.float32), 1.0)
+    np.testing.assert_allclose(out[:active].astype(np.float32), 1.0)
     np.testing.assert_array_equal(
-        out[4:].astype(np.float32), np.zeros((4, lane_blocks * lanes), np.float32)
+        out[active:].astype(np.float32), np.zeros((4, lane_blocks * lanes), np.float32)
     )
 
 

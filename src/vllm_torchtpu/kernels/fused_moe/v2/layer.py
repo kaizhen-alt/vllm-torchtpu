@@ -120,28 +120,39 @@ def _row_routes(scores, gate_l):
 
 
 def _combine_arrivals(
-    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+    arrivals,
+    arrival_scales,
+    pos,
+    mirror_pos,
+    topk_weights,
+    row_routes,
+    out_dtype,
 ):
     """Combine arrivals [rows, lane blocks, 128] into [t_local, hidden].
 
+    A row with `row_routes` False comes out zero: it read arrival rows nobody
+    wrote, and its weight is zero, but zero times an unwritten NaN is not, so
+    it is selected away.
+
     Two tables index two different objects, so each owns its own clamp.
-    `pos` is the arrival ROW: a row of `arrivals`, and on the kernel path
-    below it is a DMA address. `mirror_pos` is a position in the wire's scale
+    `pos` is the arrival ROW: a row of `arrivals`, and in the combine kernel
+    it is a DMA address. `mirror_pos` is a position in the wire's scale
     mirror, which is [sublanes, tile_m] because a transport can only address
     the mirror a sublane at a time and a sublane holds tile_m f32 whatever is
     written in it -- so a whole source TILE's scales are one sublane and the
     mirror position is NOT the arrival row.
 
     Where the kernel path applies (kernel.combine_step_tokens) the row gather
-    and the weighted sum are one Mosaic call: XLA answers `arrivals[rows]`
-    with a SparseCore gather whose output is in HBM at any size, so the rows
-    are written out and read straight back before the sum sees them.
-    Everywhere else the gather is not offloaded and there is no round trip to
-    remove, so the fused XLA epilogue below stays.
+    and the weighted sum are one Mosaic call: every t_local up to
+    kernel.COMBINE_UNROLLED_TOKENS, and past it a t_local that splits into
+    whole rotations of equal steps. Any other t_local takes the fused XLA
+    epilogue below.
 
     Both paths fold the arrival row's scale and the router weight into one
     coefficient over K * t_local values, so each of the K * t_local * hidden
-    elements is multiplied once rather than twice.
+    elements is multiplied once rather than twice. Both apply the mask in the
+    same pass as the sum: after a Mosaic call it would be an XLA pass that
+    reads the sum back from HBM and writes it again.
     """
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
@@ -164,7 +175,7 @@ def _combine_arrivals(
             wire_dtype=arrivals.dtype,
             out_dtype=out_dtype,
         )
-        return combine(arrivals, coef, rows)
+        return combine(arrivals, coef, rows, row_routes)
     rows_fp8 = arrivals[pos.T.reshape(-1)]  # f8 [K*t, lane blocks, 128]
     coef_k = coef.T.reshape(-1)  # k-major [K*t_local]
     terms = []
@@ -174,7 +185,8 @@ def _combine_arrivals(
         )
         slot_coef = lax.slice(coef_k, (k * t_local,), ((k + 1) * t_local,))
         terms.append(slot_rows.astype(jnp.float32) * slot_coef[:, None, None])
-    return cast(jax.Array, sum(terms)).astype(out_dtype).reshape(t_local, hidden)
+    combined = cast(jax.Array, sum(terms)).astype(out_dtype).reshape(t_local, hidden)
+    return jnp.where(row_routes, combined, jnp.zeros_like(combined))
 
 
 def _exchange_layout(t_local, topk, e_total, quantized, per_pair=False):
@@ -611,7 +623,7 @@ def fused_ep_moe_v2(
     gather_positions=None,
     w1_scales_expert_second_minor=False,
     w2_scales_expert_second_minor=False,
-    use_route_kernel=False,
+    use_route_kernel=True,
     shared_partial=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
@@ -1153,11 +1165,9 @@ def fused_ep_moe_v2(
             planned.pos,
             planned.mirror_pos,
             topk_weights,
+            row_routes,
             out_dtype,
         )
-        # A row that routed nowhere read arrival rows nobody wrote; its weight is
-        # zero, but zero times an unwritten NaN is not.
-        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         if shared_rows is not None:
             combined = combined + shared_rows
         return token_layout.restore(combined, ax)
