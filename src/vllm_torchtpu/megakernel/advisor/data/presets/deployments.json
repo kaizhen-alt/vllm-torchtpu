@@ -330,6 +330,34 @@
         "dp": 8,
         "ep": 8
       }
+    },
+    "minimax-m3.1-flash": {
+      "source": "MiniMax-M3.1-Flash colocated serving layout: Wide-DCP TP8 x EP8 x DCP4 decode with 7 speculative tokens, TP8 x EP8 x DCP2 prefill, and TP8 x EP8 x DCP8 high-context saturation (no megakernel declared)",
+      "prefill_windows": [
+        2048
+      ],
+      "unmodeled_notes": [
+        "5-layer dense SWA-4096 dspark draft stack (k=7)",
+        "Host KV offload via TPURaidenOffloadingConnector used in high-concurrency 4-bit KV runs",
+        "Optional MSA DCP exchange collectives omitted as a lower bound",
+        "Host dispatch gap between device steps"
+      ],
+      "decode": {
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "spec_tokens": 7
+      },
+      "prefill": {
+        "tp": 8,
+        "ep": 8,
+        "dcp": 2
+      },
+      "saturation": {
+        "tp": 8,
+        "ep": 8,
+        "dcp": 8
+      }
     }
   }
 }

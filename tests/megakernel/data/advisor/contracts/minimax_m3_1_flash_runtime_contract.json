@@ -1,0 +1,193 @@
+{
+  "schema_version": 1,
+  "model_id": "minimax_m3",
+  "runtime_profile": "minimax-m31-forge",
+  "hf_repo": "MiniMaxAI/MiniMax-M3.1-Flash",
+  "served_provenance": "source tarball, no commit recorded",
+  "reference_branch": "forge/project_minimax-m3.1-flash/campaign_e2e",
+  "reference_commit": "435509b8abfa76a388d268d38e974c93e3d45db8",
+  "rules": [
+    {
+      "id": 1,
+      "name": "all_layers_sparse_attention",
+      "status": "resolved",
+      "rule": "Every layer must use sparse attention.",
+      "source": "src/vllm_torchtpu/models/minimax_m3/hooks.py:43-48"
+    },
+    {
+      "id": 2,
+      "name": "block_size_equals_sparse_block_size",
+      "status": "resolved",
+      "rule": "--block-size must equal sparse_block_size (128); pinned when unset.",
+      "source": "src/vllm_torchtpu/models/minimax_m3/hooks.py:50-59"
+    },
+    {
+      "id": 3,
+      "name": "min_tp_equals_num_kv_heads",
+      "status": "resolved",
+      "rule": "--tensor-parallel-size >= num_key_value_heads (4).",
+      "source": "src/vllm_torchtpu/models/minimax_m3/hooks.py:61-68"
+    },
+    {
+      "id": 4,
+      "name": "allowed_kv_cache_dtypes",
+      "status": "resolved",
+      "rule": "--kv-cache-dtype in {auto, bfloat16, fp8, fp8_e4m3, int4_per_token_head}; index keys use the KV dtype.",
+      "source": "src/vllm_torchtpu/models/minimax_m3/hooks.py:23-32,69-88"
+    },
+    {
+      "id": 5,
+      "name": "no_pcp",
+      "status": "resolved",
+      "rule": "PCP > 1 is rejected.",
+      "source": "src/vllm_torchtpu/models/minimax_m3/hooks.py:89-92"
+    },
+    {
+      "id": 6,
+      "name": "no_pp",
+      "status": "resolved",
+      "rule": "PP > 1 is rejected.",
+      "source": "src/vllm_torchtpu/models/minimax_m3/hooks.py:101-104"
+    },
+    {
+      "id": 7,
+      "name": "dcp_tp_group_divisibility",
+      "status": "resolved",
+      "rule": "DCP must divide TP and divide or be a multiple of replicas = TP // num_key_value_heads; contiguous rank placement.",
+      "source": "src/vllm_torchtpu/models/minimax_m3/hooks.py:107-122",
+      "verbatim": "if tp_size % dcp or (replicas % dcp and dcp % replicas):"
+    },
+    {
+      "id": 8,
+      "name": "dcp_interleave_size",
+      "status": "resolved",
+      "rule": "Under DCP > 1, --cp-kv-cache-interleave-size equals sparse_block_size (128) and prefix match unit stays 128.",
+      "source": "src/vllm_torchtpu/models/minimax_m3/hooks.py:123-141"
+    },
+    {
+      "id": 9,
+      "name": "dspark_disable_hybrid_kv_manager",
+      "status": "resolved",
+      "rule": "dspark requires --disable-hybrid-kv-cache-manager under DCP > 1 (hooks.py) and unconditionally with host KV offload skip_draft_kv (raiden_store.py).",
+      "source": "src/vllm_torchtpu/models/minimax_m3/hooks.py:142-152, src/vllm_torchtpu/offload/raiden_store.py:3006",
+      "verbatim": "\"by --disable-hybrid-kv-cache-manager next to MLA caches)\""
+    },
+    {
+      "id": 10,
+      "name": "dspark_companion_draft_config",
+      "status": "resolved",
+      "rule": "Speculative method must be dspark using checkpoint dspark/config.json.",
+      "source": "src/vllm_torchtpu/models/minimax_m3/dspark.py:90-118"
+    },
+    {
+      "id": 11,
+      "name": "dspark_draft_kv_dtype_and_dcp",
+      "status": "resolved",
+      "rule": "Draft is 5 dense layers; its sliding-window (4096) KV uses fp8 when target KV is int4_per_token_head and otherwise target KV dtype; sharded over DCP.",
+      "source": "src/vllm_torchtpu/models/minimax_m3/dspark.py:153-156,190-191,406"
+    },
+    {
+      "id": 12,
+      "name": "kv_heads_per_rank_under_dcp",
+      "status": "resolved",
+      "rule": "kv_heads_per_rank = max(1, dcp // max(1, tp // num_key_value_heads)); KV row width = 2 * head_dim * kv_heads_per_rank.",
+      "source": "src/vllm_torchtpu/models/minimax_m3/attention.py:335-342"
+    },
+    {
+      "id": 13,
+      "name": "int4_page_and_scale_layout",
+      "status": "resolved",
+      "rule": "4-bit page shape (blocks, tokens // 8 + scale row, 4, row_width); index page folds 4B f32 scale per token; one f32 scale page [pages, 8, 128] (4096B = 32B/tok) per layer.",
+      "source": "src/vllm_torchtpu/models/minimax_m3/attention.py:98-153,343-361, src/vllm_torchtpu/models/minimax_m3/kernels/msa_fp4.py:14-49,137-141"
+    },
+    {
+      "id": 14,
+      "name": "msa_topk_selection_and_verify_tile",
+      "status": "resolved",
+      "rule": "Indexer scores visible blocks, forces local block, keeps topk=16 blocks per KV head; decode dspark verify has 8 query rows (7 draft + 1 current) tiled at SMALL_BATCH_BLOCK_Q=8 sharing fetched pages once.",
+      "source": "src/vllm_torchtpu/models/minimax_m3/kernels/msa.py:14-21,292-293, src/vllm_torchtpu/models/minimax_m3/kernels/msa_attention.py:57",
+      "verbatim": "SMALL_BATCH_BLOCK_Q = 8"
+    },
+    {
+      "id": 15,
+      "name": "mxfp8_block_alignment",
+      "status": "resolved",
+      "rule": "MXFP8 linears require per-rank input dimension to be a multiple of the 32-element MXFP8 block.",
+      "source": "src/vllm_torchtpu/models/minimax_m3/quant.py:154-159"
+    },
+    {
+      "id": 16,
+      "name": "moe_layer_freq_dense_vs_moe",
+      "status": "resolved",
+      "rule": "Layers 0..2 are dense MLPs (dense_intermediate_size=12288); layers 3..59 are MoE (128 routed + 1 shared).",
+      "source": "src/vllm_torchtpu/models/minimax_m3/model.py:84-92"
+    },
+    {
+      "id": 17,
+      "name": "index_key_cache_replication",
+      "status": "resolved",
+      "rule": "Index-key cache is replicated per rank by default; TP sharding applies only at tp == num_key_value_heads with dcp == 1 and non-4-bit KV (not enumerated).",
+      "source": "src/vllm_torchtpu/models/minimax_m3/attention.py:156-168,316-334,351-358"
+    },
+    {
+      "id": 18,
+      "name": "dp_lockstep_and_ep",
+      "status": "resolved_fail_closed_upstream",
+      "rule": "DP lockstep requires enable_expert_parallel (tpu_runner.py:3738); non-EP workers collapse pc.data_parallel_size = 1 (tpu_worker.py:235). Fail-closed: dp_requires_ep=True.",
+      "source": "src/vllm_torchtpu/runner/tpu_runner.py:3738, src/vllm_torchtpu/worker/tpu_worker.py:235",
+      "verbatim": "and self.parallel_config.enable_expert_parallel"
+    },
+    {
+      "id": 19,
+      "name": "dcp_requires_dp1",
+      "status": "unsettled_upstream_fail_closed",
+      "rule": "No dp==1 check in minimax_m3/hooks.py; upstream governs dp>1 + dcp>1. Fail-closed: dcp_requires_dp1=True.",
+      "source": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py:3204"
+    },
+    {
+      "id": 20,
+      "name": "disagg_rejected",
+      "status": "resolved",
+      "rule": "Stage-3 Raiden rejects un-admitted models; legacy ZMQ-shm assumes uniform kv_caches[0].shape incompatible with heterogeneous KV/index/4-bit scale pages. Fail-closed: disagg=False.",
+      "source": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py:2820, src/vllm_torchtpu/distributed/kv_transfer/zmq_shm_base.py:518",
+      "verbatim": "if self._raiden_stage3_enabled() and not selected:"
+    },
+    {
+      "id": 21,
+      "name": "fused_ep_w4a8_gate",
+      "status": "resolved",
+      "rule": "Fused EP W4A8 MoE engages with USE_MOE_FUSED_EP_KERNEL, MOE_FUSED_EP_ENABLE_W4A8, use_ep, hidden % 128 == 0, max_node_tokens >= 1024; roofline prices cheaper floor and emits no perf-only env.",
+      "source": "src/vllm_torchtpu/layers/adapter/quantization/nvfp4.py:209, src/vllm_torchtpu/layers/adapter/fused_moe_ep.py:887",
+      "verbatim": "and envs.MOE_FUSED_EP_ENABLE_W4A8"
+    },
+    {
+      "id": 22,
+      "name": "synthetic_verify_one_lm_head_row",
+      "status": "resolved",
+      "rule": "TPU_SPEC_SYNTHETIC_ONE_ROW_VERIFY (default True) slices 1 hidden-state logit row per padded request.",
+      "source": "src/vllm_torchtpu/runner/tpu_runner.py:4804, src/vllm_torchtpu/envs.py:1045",
+      "verbatim": "row to compute logits for, one per padded request.\"\"\""
+    },
+    {
+      "id": 23,
+      "name": "skip_draft_kv_host_offload",
+      "status": "resolved",
+      "rule": "TPURaidenOffloadingConnector subtracts draft_bytes from bytes_per_block_all_ranks so host DRAM holds target KV only.",
+      "source": "src/vllm_torchtpu/offload/raiden_store.py:3008, src/vllm_torchtpu/offload/raiden_connector.py:783",
+      "verbatim": "bytes_per_block_all_ranks -= draft_bytes"
+    },
+    {
+      "id": 24,
+      "name": "dcp_collectives_floor",
+      "status": "resolved",
+      "rule": "DCP kernels run q_all all_gather, candidate ppermute/all_gather, and (out, lse) partial exchange (or remote-DMA exchange_head_pages + scale_cache all_to_all for 4-bit large-token heads_op); L1 omits optional DCP exchange as a lower bound.",
+      "source": "src/vllm_torchtpu/models/minimax_m3/kernels/msa_dcp_heads.py:554, src/vllm_torchtpu/models/minimax_m3/kernels/msa_dcp.py:1123",
+      "verbatim": "if num_tokens < max(head_parallel_min_tokens, 2 * rows):"
+    }
+  ],
+  "cache_bytes_per_stored_token_per_layer_per_rank": {
+    "kv_heads_1": {"layouts": ["TP8", "TP8 x DCP2", "TP4 x DP2"], "fp8": 384, "int4_per_token_head": 228},
+    "kv_heads_2": {"layouts": ["TP8 x DCP4"], "fp8": 640, "int4_per_token_head": 356},
+    "kv_heads_4": {"layouts": ["TP8 x DCP8"], "fp8": 1152, "int4_per_token_head": 612}
+  }
+}
