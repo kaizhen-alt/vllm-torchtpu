@@ -46,6 +46,7 @@ from vllm_torchtpu.roofline import (
     SpecShape,
     StepShape,
     TrafficScenario,
+    attach_reference_report,
     build_example_scenario,
     build_solve_payload,
     cli,
@@ -53,17 +54,30 @@ from vllm_torchtpu.roofline import (
     dtypes_from_hf_config,
     emit_launch_args,
     explain_layout_rejection,
+    floor_throughput_per_chip,
     from_hf_config,
     hbm_breakdown_per_core_bytes,
     hbm_footprint_per_core_bytes,
+    pareto_skyline_by_concurrency,
+    parse_layout,
     point_launch_args,
+    reference_layout_report,
+    render_html,
     scale_pp_stage_floor,
     solve_serving_plan,
+    top_layouts,
+    x_bound,
 )
 from vllm_torchtpu.roofline import constants as rf_constants
 from vllm_torchtpu.roofline import crossover as rf_crossover
 from vllm_torchtpu.roofline import solver as rf_solver
-from vllm_torchtpu.roofline.constants import DEFAULT_GPU_MEMORY_UTILIZATION, UNIT_GIGA
+from vllm_torchtpu.roofline.constants import (
+    DEFAULT_GPU_MEMORY_UTILIZATION,
+    SLO_VERDICT_RULED_OUT,
+    SLO_VERDICT_UNDECIDED,
+    UNIT_GIGA,
+    ZERO_THINK_TIME_WARNING,
+)
 from vllm_torchtpu.roofline.crossover import (
     CandidateState,
     EpLoadSpec,
@@ -93,8 +107,11 @@ from vllm_torchtpu.roofline.memory import (
 from vllm_torchtpu.roofline.partition import (
     count_full_attn_layers,
 )
+from vllm_torchtpu.roofline.schema import _pool_key
 from vllm_torchtpu.roofline.solver import (
     EXAMPLE_SCENARIOS,
+    _apply_capacity_ceiling_verdict,
+    _build_l1_decode_input,
     _candidate_decode_parallels,
     _candidate_moe_dispatches,
     _candidate_prefill_parallels,
@@ -102,6 +119,7 @@ from vllm_torchtpu.roofline.solver import (
     _find_prefill_options,
     _pareto_filter,
     _prefill_stage_step_floor,
+    _run_isolated_tarski_loop,
     _SolveContext,
     _valid_gdn_degree,
     _valid_head_tp,
@@ -3574,3 +3592,444 @@ def test_scale_ep_moe_floor_preserves_collective_latency() -> None:
         collective_latency_s=coll_lat_s,
     )
     assert sf_scaled.chain_s == pytest.approx(sf_base.chain_s, rel=1e-12)
+
+
+def _load_qwen3_5_397b_fp8() -> tuple[rf.ModelGeometry, rf.Dtypes, rf.ChipSpec]:
+    """Load the checked-in Qwen3.5 397B FP8 geometry, dtypes, and v7x chip spec."""
+    cfg_path = Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    return from_hf_config(cfg), dtypes_from_hf_config(cfg), CHIPS["tpu7x"]
+
+
+def _mixed_key(pt: ParetoPoint) -> tuple[object, ...]:
+    """Build a structural candidate key for comparing mixed-mode solver plans."""
+    pool = pt.decode_pool
+    return (
+        pool.topology,
+        pool.tp,
+        pool.dp,
+        pool.ep,
+        pool.pp,
+        pool.pcp,
+        pool.kv_split,
+        pool.moe_dispatch,
+    )
+
+
+def _assert_unknown_think_l1_and_report(
+    model_ctx: tuple[rf.ModelGeometry, rf.Dtypes, rf.ChipSpec],
+    scenarios: tuple[TrafficScenario, TrafficScenario, TrafficScenario],
+    plan_none: ServingPlan,
+    tmp_path: Path,
+) -> None:
+    """Assert sound X/throughput bounds, HTML rendering, and sweep."""
+    geom, dt, chip = model_ctx
+    scen_none, scen_zero, scen_15 = scenarios
+    tp_deg, dp_deg, ep_deg = 4, 2, 8
+    rescued_par = Parallel(
+        tp=tp_deg, dp=dp_deg, ep=ep_deg, moe="ep", moe_dispatch="a2a_push"
+    )
+    l1_opts = {
+        "decode_par": rescued_par,
+        "decode_topo": TOPOLOGIES["2x2x1"],
+        "concurrency": 256,
+    }
+    bound_in, b_cap_single = _build_l1_decode_input(geom, dt, chip, scen_none, l1_opts)
+    tarski_b, _ = _run_isolated_tarski_loop(bound_in, 256, b_cap_single, dp_deg, 1e6)
+    assert tarski_b == pytest.approx(1.0)
+
+    tput_none = floor_throughput_per_chip(geom, dt, chip, scen_none, **l1_opts)
+    tput_zero = floor_throughput_per_chip(geom, dt, chip, scen_zero, **l1_opts)
+    tput_15 = floor_throughput_per_chip(geom, dt, chip, scen_15, **l1_opts)
+    assert tput_none == pytest.approx(tput_zero, rel=1e-12)
+    assert tput_none >= tput_15
+
+    xb_none = x_bound(geom, dt, chip, scen_none, **l1_opts)
+    xb_zero = x_bound(geom, dt, chip, scen_zero, **l1_opts)
+    xb_15 = x_bound(geom, dt, chip, scen_15, **l1_opts)
+    assert xb_none == pytest.approx(xb_zero, rel=1e-12)
+    assert xb_none >= xb_15
+
+    payload = build_solve_payload(
+        plan_none, chip=chip, dtypes=dt, model="Qwen/Qwen3.5-397B-FP8"
+    )
+    html = render_html(payload)
+    assert "Qwen3.5" in html
+    out_html = tmp_path / "unknown_think.html"
+    out_html.write_text(html, encoding="utf-8")
+    assert out_html.is_file()
+    hit_range, crossover_hit = sweep_prefix_hit_crossovers(geom, dt, chip, plan_none)
+    range_bounds_len = 2
+    assert hit_range is None or len(hit_range) == range_bounds_len
+    assert crossover_hit is None or 0.0 <= crossover_hit <= 1.0
+
+
+def test_unknown_think_time_skips_capacity_and_tarski_false_prune_with_sound_x_bound(
+    tmp_path: Path,
+) -> None:
+    """Verify None think time avoids false SLO pruning while keeping sound X bounds."""
+    geom, dt, chip = _load_qwen3_5_397b_fp8()
+    scen_none = TrafficScenario(
+        "chat-unknown",
+        4096,
+        512,
+        0.0,
+        1.0,
+        None,
+        (256,),
+        1.0,
+        ttft_slo_ms=600.0,
+        tpot_slo_ms=15.0,
+    )
+    scen_zero = dc_replace(scen_none, name="chat-zero", think_time_s=0.0)
+    scen_15 = dc_replace(scen_none, name="chat-15s", think_time_s=15.0)
+    scen_open = dc_replace(
+        scen_none, name="chat-open", ttft_slo_ms=None, tpot_slo_ms=None
+    )
+
+    with pytest.raises(ValueError, match="think_time_s"):
+        TrafficScenario("neg", 1024, 128, 0.0, 1.0, -0.1, (1,), 1.0)
+
+    opts = SolveOptions(mode="mixed", max_chips=16, max_instances=1)
+    plan_none = solve_serving_plan(geom, dt, chip, scen_none, opts)
+    plan_zero = solve_serving_plan(geom, dt, chip, scen_zero, opts)
+    plan_15 = solve_serving_plan(geom, dt, chip, scen_15, opts)
+    plan_open = solve_serving_plan(geom, dt, chip, scen_open, opts)
+
+    unknown_warn = rf.UNKNOWN_THINK_TIME_WARNING
+    assert unknown_warn in plan_none.warnings
+    assert ZERO_THINK_TIME_WARNING not in plan_none.warnings
+    assert unknown_warn not in plan_open.warnings
+
+    assert (
+        _apply_capacity_ceiling_verdict(
+            scen_none,
+            SLO_VERDICT_UNDECIDED,
+            concurrency=256,
+            pool_capacity_req_s=1e-6,
+        )
+        == SLO_VERDICT_UNDECIDED
+    )
+    assert (
+        _apply_capacity_ceiling_verdict(
+            scen_zero,
+            SLO_VERDICT_UNDECIDED,
+            concurrency=256,
+            pool_capacity_req_s=1e-6,
+        )
+        == SLO_VERDICT_RULED_OUT
+    )
+
+    target_key = ("2x2x1", 4, 2, 8, 1, 1, 1, "a2a_push")
+    by_zero = {_mixed_key(pt): pt for pt in plan_zero.candidates}
+    by_15 = {_mixed_key(pt): pt for pt in plan_15.candidates}
+    by_none = {_mixed_key(pt): pt for pt in plan_none.candidates}
+    assert target_key not in by_zero
+    assert target_key in by_15
+    assert target_key in by_none
+    assert by_none[target_key].min_decode_seqs == pytest.approx(1.0)
+    _assert_unknown_think_l1_and_report(
+        (geom, dt, chip),
+        (scen_none, scen_zero, scen_15),
+        plan_none,
+        tmp_path,
+    )
+
+
+def _find_2x2x1_tp8(candidates: tuple[ParetoPoint, ...], instances: int) -> ParetoPoint:
+    """Select the 2x2x1 TP8 EP8 DCP1 mixed point for one instance count."""
+    tp_deg, ep_deg, unit_axis = 8, 8, 1
+    matches = [
+        pt
+        for pt in candidates
+        if pt.decode_pool.topology == "2x2x1"
+        and pt.decode_pool.instances == instances
+        and pt.decode_pool.tp == tp_deg
+        and pt.decode_pool.dp == unit_axis
+        and pt.decode_pool.ep == ep_deg
+        and pt.decode_pool.pp == unit_axis
+        and pt.decode_pool.pcp == unit_axis
+        and pt.decode_pool.kv_split == unit_axis
+    ]
+    assert matches, f"missing {instances}x 2x2x1 TP8 candidate"
+    return max(matches, key=lambda pt: pt.token_throughput_per_chip)
+
+
+def _assert_multi_instance_cli_and_disagg(
+    model_ctx: tuple[rf.ModelGeometry, rf.Dtypes, rf.ChipSpec],
+    scen_32: TrafficScenario,
+    plan_multi: ServingPlan,
+    pts_by_inst: tuple[ParetoPoint, ParetoPoint],
+) -> None:
+    """Assert multi-instance CLI formatting, layout parsing, attach, and disagg."""
+    geom, dt, chip = model_ctx
+    pt_2x, pt_4x = pts_by_inst
+    inst_2, inst_4, tp_deg, ep_deg, pp_deg = 2, 4, 8, 8, 8
+    chips_4x, single_inst = 16, 1
+
+    cmds_2x = point_launch_args(pt_2x, LaunchOptions(), model="Qwen/Qwen3.5-397B-FP8")[
+        "commands"
+    ]
+    cmds_4x = point_launch_args(pt_4x, LaunchOptions(), model="Qwen/Qwen3.5-397B-FP8")[
+        "commands"
+    ]
+    assert any("2x " in cmd for cmd in cmds_2x)
+    assert any("4x " in cmd for cmd in cmds_4x)
+
+    parsed_4x = parse_layout("4x TP8 x EP8")
+    assert parsed_4x["decode"]["instances"] == inst_4
+    assert parsed_4x["decode"]["tp"] == tp_deg
+    assert parsed_4x["decode"]["ep"] == ep_deg
+    parsed_2x_topo = parse_layout("2x 2x2x1 TP8")
+    assert parsed_2x_topo["decode"]["instances"] == inst_2
+    assert parsed_2x_topo["decode"]["tp"] == tp_deg
+
+    top_pts = top_layouts(plan_multi, 5)
+    ref = reference_layout_report(plan_multi, top_pts, "4x TP8 x EP8", "outside")
+    assert ref["found"] is True
+    assert ref["layout"] == "4x TP8 x EP8"
+    assert isinstance(ref["point"], dict)
+    assert ref["point"]["total_chips"] == chips_4x
+    assert ref["point"]["decode_pool"]["instances"] == inst_4
+
+    payload = build_solve_payload(
+        plan_multi, chip=chip, dtypes=dt, model="Qwen/Qwen3.5-397B-FP8"
+    )
+    attached = attach_reference_report(
+        payload,
+        plan_multi,
+        ref,
+        launch_fn=lambda pt: point_launch_args(
+            pt, LaunchOptions(), model="Qwen/Qwen3.5-397B-FP8"
+        ),
+    )
+    ref_out = attached["reference"]
+    assert ref_out["layout"] == "4x TP8 x EP8"
+    assert ref_out["launch"] is not None
+    assert any("4x " in cmd for cmd in ref_out["launch"]["commands"])
+
+    parsed_disagg = parse_layout("P: PP8 / D: TP8 x EP8")
+    assert "instances" not in parsed_disagg["prefill"]
+    assert "instances" not in parsed_disagg["decode"]
+
+    plan_disagg = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen_32,
+        SolveOptions(mode="disagg", max_chips=64, max_instances=4),
+    )
+    disagg_multi = [
+        pt
+        for pt in plan_disagg.candidates
+        if pt.prefill_pool is not None
+        and pt.prefill_pool.pp == pp_deg
+        and pt.decode_pool.tp == tp_deg
+        and pt.decode_pool.ep == ep_deg
+        and (
+            pt.prefill_pool.instances > single_inst
+            or pt.decode_pool.instances > single_inst
+        )
+    ]
+    assert disagg_multi
+    ref_disagg = reference_layout_report(
+        plan_disagg,
+        top_layouts(plan_disagg, 5),
+        "P: PP8 / D: TP8 x EP8",
+        "outside",
+    )
+    assert ref_disagg["found"] is True
+    assert isinstance(ref_disagg["point"], dict)
+    assert (
+        ref_disagg["point"]["prefill_pool"]["instances"] > single_inst
+        or ref_disagg["point"]["decode_pool"]["instances"] > single_inst
+    )
+
+
+def test_multi_instance_mixed_enumerates_and_scales_throughput_and_cli() -> None:
+    """Verify multi-instance mixed replication enumerates, scales, and emits CLI."""
+    geom, dt, chip = _load_qwen3_5_397b_fp8()
+    base = build_example_scenario("chat-8k1k")
+    scen_32 = dc_replace(base, think_time_s=0.0, concurrencies=(32,))
+    scen_16 = dc_replace(base, think_time_s=0.0, concurrencies=(16,))
+    scen_8 = dc_replace(base, think_time_s=0.0, concurrencies=(8,))
+
+    plan_multi = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen_32,
+        SolveOptions(mode="mixed", max_chips=16, max_instances=4),
+    )
+    plan_c16 = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen_16,
+        SolveOptions(mode="mixed", max_chips=16, max_instances=1),
+    )
+    plan_c8 = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen_8,
+        SolveOptions(mode="mixed", max_chips=16, max_instances=1),
+    )
+
+    pt_1x = _find_2x2x1_tp8(plan_multi.candidates, 1)
+    pt_2x = _find_2x2x1_tp8(plan_multi.candidates, 2)
+    pt_4x = _find_2x2x1_tp8(plan_multi.candidates, 4)
+    chips_1x, chips_2x, chips_4x, expected_distinct = 4, 8, 16, 3
+    assert pt_1x.total_chips == chips_1x
+    assert pt_2x.total_chips == chips_2x
+    assert pt_4x.total_chips == chips_4x
+
+    pool_keys = {
+        _pool_key(pt_1x.decode_pool),
+        _pool_key(pt_2x.decode_pool),
+        _pool_key(pt_4x.decode_pool),
+    }
+    pool_sigs = {
+        _pool_sig(pt_1x.decode_pool),
+        _pool_sig(pt_2x.decode_pool),
+        _pool_sig(pt_4x.decode_pool),
+    }
+    assert len(pool_keys) == expected_distinct
+    assert len(pool_sigs) == expected_distinct
+
+    ref_c16 = _find_2x2x1_tp8(plan_c16.candidates, 1)
+    ref_c8 = _find_2x2x1_tp8(plan_c8.candidates, 1)
+    for lhs, rhs in ((pt_2x, ref_c16), (pt_4x, ref_c8)):
+        assert lhs.token_throughput_per_chip == pytest.approx(
+            rhs.token_throughput_per_chip, rel=1e-6
+        )
+        assert lhs.output_throughput_per_chip == pytest.approx(
+            rhs.output_throughput_per_chip, rel=1e-6
+        )
+        assert lhs.floor_throughput_per_chip == pytest.approx(
+            rhs.floor_throughput_per_chip, rel=1e-6
+        )
+
+    tp8_par = Parallel(
+        tp=8,
+        dp=1,
+        ep=8,
+        moe="ep",
+        moe_dispatch=pt_4x.decode_pool.moe_dispatch,
+    )
+    l1_tput_4x = floor_throughput_per_chip(
+        geom,
+        dt,
+        chip,
+        scen_32,
+        decode_par=tp8_par,
+        decode_topo=TOPOLOGIES["2x2x1"],
+        concurrency=32,
+        y_d=4,
+    )
+    l1_tput_1x_c8 = floor_throughput_per_chip(
+        geom,
+        dt,
+        chip,
+        scen_8,
+        decode_par=tp8_par,
+        decode_topo=TOPOLOGIES["2x2x1"],
+        concurrency=8,
+        y_d=1,
+    )
+    assert l1_tput_4x == pytest.approx(l1_tput_1x_c8, rel=1e-9)
+    _assert_multi_instance_cli_and_disagg(
+        (geom, dt, chip), scen_32, plan_multi, (pt_2x, pt_4x)
+    )
+
+
+def test_reference_layout_report_diagnoses_ruled_out_and_family_skyline() -> None:
+    """Verify reference report surfaces ruled-out SLO bounds and skyline peers."""
+    geom, dt, chip = _load_qwen3_5_397b_fp8()
+    tpot_slo_limit = 1.0
+    scen_tight = TrafficScenario(
+        "tight-dual-slo",
+        4096,
+        512,
+        0.0,
+        1.0,
+        0.0,
+        (32,),
+        1.0,
+        ttft_slo_ms=500.0,
+        tpot_slo_ms=tpot_slo_limit,
+    )
+    plan_tight = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen_tight,
+        SolveOptions(mode="mixed", max_chips=16, max_instances=1),
+    )
+    assert plan_tight.candidates
+    assert all(pt.slo_verdict != SLO_VERDICT_RULED_OUT for pt in plan_tight.candidates)
+    assert plan_tight.ruled_out_candidates
+    assert all(
+        pt.slo_verdict == SLO_VERDICT_RULED_OUT
+        for pt in plan_tight.ruled_out_candidates
+    )
+
+    ref_ruled = reference_layout_report(
+        plan_tight,
+        top_layouts(plan_tight, 5),
+        "TP2 x DP4 x EP8",
+        "outside Pareto frontier",
+    )
+    assert ref_ruled["found"] is False
+    assert ref_ruled["ruled_out"] is True
+    assert ref_ruled["slo_verdict"] == SLO_VERDICT_RULED_OUT
+    assert isinstance(ref_ruled["bound_tpot_ms"], float)
+    assert ref_ruled["bound_tpot_ms"] > tpot_slo_limit
+    assert isinstance(ref_ruled["bound_ttft_ms"], float)
+    assert ref_ruled["bound_ttft_ms"] > 0.0
+    assert isinstance(ref_ruled["hbm_used_gb"], float)
+    assert ref_ruled["hbm_used_gb"] > 0.0
+    reason = str(ref_ruled["rejection_reason"])
+    assert reason == str(ref_ruled["rejected_by"])
+    assert reason
+    assert "outside Pareto frontier" not in reason
+    assert "TPOT" in reason
+    assert "1.0" in reason
+
+    scen_open = dc_replace(
+        build_example_scenario("chat-8k1k"),
+        think_time_s=0.0,
+        concurrencies=(32,),
+    )
+    plan_open = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen_open,
+        SolveOptions(mode="mixed", max_chips=16, max_instances=1),
+    )
+    sky = pareto_skyline_by_concurrency(plan_open, k=5)[32]
+    tp_deg, ep_deg, dcp_sky, dcp_base = 16, 16, 8, 1
+    assert any(
+        pt.decode_pool.tp == tp_deg
+        and pt.decode_pool.ep == ep_deg
+        and pt.decode_pool.kv_split == dcp_sky
+        for pt in sky
+    )
+    assert not any(
+        pt.decode_pool.tp == tp_deg
+        and pt.decode_pool.ep == ep_deg
+        and pt.decode_pool.kv_split == dcp_base
+        for pt in sky
+    )
+
+    ref_fam = reference_layout_report(
+        plan_open,
+        top_layouts(plan_open, 5),
+        "TP16 x EP16",
+        "outside",
+    )
+    assert ref_fam["found"] is True
+    assert ref_fam["ruled_out"] is False
+    assert ref_fam["family_in_skyline_k"] is True
+    assert "DCP8" in str(ref_fam["skyline_family_peer"])

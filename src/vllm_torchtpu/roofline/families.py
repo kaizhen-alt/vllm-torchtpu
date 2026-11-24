@@ -43,6 +43,10 @@ _REF_AXIS_MAP: Final[dict[str, str]] = {
     "DCP": "kv_split",
 }
 _EXPECTED_DISAGG_POOL_PARTS: Final[int] = 2
+_INSTANCE_PREFIX_RE: Final[re.Pattern[str]] = re.compile(r"^\s*(\d+)\s*[xX]\s+(.+)$")
+_TOPOLOGY_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
+    r"^\s*\d+[xX]\d+[xX]\d+\s+(.+)$"
+)
 
 __all__ = [
     "attach_reference_report",
@@ -413,13 +417,30 @@ def build_bound_families_by_concurrency(
     return result
 
 
-def _parse_single_pool_layout(pool_text: str) -> dict[str, int]:
-    """Parse one pool layout string (e.g. 'TP8 x EP8') into an axis dictionary."""
-    stripped_pool_text = pool_text.strip()
-    if not stripped_pool_text:
+def _extract_pool_prefixes(pool_text: str) -> tuple[str, int | None]:
+    """Strip optional leading Nx instances and topology token from one pool string."""
+    remainder = pool_text.strip()
+    if not remainder:
         msg = f"empty layout string: {pool_text!r}"
         raise ValueError(msg)
-    raw_tokens = re.split(r"\s*[xX]\s*", stripped_pool_text)
+    instances: int | None = None
+    inst_match = _INSTANCE_PREFIX_RE.match(remainder)
+    if inst_match is not None:
+        instances = int(inst_match.group(1))
+        if instances < 1:
+            msg = f"instance count must be at least 1: {pool_text!r}"
+            raise ValueError(msg)
+        remainder = inst_match.group(2).strip()
+    topo_match = _TOPOLOGY_PREFIX_RE.match(remainder)
+    if topo_match is not None:
+        remainder = topo_match.group(1).strip()
+    return remainder, instances
+
+
+def _parse_single_pool_layout(pool_text: str) -> dict[str, int]:
+    """Parse one pool layout string (e.g. '4x TP8 x EP8') into an axis dictionary."""
+    axes_text, instances = _extract_pool_prefixes(pool_text)
+    raw_tokens = re.split(r"\s*[xX]\s*", axes_text)
     seen_axes: set[str] = set()
     axis_values: dict[str, int] = {
         "tp": 1,
@@ -429,6 +450,8 @@ def _parse_single_pool_layout(pool_text: str) -> dict[str, int]:
         "pcp": 1,
         "kv_split": 1,
     }
+    if instances is not None:
+        axis_values["instances"] = instances
     for raw_token in raw_tokens:
         token = raw_token.strip()
         if not token:
@@ -530,7 +553,9 @@ def parse_layout(layout_text: str) -> dict[str, dict[str, int]]:
 
 
 def _pool_matches_axes(pool: PoolMeshPlan, axes: Mapping[str, int]) -> bool:
-    """Check if a pool mesh plan matches the exact reference axis values."""
+    """Check if a pool mesh plan matches exact reference axis values."""
+    if "instances" in axes and pool.instances != axes["instances"]:
+        return False
     return (
         pool.tp == axes["tp"]
         and pool.dp == axes["dp"]
@@ -584,6 +609,110 @@ def _best_values_by_non_matching_layout(
     return list(best_by_layout_key.values())
 
 
+def _format_parsed_pool_layout(axes: Mapping[str, int]) -> str:
+    """Format parsed pool axes while preserving any explicit Nx prefix."""
+    base_layout = format_parallelism(axes)
+    if "instances" in axes:
+        return f"{axes['instances']}x {base_layout}"
+    return base_layout
+
+
+def _format_candidate_layout(point: ParetoPoint) -> str:
+    """Format a candidate's topology, instances, and parallelism axes as text."""
+    decode_prefix = (
+        f"{point.decode_pool.instances}x " if point.decode_pool.instances > 1 else ""
+    )
+    decode_text = (
+        f"{decode_prefix}{point.decode_pool.topology} "
+        f"{format_parallelism(asdict(point.decode_pool))}"
+    )
+    if point.prefill_pool is None:
+        return decode_text
+    prefill_prefix = (
+        f"{point.prefill_pool.instances}x " if point.prefill_pool.instances > 1 else ""
+    )
+    prefill_text = (
+        f"{prefill_prefix}{point.prefill_pool.topology} "
+        f"{format_parallelism(asdict(point.prefill_pool))}"
+    )
+    return f"P: {prefill_text} / D: {decode_text}"
+
+
+def _find_skyline_family_peer(
+    plan: ServingPlan,
+    target_point: ParetoPoint | None,
+) -> tuple[bool, str | None]:
+    """Return whether target_point's mesh family has a Top-K skyline peer."""
+    if target_point is None:
+        return False, None
+    skyline_by_conc = pareto_skyline_by_concurrency(plan, k=DEFAULT_TOP_K)
+    target_family = _pair_family_key(target_point)
+    for peer in skyline_by_conc.get(target_point.concurrency, ()):
+        if _pair_family_key(peer) == target_family:
+            return True, _format_candidate_layout(peer)
+    return False, None
+
+
+def _format_ruled_out_reason(candidate: ParetoPoint, plan: ServingPlan) -> str:
+    """Format physical bound vs SLO margin explaining why candidate was ruled out."""
+    use_envelope = plan.activation_model.prunes_on_envelope
+    active_tpot_ms = (
+        candidate.envelope_tpot_ms if use_envelope else candidate.bound_tpot_ms
+    )
+    active_ttft_ms = (
+        candidate.envelope_ttft_ms if use_envelope else candidate.bound_ttft_ms
+    )
+    violations: list[str] = []
+    if (
+        plan.scenario.tpot_slo_ms is not None
+        and active_tpot_ms > plan.scenario.tpot_slo_ms
+    ):
+        margin_ms = active_tpot_ms - plan.scenario.tpot_slo_ms
+        violations.append(
+            f"TPOT lower bound {active_tpot_ms:.3f} ms exceeds TPOT SLO "
+            f"{plan.scenario.tpot_slo_ms:.3f} ms (+{margin_ms:.3f} ms)"
+        )
+    if (
+        plan.scenario.ttft_slo_ms is not None
+        and active_ttft_ms > plan.scenario.ttft_slo_ms
+    ):
+        margin_ms = active_ttft_ms - plan.scenario.ttft_slo_ms
+        violations.append(
+            f"TTFT lower bound {active_ttft_ms:.2f} ms exceeds TTFT SLO "
+            f"{plan.scenario.ttft_slo_ms:.2f} ms (+{margin_ms:.2f} ms)"
+        )
+    if violations:
+        return "; ".join(violations)
+    return (
+        "ruled out by closed-loop capacity ceiling "
+        f"(TPOT bound {active_tpot_ms:.3f} ms, TTFT bound {active_ttft_ms:.2f} ms)"
+    )
+
+
+def _point_diagnostics(point: ParetoPoint | None) -> dict[str, object]:
+    """Extract uniform scalar bound and memory diagnostic fields for one candidate."""
+    if point is None:
+        return {
+            "slo_verdict": None,
+            "bound_tpot_ms": None,
+            "bound_ttft_ms": None,
+            "floor_throughput_per_chip": None,
+            "hbm_used_gb": None,
+            "min_decode_seqs": None,
+        }
+    hbm_used_gb = point.decode_pool.hbm_used_gb
+    if point.prefill_pool is not None:
+        hbm_used_gb = max(hbm_used_gb, point.prefill_pool.hbm_used_gb)
+    return {
+        "slo_verdict": effective_slo_verdict(point),
+        "bound_tpot_ms": point.bound_tpot_ms,
+        "bound_ttft_ms": point.bound_ttft_ms,
+        "floor_throughput_per_chip": point.floor_throughput_per_chip,
+        "hbm_used_gb": hbm_used_gb,
+        "min_decode_seqs": point.min_decode_seqs,
+    }
+
+
 def reference_layout_report(
     plan: ServingPlan,
     top_points: Sequence[ParetoPoint],
@@ -594,11 +723,11 @@ def reference_layout_report(
     parsed_layout = parse_layout(layout_text)
     if "prefill" in parsed_layout:
         normalized_layout = (
-            f"P: {format_parallelism(parsed_layout['prefill'])} / "
-            f"D: {format_parallelism(parsed_layout['decode'])}"
+            f"P: {_format_parsed_pool_layout(parsed_layout['prefill'])} / "
+            f"D: {_format_parsed_pool_layout(parsed_layout['decode'])}"
         )
     else:
-        normalized_layout = format_parallelism(parsed_layout["decode"])
+        normalized_layout = _format_parsed_pool_layout(parsed_layout["decode"])
 
     matching_candidates = [
         candidate
@@ -606,12 +735,15 @@ def reference_layout_report(
         if _candidate_matches_layout(candidate, parsed_layout)
     ]
     found = len(matching_candidates) > 0
+    ruled_out = False
+    diag_point: ParetoPoint | None = None
 
     if found:
         best_candidate = max(
             matching_candidates,
             key=lambda candidate: candidate.token_throughput_per_chip,
         )
+        diag_point = best_candidate
         peer_candidates = [
             candidate
             for candidate in plan.candidates
@@ -656,17 +788,42 @@ def reference_layout_report(
         rank_by_estimated_throughput = None
         in_top_k = False
         candidate_point_dict = None
-        final_rejection_reason = rejected_by
+        ruled_matches = [
+            cand
+            for cand in plan.ruled_out_candidates
+            if _candidate_matches_layout(cand, parsed_layout)
+        ]
+        if ruled_matches:
+            ruled_out = True
+            diag_point = min(
+                ruled_matches,
+                key=lambda cand: (
+                    cand.bound_tpot_ms,
+                    cand.bound_ttft_ms,
+                    -cand.token_throughput_per_chip,
+                ),
+            )
+            final_rejection_reason = _format_ruled_out_reason(diag_point, plan)
+        else:
+            final_rejection_reason = rejected_by
 
+    family_in_skyline_k, skyline_family_peer = _find_skyline_family_peer(
+        plan, diag_point
+    )
     return {
         "layout": normalized_layout,
         "found": found,
+        "ruled_out": ruled_out,
         "candidates": num_candidates,
         "rank_by_tpot_bound": rank_by_tpot_bound,
         "rank_by_estimated_throughput": rank_by_estimated_throughput,
         "in_top_k": in_top_k,
+        "family_in_skyline_k": family_in_skyline_k,
+        "skyline_family_peer": skyline_family_peer,
         "point": candidate_point_dict,
         "rejected_by": final_rejection_reason,
+        "rejection_reason": final_rejection_reason,
+        **_point_diagnostics(diag_point),
     }
 
 

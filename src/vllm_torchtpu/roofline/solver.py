@@ -44,6 +44,7 @@ from .constants import (
     UNIT_GIBI,
     UNIT_GIGA,
     UNIT_MILLIS_PER_SECOND,
+    UNKNOWN_THINK_TIME_WARNING,
     ZERO_THINK_TIME_WARNING,
     ParallelRules,
     SloVerdict,
@@ -505,6 +506,25 @@ def _count_disagg_ratio_slots(
     return slots
 
 
+def _mixed_max_instances(eval_context: _SolveContext, topo: SliceTopology) -> int:
+    """Return max mixed-pool identical slice replicas permitted within budgets."""
+    if eval_context.max_chips is None:
+        return 1
+    cap = (
+        eval_context.max_instances
+        if eval_context.max_instances is not None
+        else DEFAULT_MAX_INSTANCES
+    )
+    return max(1, min(cap, eval_context.max_chips // max(1, topo.num_chips)))
+
+
+def _mixed_instance_counts(max_instances: int, concurrency: int) -> tuple[int, ...]:
+    """Return feasible replica counts m in 1..max_instances for one concurrency."""
+    return tuple(
+        inst for inst in range(1, max_instances + 1) if inst == 1 or inst <= concurrency
+    )
+
+
 def _count_core_grid(
     eval_context: _SolveContext,
     topologies: Sequence[SliceTopology],
@@ -527,10 +547,12 @@ def _count_core_grid(
                 and topology.num_chips > eval_context.max_chips
             ):
                 continue
-            total += (
-                _count_core_valid_layouts(topology.num_cores, has_moe=has_moe)
-                * concurrency_count
+            layout_count = _count_core_valid_layouts(
+                topology.num_cores, has_moe=has_moe
             )
+            max_m = _mixed_max_instances(eval_context, topology)
+            for concurrency in eval_context.scenario.concurrencies:
+                total += layout_count * len(_mixed_instance_counts(max_m, concurrency))
     if eval_context.mode in ("auto", "disagg"):
         for decode_topology in topologies:
             if (
@@ -1015,6 +1037,7 @@ class _MixedLoopInput:
     eff_isl_c: int = 0
     duration_kind: _StepDurationKind = "serial_estimate"
     ttft_upper_s: float | None = None
+    instances: int = 1
 
 
 def _step_duration_s(
@@ -1212,6 +1235,7 @@ def _apply_capacity_ceiling_verdict(
         or concurrency <= 0
         or scen.ttft_slo_ms is None
         or scen.tpot_slo_ms is None
+        or scen.think_time_s is None
     ):
         return verdict
     x_min = float(concurrency) / max(
@@ -1453,6 +1477,8 @@ def _eval_unpadded_decode_res(
 def _mixed_capacity_work_bound(
     bound_in: _BoundDecodeInput,
     b_cap_single: int,
+    *,
+    instances: int = 1,
 ) -> float:
     """Return isolated mixed-pool X_cap_pool ceiling (req/s) via unpadded times."""
     dec_steps_per_req = max(1.0, float(bound_in.scenario.osl) / bound_in.eff_al)
@@ -1464,7 +1490,8 @@ def _mixed_capacity_work_bound(
     req_time_s = max(
         pre_res[i] + dec_scale * dec_res[i] for i in range(_UNPADDED_BUCKET_COUNT)
     )
-    return float(max(1, bound_in.decode_par.dp)) / max(_CAP_DENOM_EPS, req_time_s)
+    idp_val = max(1, max(1, instances) * max(1, bound_in.decode_par.dp))
+    return float(idp_val) / max(_CAP_DENOM_EPS, req_time_s)
 
 
 def _disagg_capacity_work_bound(
@@ -1538,10 +1565,14 @@ def _compute_mixed_capacity_bound(
     topo: SliceTopology,
     par: Parallel,
     b_cap_single: int,
+    *,
+    instances: int = 1,
 ) -> float:
     """Isolated unpadded work-conservation ceiling X_cap_pool (req/s) for mixed."""
     return _mixed_capacity_work_bound(
-        _context_to_bound_input(eval_context, topo, par), b_cap_single
+        _context_to_bound_input(eval_context, topo, par),
+        b_cap_single,
+        instances=instances,
     )
 
 
@@ -1571,7 +1602,7 @@ def _run_isolated_tarski_loop(
     """Run bottom-up Tarski pure-decode hard_floor residency fixed-point loop."""
     scenario = bound_in.scenario
     ttft_slo_ms = scenario.ttft_slo_ms
-    if ttft_slo_ms is None:
+    if ttft_slo_ms is None or scenario.think_time_s is None:
         return (1.0, _eval_bound_decode_floor(bound_in, 1))
     ttft_upper_s = ttft_slo_ms / UNIT_MILLIS_PER_SECOND
     osl = float(scenario.osl)
@@ -1643,12 +1674,13 @@ def _resolve_l1_x_cap(
             bound_in, pref_par, pref_topo, (x_p, y_d, b_cap_single)
         )
         return (x_cap_val, pref_par, pref_topo, x_p, y_d)
+    y_d = max(1, opts.get("y_d", 1))
     return (
-        _mixed_capacity_work_bound(bound_in, b_cap_single),
+        _mixed_capacity_work_bound(bound_in, b_cap_single, instances=y_d),
         bound_in.decode_par,
         bound_in.decode_topo,
         1,
-        1,
+        y_d,
     )
 
 
@@ -1753,12 +1785,13 @@ def x_bound(
     )
     sf_b1 = _eval_bound_decode_floor(bound_in, 1)
     bound_tpot_b1_s = sf_b1.hard_floor_s / bound_in.eff_al
+    think_eff = scenario.think_time_s if scenario.think_time_s is not None else 0.0
     return min(
         x_cap_val,
         float(conc)
         / max(
             _RATE_FLOOR_EPS,
-            b_ttft_s + float(scenario.osl) * bound_tpot_b1_s + scenario.think_time_s,
+            b_ttft_s + float(scenario.osl) * bound_tpot_b1_s + think_eff,
         ),
     )
 
@@ -1787,7 +1820,8 @@ def floor_throughput_per_chip(
             y_d = max(1, opts.get("y_d", 1))
             total_chips = x_p * pref_topo.num_chips + y_d * dec_topo.num_chips
         else:
-            total_chips = dec_topo.num_chips
+            y_d = max(1, opts.get("y_d", 1))
+            total_chips = y_d * dec_topo.num_chips
     return (x_rate_bound * float(scenario.isl + scenario.osl)) / float(
         max(1, total_chips)
     )
@@ -2093,23 +2127,23 @@ def _solve_mixed_think_batch(
     par: Parallel,
     c: int,
     sf_ttft: StepFloor,
+    *,
+    idp: int | None = None,
 ) -> int:
     """Resolve Little's-law active local batch size under non-zero think time."""
     dec_steps_per_req = max(1.0, eval_context.scenario.osl / eval_context.eff_al)
-    b_local = max(1, math.ceil(c / max(1, par.dp)))
-    if eval_context.scenario.think_time_s <= 0.0:
+    eff_idp = max(1, par.dp) if idp is None else max(1, idp)
+    b_local = max(1, math.ceil(c / eff_idp))
+    think = eval_context.scenario.think_time_s
+    if think is None or think <= 0.0:
         return b_local
     for _ in range(2):
         sf_dec_tmp = _eval_decode_floor(eval_context, topo, par, b_local)
         service_time_s = (
             sf_ttft.serial_estimate_s + dec_steps_per_req * sf_dec_tmp.serial_estimate_s
         )
-        active_concurrency = (
-            float(c)
-            * service_time_s
-            / (service_time_s + eval_context.scenario.think_time_s)
-        )
-        b_local = max(1, math.ceil(active_concurrency / max(1, par.dp)))
+        active_concurrency = float(c) * service_time_s / (service_time_s + think)
+        b_local = max(1, math.ceil(active_concurrency / eff_idp))
     return b_local
 
 
@@ -2119,9 +2153,13 @@ def _fit_mixed_batch_with_logits(
     par: Parallel,
     c: int,
     bounds: _MixedPointBounds,
+    *,
+    idp: int | None = None,
 ) -> tuple[int, int, HbmBreakdown] | None:
     """Compute active local batch and HBM-fitting resident batch with logit peak."""
-    b_local = _solve_mixed_think_batch(eval_context, topo, par, c, bounds.sf_ttft)
+    b_local = _solve_mixed_think_batch(
+        eval_context, topo, par, c, bounds.sf_ttft, idp=idp
+    )
     b_res = min(b_local, bounds.b_hbm_max, bounds.b_smem_max)
     if eval_context.scenario.max_num_seqs is not None:
         b_res = min(b_res, eval_context.scenario.max_num_seqs)
@@ -2171,10 +2209,14 @@ def _solve_mixed_decode_fixed_point(
 ) -> _MixedLoopOutput:
     """Solve 3-step Little's-law fixed point for mixed prefill-decode serving."""
     eff_al = eval_context.eff_al
-    think = eval_context.scenario.think_time_s
+    think = (
+        0.0
+        if eval_context.scenario.think_time_s is None
+        else eval_context.scenario.think_time_s
+    )
     osl = float(eval_context.scenario.osl)
     dec_steps_per_req = max(1.0, osl / eff_al)
-    dp_val = max(1, par.dp)
+    dp_val = max(1, loop_in.instances * max(1, par.dp))
     max_decode_seqs = float(loop_in.b_res * dp_val)
     b_dec = max(1.0, min(float(min(c, int(max_decode_seqs))), float(c)))
     opts = FloorOptions(
@@ -2301,11 +2343,16 @@ def _evaluate_mixed_point(
     par: Parallel,
     c: int,
     bounds: _MixedPointBounds,
+    *,
+    instances: int = 1,
 ) -> ParetoPoint | None:
-    """Evaluate one concurrency target for a single-pool mixed serving configuration."""
+    """Evaluate one concurrency target for a single- or multi-instance mixed pool."""
     if bounds.b_hbm_max < 1 or bounds.b_smem_max < 1:
         return None
-    fitted = _fit_mixed_batch_with_logits(eval_context, topo, par, c, bounds)
+    eff_instances = max(1, instances)
+    idp = eff_instances * max(1, par.dp)
+    total_chips = eff_instances * topo.num_chips
+    fitted = _fit_mixed_batch_with_logits(eval_context, topo, par, c, bounds, idp=idp)
     if fitted is None:
         return None
     _b_local, b_res, hbm_bd = fitted
@@ -2316,7 +2363,7 @@ def _evaluate_mixed_point(
         * UNIT_GIBI
         / float(max(1, par.tp * par.pp * par.dp * par.pcp))
     )
-    b_ws = max(1, math.ceil(c / max(1, par.dp)))
+    b_ws = max(1, math.ceil(c / idp))
     cap_tok, h_eff = kv_capacity_and_hit_rate(
         eval_context.geom,
         eval_context.dtypes,
@@ -2383,15 +2430,14 @@ def _evaluate_mixed_point(
             ttft_service_s=ttft_service_s,
             pcie_read_s=pcie_read_s,
             eff_isl_c=eff_isl_c,
+            instances=eff_instances,
         ),
     )
     interactivity = UNIT_MILLIS_PER_SECOND / max(_RATE_FLOOR_EPS, solved.est_tpot_ms)
-    out_tput = (solved.x_rate * float(eval_context.scenario.osl)) / float(
-        topo.num_chips
-    )
+    out_tput = (solved.x_rate * float(eval_context.scenario.osl)) / float(total_chips)
     tot_tput = (
         solved.x_rate * float(eval_context.scenario.isl + eval_context.scenario.osl)
-    ) / float(topo.num_chips)
+    ) / float(total_chips)
     b_cap_single = max(
         1,
         min(
@@ -2404,9 +2450,16 @@ def _evaluate_mixed_point(
             ),
         ),
     )
-    x_cap_val = _compute_mixed_capacity_bound(eval_context, topo, par, b_cap_single)
+    x_cap_val = _compute_mixed_capacity_bound(
+        eval_context, topo, par, b_cap_single, instances=eff_instances
+    )
     bound_in = _context_to_bound_input(eval_context, topo, par)
     sf_dec_b1 = _eval_bound_decode_floor(bound_in, 1)
+    think_eff = (
+        0.0
+        if eval_context.scenario.think_time_s is None
+        else eval_context.scenario.think_time_s
+    )
     x_bound_val = min(
         x_cap_val,
         float(c)
@@ -2415,14 +2468,14 @@ def _evaluate_mixed_point(
             bound_ttft_val / UNIT_MILLIS_PER_SECOND
             + float(eval_context.scenario.osl)
             * (sf_dec_b1.hard_floor_s / eval_context.eff_al)
-            + eval_context.scenario.think_time_s,
+            + think_eff,
         ),
     )
     floor_tput = (
         x_bound_val * float(eval_context.scenario.isl + eval_context.scenario.osl)
-    ) / float(topo.num_chips)
+    ) / float(total_chips)
     min_decode_seqs, bound_sf_dec = _run_isolated_tarski_loop(
-        bound_in, c, b_cap_single, max(1, par.dp), x_cap_val
+        bound_in, c, b_cap_single, idp, x_cap_val
     )
     bound_tpot_val = (
         bound_sf_dec.hard_floor_s * UNIT_MILLIS_PER_SECOND
@@ -2452,7 +2505,7 @@ def _evaluate_mixed_point(
     pool = _build_pool_mesh_plan(
         _PoolPlanInput(
             role="mixed",
-            instances=1,
+            instances=eff_instances,
             topo=topo,
             par=par,
             hbm_used_gb=hbm_b / UNIT_GIGA,
@@ -2474,7 +2527,7 @@ def _evaluate_mixed_point(
     return ParetoPoint(
         mode="mixed",
         concurrency=c,
-        total_chips=topo.num_chips,
+        total_chips=total_chips,
         prefill_pool=None,
         decode_pool=pool,
         est_ttft_ms=solved.est_ttft_ms,
@@ -2568,11 +2621,35 @@ def _decode_capacity_profile(
     )
 
 
+def _evaluate_mixed_par_points(
+    eval_context: _SolveContext,
+    topo: SliceTopology,
+    par: Parallel,
+    bounds: _MixedPointBounds,
+    max_instances: int,
+) -> list[ParetoPoint]:
+    """Evaluate all feasible (concurrency, instances) slots for one mixed layout."""
+    out: list[ParetoPoint] = []
+    if bounds.b_hbm_max < 1 or bounds.b_smem_max < 1:
+        for c in eval_context.scenario.concurrencies:
+            eval_context.enumerated += len(_mixed_instance_counts(max_instances, c))
+        return out
+    for c in eval_context.scenario.concurrencies:
+        for instances in _mixed_instance_counts(max_instances, c):
+            eval_context.enumerated += 1
+            pt = _evaluate_mixed_point(
+                eval_context, topo, par, c, bounds, instances=instances
+            )
+            if pt is not None:
+                out.append(pt)
+    return out
+
+
 def _evaluate_mixed_candidates(
     eval_context: _SolveContext,
     topos: list[SliceTopology],
 ) -> tuple[list[ParetoPoint], float, float]:
-    """Evaluate all single-pool mixed candidate parallelisms across topologies."""
+    """Evaluate single- and multi-instance mixed parallelisms across topologies."""
     candidates: list[ParetoPoint] = []
     min_c1_tpot_ms = math.inf
     min_req_ttft_ms = math.inf
@@ -2591,6 +2668,7 @@ def _evaluate_mixed_candidates(
             and topo.num_chips > eval_context.max_chips
         ):
             continue
+        max_m = _mixed_max_instances(eval_context, topo)
         for par in _candidate_decode_parallels(
             eval_context.geom, topo, chip=eval_context.chip
         ):
@@ -2635,11 +2713,9 @@ def _evaluate_mixed_candidates(
                 sf_ttft=sf_ttft,
                 fixed_kv_per_seq_b=fixed_kv_per_seq_b,
             )
-            for c in eval_context.scenario.concurrencies:
-                eval_context.enumerated += 1
-                pt = _evaluate_mixed_point(eval_context, topo, par, c, bounds)
-                if pt is not None:
-                    candidates.append(pt)
+            candidates.extend(
+                _evaluate_mixed_par_points(eval_context, topo, par, bounds, max_m)
+            )
     return candidates, min_c1_tpot_ms, min_req_ttft_ms
 
 
@@ -2654,7 +2730,11 @@ def _run_disagg_decode_loop(
     prefill_wait_s, duration_kind, rate_dcn_cap = loop_ctrl
     eff_al = eval_context.eff_al
     dec_steps_per_req = max(1.0, eval_context.scenario.osl / eff_al)
-    think = eval_context.scenario.think_time_s
+    think = (
+        0.0
+        if eval_context.scenario.think_time_s is None
+        else eval_context.scenario.think_time_s
+    )
     osl = float(eval_context.scenario.osl)
     idp_val = max(1, target.y_d * dec.par.dp)
     max_decode_seqs = float(batch_stats.b_res * idp_val)
@@ -2693,7 +2773,11 @@ def _compute_disagg_metrics(
     batch_stats: _DisaggBatchStats,
 ) -> _DisaggMetricsOutput:
     """Solve coupled Little's-law fixed point for a disaggregated candidate."""
-    think = eval_context.scenario.think_time_s
+    think = (
+        0.0
+        if eval_context.scenario.think_time_s is None
+        else eval_context.scenario.think_time_s
+    )
     osl = float(eval_context.scenario.osl)
     uncached_d_tok = max(
         0, math.ceil((1.0 - batch_stats.h_eff) * eval_context.scenario.isl)
@@ -2802,7 +2886,8 @@ def _solve_disagg_think_batch(
     """Resolve Little's-law active local batch for disaggregated decode pool."""
     dec_steps_per_req = max(1.0, eval_context.scenario.osl / eval_context.eff_al)
     b_local = max(1, math.ceil(target.c / max(1, target.y_d * dec.par.dp)))
-    if eval_context.scenario.think_time_s <= 0.0:
+    think = eval_context.scenario.think_time_s
+    if think is None or think <= 0.0:
         return b_local
     for _ in range(2):
         decode_step_floor = _eval_decode_floor(eval_context, dec.topo, dec.par, b_local)
@@ -2810,11 +2895,7 @@ def _solve_disagg_think_batch(
             pref.ttft_ms / UNIT_MILLIS_PER_SECOND
             + dec_steps_per_req * decode_step_floor.serial_estimate_s
         )
-        active_concurrency = (
-            float(target.c)
-            * service_time_s
-            / (service_time_s + eval_context.scenario.think_time_s)
-        )
+        active_concurrency = float(target.c) * service_time_s / (service_time_s + think)
         b_local = max(
             1, math.ceil(active_concurrency / max(1, target.y_d * dec.par.dp))
         )
@@ -3212,7 +3293,10 @@ def _finalize_plan_selection(
     )
     if recommended is not None and recommended.slo_verdict == SLO_VERDICT_UNDECIDED:
         warnings.append(UNDECIDED_SLO_WARNING)
-    if scenario.think_time_s <= 0.0:
+    if scenario.think_time_s is None:
+        if scenario.ttft_slo_ms is not None and scenario.tpot_slo_ms is not None:
+            warnings.append(UNKNOWN_THINK_TIME_WARNING)
+    elif scenario.think_time_s <= 0.0:
         warnings.append(ZERO_THINK_TIME_WARNING)
     return (not_ruled_out, pool_for_frontier, frontier, recommended)
 
@@ -3453,6 +3537,31 @@ class _ExplainOptions(TypedDict, total=False):
     spec_k: int
 
 
+def _explain_mixed_instance_budget(
+    decode_axes: Mapping[str, int],
+    decode_topologies: Sequence[SliceTopology],
+    options: SolveOptions,
+) -> str | None:
+    """Return budget rejection reason when explicit Nx mixed instances exceed limits."""
+    instances = decode_axes.get("instances")
+    if instances is None or options.mode == "disagg":
+        return None
+    if options.max_instances is not None and instances > options.max_instances:
+        return (
+            f"requested {instances}x instances exceeds "
+            f"max_instances={options.max_instances}"
+        )
+    needed_cores = decode_axes.get("tp", 1) * decode_axes.get("dp", 1)
+    matching_topos = [t for t in decode_topologies if t.num_cores == needed_cores]
+    if (
+        options.max_chips is not None
+        and matching_topos
+        and all(instances * t.num_chips > options.max_chips for t in matching_topos)
+    ):
+        return f"{instances}x slice footprint exceeds max_chips={options.max_chips}"
+    return None
+
+
 def explain_layout_rejection(
     geom: ModelGeometry,
     layout: Mapping[str, Mapping[str, int]],
@@ -3496,6 +3605,12 @@ def explain_layout_rejection(
     )
     if decode_reason is not None:
         return decode_reason
+
+    instance_reason = _explain_mixed_instance_budget(
+        layout["decode"], decode_topologies, options
+    )
+    if instance_reason is not None:
+        return instance_reason
 
     if "prefill" in layout:
         prefill_reason = _explain_prefill_rejection(
@@ -3721,6 +3836,9 @@ def solve_serving_plan(
     not_ruled_out_candidates, pool_for_frontier, frontier, recommended = (
         _finalize_plan_selection(scenario, candidates, warnings)
     )
+    ruled_out_candidates = tuple(
+        cand for cand in candidates if cand.slo_verdict == SLO_VERDICT_RULED_OUT
+    )
     pruned_sweep = prune_sweep_candidates(geom, dtypes, chip, scenario, candidates)
     base_plan = ServingPlan(
         model_layers=geom.num_layers,
@@ -3731,6 +3849,7 @@ def solve_serving_plan(
         frontier=frontier,
         warnings=tuple(warnings),
         candidates=tuple(pool_for_frontier),
+        ruled_out_candidates=ruled_out_candidates,
         gpu_memory_utilization=opts.gpu_memory_utilization,
         collective_latency_s=opts.collective_latency_s,
         spec_k=spec_k,

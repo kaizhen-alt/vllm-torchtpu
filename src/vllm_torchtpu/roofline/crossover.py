@@ -270,6 +270,7 @@ def _pool_sig(pool: PoolMeshPlan) -> tuple[object, ...]:
     """Return canonical layout signature identifying a pool configuration."""
     return (
         pool.topology,
+        pool.instances,
         pool.tp,
         pool.dp,
         pool.ep,
@@ -1044,7 +1045,7 @@ class _CrossoverPlanner:
         )
         self.dec_steps = max(1.0, scen.osl / self.eff_al)
         has_dcn = chip.dcn_bw > 0.0 and math.isfinite(chip.dcn_bw)
-        self.think_s = scen.think_time_s
+        self.think_s = 0.0 if scen.think_time_s is None else scen.think_time_s
         self.need_wire = has_dcn
 
         self.pool_ids: dict[tuple[object, ...], int] = {}

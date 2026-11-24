@@ -496,7 +496,10 @@ def _format_pool_commands(
         elif is_disagg:
             commands.append(f"# {pool.role} ({pool.instances}x {pool.topology}): {cmd}")
         elif is_multihost:
-            commands.append(f"# host {rank} ({pool.topology}): {cmd}")
+            inst_prefix = f"{pool.instances}x " if pool.instances > 1 else ""
+            commands.append(f"# host {rank} ({inst_prefix}{pool.topology}): {cmd}")
+        elif pool.instances > 1:
+            commands.append(f"# {pool.instances}x {pool.topology}: {cmd}")
         else:
             commands.append(cmd)
     return commands

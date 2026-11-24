@@ -618,6 +618,14 @@ ZERO_THINK_TIME_WARNING: str = (
     "matches concurrency up to the HBM/SMEM cap without client request pauses."
 )
 
+# Informational warning emitted when closed-loop think_time_s is unspecified.
+UNKNOWN_THINK_TIME_WARNING: str = (
+    "Closed-loop think_time_s was unspecified (None): Little's-law capacity "
+    "ceiling and Tarski batch-inflation SLO pruning were skipped to avoid false "
+    "rejections; pass --think-time-s 0 for saturation or --think-time-s <sec> "
+    "for multi-turn closed-loop pruning."
+)
+
 ACTIVATION_HULL_SCHEMA: str = "vllm_torchtpu.roofline.moe_activation_hull/v1"
 # Float64 slope rounding scales as ulp(active) / spacing (~1e-13 for 512
 # experts); 1e-9 experts/token absorbs JSON float formatting slack.

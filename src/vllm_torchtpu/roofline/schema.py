@@ -60,7 +60,7 @@ class TrafficScenario:
     osl: int
     prefix_hit_rate: float
     accept_len: float
-    think_time_s: float
+    think_time_s: float | None
     concurrencies: tuple[int, ...]
     kv_working_set_turns: float
     prefill_chunk: int = DEFAULT_PREFILL_CHUNK
@@ -83,7 +83,7 @@ class TrafficScenario:
             msg = f"accept_len must be >= 1.0, got {self.accept_len}"
             raise ValueError(msg)
         self._validate_spec_tokens()
-        if self.think_time_s < 0.0:
+        if self.think_time_s is not None and self.think_time_s < 0.0:
             msg = f"think_time_s must be >= 0, got {self.think_time_s}"
             raise ValueError(msg)
         if not self.concurrencies or any(c <= 0 for c in self.concurrencies):
@@ -248,6 +248,7 @@ class ServingPlan:
         default_factory=ExpertActivationModel
     )
     runtime_profile: str = DEFAULT_RUNTIME_PROFILE
+    ruled_out_candidates: tuple[ParetoPoint, ...] = ()
 
 
 class PointLaunchPayload(TypedDict):
@@ -344,7 +345,9 @@ class CeilingRow(TypedDict):
     floor_throughput_per_chip: float
 
 
-type PoolStructKey = tuple[str, int, int, int, int, int, int, tuple[int, ...] | None]
+type PoolStructKey = tuple[
+    str, int, int, int, int, int, int, int, tuple[int, ...] | None
+]
 
 
 def effective_slo_verdict(pt: ParetoPoint) -> SloVerdict:
@@ -472,6 +475,7 @@ def _pool_key(pool: PoolMeshPlan | None) -> PoolStructKey | None:
         return None
     return (
         pool.topology,
+        pool.instances,
         pool.tp,
         pool.dp,
         pool.ep,
