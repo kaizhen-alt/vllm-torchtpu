@@ -199,3 +199,47 @@ python -m vllm_torchtpu.roofline solve \
   --max-chips 4 \
   --json
 ```
+
+## 4. Runtime Profiles (`ParallelRules` / `RuntimeProfile`) and Open-Loop Scenarios
+
+### Runtime Admission Profiles (`--runtime-profile main` vs. `hardware`)
+
+Each canonical `ModelSpec` pairs declarative `ParallelRules` with allowed KV
+cache dtypes inside `RuntimeProfile` (`constants.py`). Pass
+`--runtime-profile` across `inspect`, `solve`, `plan`, `emit`, `ceiling`, and
+`explain`:
+
+| Profile | Intended Scope | Parallel & Feature Gates | Admitted KV Dtypes |
+| :--- | :--- | :--- | :--- |
+| `main` (default) | Current runtime parity | Enforces per-model `ParallelRules` (for example prefill `DCP` mode, `PP`/`PCP` caps, `qwen4_exp` bring-up rules) | `"bf16"`, `"fp8"` |
+| `hardware` | Unbridled L1 hardware ceiling | Uses `HARDWARE_PHYSICS_PROFILE`: lifts experimental bring-up overrides, prefill `DCP`/`PCP`/`PP` caps, and speculative draft limits | `"bf16"`, `"fp8"`, `"fp4"` |
+
+When `runtime_profile="main"` is active, passing `--kv-dtype fp4` or
+`--from-serve-cmd "... --kv-cache-dtype turboquant_4bit_nc"` is rejected cleanly
+with exit code `2`. Switching to `--runtime-profile hardware` admits 4-bit KV
+dtypes (emitting `--kv-cache-dtype fp4` in `emit` and `solve` launch payloads)
+and unlocks unmodified `qwen4_exp` configs without `--hf-overrides`:
+
+```bash
+python -m vllm_torchtpu.roofline solve \
+  --model Qwen/Qwen3.8-Flash-Next-FP8 \
+  --runtime-profile hardware \
+  --kv-dtype fp4 \
+  --example-scenario coding-agent \
+  --max-chips 16 \
+  --json
+```
+
+### Open-Loop Scenarios (`think_time_s = None`)
+
+Omitting `--think-time-s` in either custom `solve` invocations or
+`--from-serve-cmd` / `--from-bench-cmd` workflows keeps
+`scenario.think_time_s = None` (open-loop mode) instead of assuming zero pause
+(`0.0 s`):
+
+- **Open-loop (`--think-time-s` omitted, `think_time_s = None`)**: L1 pruning
+  checks per-request `bound_ttft_ms`, batch-1 `bound_tpot_ms`, and HBM/SMEM
+  capacity bounds without enforcing closed-loop saturation capacity floors.
+- **Closed-loop (`--think-time-s <seconds>`)**: enables closed-loop Little's
+  law minimum throughput demand and Tarski residency estimation for saturation
+  benchmarks (`0.0`) or fixed client think pauses.
