@@ -270,3 +270,24 @@ def test_hint_matches_runner_rank_local_rows(check_budget, pcp, interleave, budg
 @pytest.mark.parametrize("sizes", [[], None])
 def test_no_compile_sizes_is_skipped(check_budget, sizes):
     check_budget(_budget_config(sizes, 16384))
+
+
+def test_interleaved_pcp_manager_requires_512_multiple_compile_size(
+    check_budget, monkeypatch
+):
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", True)
+    cfg = _budget_config([1000, 3000], 8192, pcp=4, interleave=128)
+    cfg.model_config = SimpleNamespace(use_mla=False)
+    with pytest.raises(ValueError, match="divisible by 512"):
+        check_budget(cfg)
+
+    cfg_small = _budget_config([512, 3000], 8192, pcp=4, interleave=128)
+    cfg_small.model_config = SimpleNamespace(use_mla=False)
+    with pytest.raises(ValueError, match="at least 2048"):
+        check_budget(cfg_small)
+
+    cfg_ok = _budget_config([512, 2048, 3000], 8192, pcp=4, interleave=128)
+    cfg_ok.model_config = SimpleNamespace(use_mla=False)
+    check_budget(cfg_ok)
