@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
@@ -504,6 +505,7 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_RELOAD_MODULES",
         "TPU_MOE_ROUTER_TOPK",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
+        "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS",
         "TPU_DP_VOCAB_PARALLEL",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
@@ -521,6 +523,18 @@ class TpuPlatform(Platform):
         "TPU_PCP_KV_WORKSPACE_TOKENS",
         "TPU_PCP_KV_CHUNK_TOKENS",
     ]
+
+    @classmethod
+    def pre_register_and_update(
+        cls, parser: "FlexibleArgumentParser | None" = None
+    ) -> None:
+        if parser is not None:
+            # Default EP weight filtering on for CLI entry points (`vllm serve`).
+            # Both model loaders gate on MoE + EP (+ non-EPLB for Run:AI), so
+            # this is a no-op for dense or non-EP runs while letting
+            # --disable-ep-weight-filter / --config YAML opt-outs travel cleanly
+            # through EngineArgs and pickled VllmConfig into spawned children.
+            parser.set_defaults(enable_ep_weight_filter=True)
 
     # The "Platform" base class has import_kernels() that tries to import
     # vllm._C, which is not available in the TPU Platform setup.
