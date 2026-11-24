@@ -54,6 +54,8 @@ from vllm_torchtpu.roofline import (
     scale_pp_stage_floor,
     solve_serving_plan,
 )
+from vllm_torchtpu.roofline import constants as rf_constants
+from vllm_torchtpu.roofline import solver as rf_solver
 from vllm_torchtpu.roofline.constants import DEFAULT_GPU_MEMORY_UTILIZATION, UNIT_GIGA
 from vllm_torchtpu.roofline.geometry import (
     UnsupportedArchitectureError,
@@ -2360,15 +2362,53 @@ def test_qwen4_exp_main_vs_hardware_profile_and_fp4_kv_gate() -> None:
     assert plan_spec.recommended is None
     assert any("speculative" in w.lower() for w in plan_spec.warnings)
 
-    fp4_cfg = {
-        **raw_cfg,
-        "quantization_config": {
-            **dict(raw_cfg["quantization_config"]),
-            "kv_cache_scheme": "fp4",
-        },
-    }
-    with pytest.raises(ValueError, match="Unsupported 4-bit/FP4 KV"):
-        dtypes_from_hf_config(fp4_cfg)
+    for bad_kv_scheme in ("fp4", "int4_per_token_head"):
+        with pytest.raises(ValueError, match="Unsupported 4-bit/FP4 KV"):
+            dtypes_from_hf_config(
+                {
+                    **raw_cfg,
+                    "quantization_config": {
+                        **dict(raw_cfg["quantization_config"]),
+                        "kv_cache_scheme": bad_kv_scheme,
+                    },
+                }
+            )
+    for bad_scheme in (
+        "int8",
+        "float32",
+        {"type": "int8", "num_bits": 8},
+    ):
+        for prof in ("main", "hardware"):
+            with pytest.raises(ValueError, match="Unsupported"):
+                dtypes_from_hf_config(
+                    {
+                        **raw_cfg,
+                        "quantization_config": {
+                            **dict(raw_cfg["quantization_config"]),
+                            "kv_cache_scheme": bad_scheme,
+                        },
+                    },
+                    runtime_profile=prof,
+                )
+
+    for fp8_tok in (
+        "fp8_e4m3fn",
+        "fp8_e5m2fn",
+        {"dynamic": False, "num_bits": 8, "type": "float"},
+    ):
+        for prof in ("main", "hardware"):
+            dt_fp8 = dtypes_from_hf_config(
+                {
+                    **raw_cfg,
+                    "quantization_config": {
+                        **dict(raw_cfg["quantization_config"]),
+                        "kv_cache_scheme": fp8_tok,
+                    },
+                },
+                runtime_profile=prof,
+            )
+            assert dt_fp8.kv == pytest.approx(1.0)
+            assert dt_fp8.kv_dtype == "fp8"
 
     fp4_dt = Dtypes(
         w_dense=dt_main.w_dense,
@@ -2385,13 +2425,42 @@ def test_qwen4_exp_main_vs_hardware_profile_and_fp4_kv_gate() -> None:
     assert plan_fp4_blocked.recommended is None
     assert any("fp4" in w.lower() for w in plan_fp4_blocked.warnings)
 
+
+def test_qwen4_exp_hardware_profile_unlocks_fp4_kv_and_launch_args() -> None:
+    """Verify qwen4_exp hardware profile unlocks full model, 100K ctx, and FP4 KV."""
+    raw_path = (
+        Path(__file__).resolve().parent / "fixtures" / "qwen3_8_flash_next_fp8.json"
+    )
+    raw_cfg = json.loads(raw_path.read_text(encoding="utf-8"))
+    chip = CHIPS["tpu7x"]
+    fp4_cfg = {
+        **raw_cfg,
+        "quantization_config": {
+            **dict(raw_cfg["quantization_config"]),
+            "kv_cache_scheme": "fp4",
+        },
+    }
+
     # Explicit hardware profile unlocks full model, 100K ctx, MTP, PP8->TP8xDCP4, FP4.
     geom_hw = from_hf_config(raw_cfg, runtime_profile="hardware")
     assert geom_hw.runtime_profile == "hardware"
     assert geom_hw.ple_layer_ids == (2,)
     assert geom_hw.mtp_layers == 1
-    dt_hw_fp4 = dtypes_from_hf_config(fp4_cfg, runtime_profile="hardware")
     expected_fp4_bytes = 0.5
+    for kv_scheme in ("fp4", "int4_per_token_head"):
+        dt_hw_fp4_tok = dtypes_from_hf_config(
+            {
+                **raw_cfg,
+                "quantization_config": {
+                    **dict(raw_cfg["quantization_config"]),
+                    "kv_cache_scheme": kv_scheme,
+                },
+            },
+            runtime_profile="hardware",
+        )
+        assert dt_hw_fp4_tok.kv == pytest.approx(expected_fp4_bytes)
+        assert dt_hw_fp4_tok.kv_dtype == "fp4"
+    dt_hw_fp4 = dtypes_from_hf_config(fp4_cfg, runtime_profile="hardware")
     assert dt_hw_fp4.kv == pytest.approx(expected_fp4_bytes)
     assert dt_hw_fp4.kv_dtype == "fp4"
 
@@ -2433,3 +2502,65 @@ def test_qwen4_exp_main_vs_hardware_profile_and_fp4_kv_gate() -> None:
     assert "--kv-cache-dtype" in launched["cli_args"]
     kv_idx = launched["cli_args"].index("--kv-cache-dtype") + 1
     assert launched["cli_args"][kv_idx] == "fp4"
+
+
+def test_raiden_kv_pairing_guards_and_pcp_explain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enforce Raiden GLM/Qwen3.5 pairing constraints and pcp_allows_pp messaging."""
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    glm_geom = from_hf_config(
+        json.loads((fixtures / "glm_5_2_fp8.json").read_text(encoding="utf-8"))
+    )
+    qwen_geom = from_hf_config(
+        json.loads((fixtures / "qwen3_5_397b_fp8.json").read_text(encoding="utf-8"))
+    )
+    qwen4_geom = from_hf_config(load_qwen3_8_bringup_config())
+
+    assert _valid_raiden_kv_pair(
+        glm_geom, Parallel(tp=16, kv_split=16), Parallel(tp=16, kv_split=16)
+    )
+    assert not _valid_raiden_kv_pair(
+        glm_geom, Parallel(pp=8, tp=1), Parallel(tp=16, pp=2, kv_split=16)
+    )
+    assert not _valid_raiden_kv_pair(
+        glm_geom, Parallel(pp=8, tp=1), Parallel(tp=16, pp=2)
+    )
+
+    assert _valid_raiden_kv_pair(qwen_geom, Parallel(pp=8, tp=1), Parallel(tp=8, dp=1))
+    assert _valid_raiden_kv_pair(
+        qwen_geom, Parallel(pp=4, pcp=2, tp=1), Parallel(tp=8, kv_split=4)
+    )
+    assert not _valid_raiden_kv_pair(
+        qwen_geom, Parallel(pp=8, tp=1), Parallel(tp=4, dp=2, kv_split=2)
+    )
+    assert not _valid_raiden_kv_pair(
+        qwen_geom, Parallel(pp=1, tp=1, dp=4), Parallel(tp=1, dp=4)
+    )
+
+    topos = tuple(TOPOLOGIES.values())
+    qwen4_reason = explain_layout_rejection(
+        qwen4_geom,
+        {"prefill": {"pcp": 2, "pp": 2, "tp": 1}, "decode": {"tp": 8}},
+        topos,
+        SolveOptions(mode="disagg"),
+    )
+    assert "PP > 1, " in qwen4_reason
+
+    pcp_pp_profile = rf_constants.RuntimeProfile(
+        name="main",
+        parallel=rf_constants.ParallelRules(
+            pcp_allows_pp=True,
+            max_pcp=2,
+            raiden_pair_rule="qwen_gdn",
+        ),
+    )
+    monkeypatch.setattr(rf_solver, "resolve_geom_profile", lambda _g: pcp_pp_profile)
+    pcp_pp_reason = explain_layout_rejection(
+        qwen_geom,
+        {"prefill": {"pcp": 4, "pp": 2, "tp": 1}, "decode": {"tp": 8}},
+        topos,
+        SolveOptions(mode="disagg"),
+    )
+    assert "PP > 1, " not in pcp_pp_reason
+    assert pcp_pp_reason == "PCP > 1 is not permitted with this profile or spec_k > 1"

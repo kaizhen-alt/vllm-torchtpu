@@ -1570,3 +1570,161 @@ def test_emit_kv_offload_uses_tpu_raiden_offloading_connector_and_unified_pool()
         and "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1" in cmd
         for cmd in disagg_launch["commands"]
     )
+
+
+def test_qwen_gdn_disagg_hnd_layout_pairing_and_dp_dcp_guard() -> None:
+    """Emit HND on both P and D when either side uses seq-on-lane, never on DP+DCP."""
+    pp8_pre = PoolMeshPlan(
+        role="prefill",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=1,
+        dp=1,
+        ep=1,
+        pp=8,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(1,),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="allreduce",
+    )
+    tp8_dec = PoolMeshPlan(
+        role="decode",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=8,
+        dp=1,
+        ep=8,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 1),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="ag_ep",
+    )
+    pp4_pcp2_pre = dc_replace(pp8_pre, pp=4, pcp=2)
+    tp8_dcp4_dec = dc_replace(tp8_dec, kv_split=4)
+    dp2_dcp2_dec = dc_replace(tp8_dec, tp=4, dp=2, ep=8, kv_split=2)
+
+    base_pt = ParetoPoint(
+        concurrency=16,
+        mode="disagg",
+        total_chips=8,
+        prefill_pool=pp8_pre,
+        decode_pool=tp8_dec,
+        est_ttft_ms=100.0,
+        est_tpot_ms=10.0,
+        est_interactivity_tok_s=100.0,
+        output_throughput_per_chip=200.0,
+        token_throughput_per_chip=600.0,
+        p_mixed=0.1,
+        binding="hbm",
+        slo_met=True,
+    )
+
+    expected_commands = 2
+    for pre_p, dec_p in ((pp8_pre, tp8_dec), (pp4_pcp2_pre, tp8_dcp4_dec)):
+        pt = dc_replace(base_pt, prefill_pool=pre_p, decode_pool=dec_p)
+        launched = point_launch_args(
+            pt,
+            kv_dtype="fp8",
+            model="Qwen/Qwen3.5-397B-A17B-FP8",
+            model_id="qwen3_5_moe",
+            is_hybrid=True,
+        )
+        assert len(launched["commands"]) == expected_commands
+        assert all("VLLM_KV_CACHE_LAYOUT=HND" in cmd for cmd in launched["commands"])
+
+    dp_dcp_pt = dc_replace(base_pt, prefill_pool=pp8_pre, decode_pool=dp2_dcp2_dec)
+    dp_dcp_launched = point_launch_args(
+        dp_dcp_pt,
+        kv_dtype="fp8",
+        model="Qwen/Qwen3.5-397B-A17B-FP8",
+        model_id="qwen3_5_moe",
+        is_hybrid=True,
+    )
+    assert not any(
+        "VLLM_KV_CACHE_LAYOUT=HND" in cmd for cmd in dp_dcp_launched["commands"]
+    )
+
+
+def test_qwen_gdn_disagg_dp_tp_decode_requires_hnd_on_both_peers() -> None:
+    """Emit HND on both peers for PP8 -> TP{2,4}xDP{4,2}, never for PP8 -> DP8."""
+    pp8_pre = PoolMeshPlan(
+        role="prefill",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=1,
+        dp=1,
+        ep=1,
+        pp=8,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(1,),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="allreduce",
+    )
+    tp2_dp4_dec = PoolMeshPlan(
+        role="decode",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=2,
+        dp=4,
+        ep=8,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 1),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="ag_ep",
+    )
+    tp4_dp2_dec = dc_replace(tp2_dp4_dec, tp=4, dp=2)
+    dp8_dec = dc_replace(tp2_dp4_dec, tp=1, dp=8, ep=8)
+
+    base_pt = ParetoPoint(
+        concurrency=16,
+        mode="disagg",
+        total_chips=8,
+        prefill_pool=pp8_pre,
+        decode_pool=tp2_dp4_dec,
+        est_ttft_ms=100.0,
+        est_tpot_ms=10.0,
+        est_interactivity_tok_s=100.0,
+        output_throughput_per_chip=200.0,
+        token_throughput_per_chip=600.0,
+        p_mixed=0.1,
+        binding="hbm",
+        slo_met=True,
+    )
+
+    expected_commands = 2
+    for dec_p in (tp2_dp4_dec, tp4_dp2_dec):
+        launched = point_launch_args(
+            dc_replace(base_pt, decode_pool=dec_p),
+            kv_dtype="fp8",
+            model="Qwen/Qwen3.5-397B-A17B-FP8",
+            model_id="qwen3_5_moe",
+            is_hybrid=True,
+        )
+        assert len(launched["commands"]) == expected_commands
+        assert all("VLLM_KV_CACHE_LAYOUT=HND" in cmd for cmd in launched["commands"])
+
+    dp8_launched = point_launch_args(
+        dc_replace(base_pt, decode_pool=dp8_dec),
+        kv_dtype="fp8",
+        model="Qwen/Qwen3.5-397B-A17B-FP8",
+        model_id="qwen3_5_moe",
+        is_hybrid=True,
+    )
+    assert len(dp8_launched["commands"]) == expected_commands
+    assert not any(
+        "VLLM_KV_CACHE_LAYOUT=HND" in cmd for cmd in dp8_launched["commands"]
+    )

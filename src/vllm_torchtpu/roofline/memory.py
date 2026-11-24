@@ -468,33 +468,35 @@ def _compute_kv_and_state(
     kv_bytes = (kv_gqa + kv_swa + kv_mla) * stage_scale / kv_div
 
     st_bytes = 0.0
-    pcp_div = float(max(1, parallel.pcp))
+    state_div = max(1, tp * max(1, parallel.pcp))
     if counts.gdn > 0:
-        key_heads = max(1, geom.linear_k_heads // tp)
-        value_heads = max(1, geom.linear_v_heads // tp)
-        qkv_rank_width = (
-            2 * key_heads * geom.linear_k_dim + value_heads * geom.linear_v_dim
+        state_k_heads = max(1, geom.linear_k_heads // state_div)
+        state_v_heads = max(1, geom.linear_v_heads // state_div)
+        state_qkv_width = (
+            2 * state_k_heads * geom.linear_k_dim + state_v_heads * geom.linear_v_dim
         )
         st_bytes += (
             float(layout.seqs_per_dp * counts.gdn)
             * (
-                float(value_heads * geom.linear_k_dim * geom.linear_v_dim) * dt.state
-                + float(qkv_rank_width * max(0, geom.conv_kernel - 1)) * dt.conv
+                float(state_v_heads * geom.linear_k_dim * geom.linear_v_dim) * dt.state
+                + float(state_qkv_width * max(0, geom.conv_kernel - 1)) * dt.conv
             )
             * stage_scale
-            / pcp_div
         )
     if counts.kda > 0:
-        value_heads = max(1, (geom.linear_v_heads or geom.num_heads) // tp)
+        state_v_heads = max(1, (geom.linear_v_heads or geom.num_heads) // state_div)
         k_head_dim = geom.linear_k_dim or geom.head_dim
         v_head_dim = geom.linear_v_dim or geom.head_dim
         st_bytes += (
             float(
-                layout.seqs_per_dp * counts.kda * value_heads * k_head_dim * v_head_dim
+                layout.seqs_per_dp
+                * counts.kda
+                * state_v_heads
+                * k_head_dim
+                * v_head_dim
             )
             * dt.state
             * stage_scale
-            / pcp_div
         )
     return kv_bytes, st_bytes
 

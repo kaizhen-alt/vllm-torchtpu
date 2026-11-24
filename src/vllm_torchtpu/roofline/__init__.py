@@ -62,6 +62,7 @@ from .constants import (
     canonicalize_kv_dtype,
     resolve_model_profile,
     resolve_runtime_profile,
+    spec_for_model_type,
 )
 from .emit import (
     CeilingRow,
@@ -79,6 +80,7 @@ from .emit import (
     format_solve_json,
     format_submodule_parallelism,
     frontier_2d_points,
+    kv_cli_dtype_str,
     point_launch_args,
     pool_cli_args,
     pool_label,
@@ -301,6 +303,7 @@ __all__ = [
     "get_solver_assumptions",
     "hbm_breakdown_per_core_bytes",
     "hbm_footprint_per_core_bytes",
+    "kv_cli_dtype_str",
     "layer_ffn_kinds",
     "load_activation_hull",
     "load_chip_spec",
@@ -332,6 +335,7 @@ __all__ = [
     "scale_pp_stage_floor",
     "solve_serving_plan",
     "spec_cycle_floor",
+    "spec_for_model_type",
     "step_floor",
     "strict_rank",
     "supports",

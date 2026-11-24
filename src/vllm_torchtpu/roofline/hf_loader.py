@@ -44,12 +44,11 @@ from .constants import (
     NVFP4_BYTES,
     SIXTEEN_BITS,
     SUPPORTED_MODEL_TYPES,
-    SUPPORTED_MODELS,
     WEIGHT_BLOCK_DIM_LEN,
     WEIGHT_ONLY_QUANT_METHODS,
-    ModelSpec,
     canonicalize_kv_dtype,
     resolve_runtime_profile,
+    spec_for_model_type,
 )
 from .geometry import (
     KeyTracker,
@@ -229,13 +228,16 @@ def load_hf_config_with_identity(
     *,
     offline: bool = False,
     hf_overrides: Mapping[str, object] | None = None,
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
 ) -> tuple[dict[str, object], ModelIdentity]:
     """Load HF config, apply optional overrides, and resolve canonical identity."""
     cfg = load_hf_config(model_or_path, offline=offline)
     if hf_overrides:
         cfg = apply_hf_overrides(cfg, hf_overrides)
     model_ref = model_or_path if isinstance(model_or_path, str) else None
-    identity = resolve_model_identity(cfg, model_ref=model_ref)
+    identity = resolve_model_identity(
+        cfg, model_ref=model_ref, runtime_profile=runtime_profile
+    )
     return cfg, identity
 
 
@@ -818,21 +820,9 @@ def _fp8_block_bytes(qcfg: Mapping[str, object], qp: _QuantParams) -> float:
     return FP8_BYTES
 
 
-def _spec_for_model_type(model_type: str) -> ModelSpec | None:
-    """Return the registered ``ModelSpec`` matching ``model_type``, if any."""
-    if not model_type:
-        return None
-    for spec in SUPPORTED_MODELS.values():
-        if model_type in spec.model_types:
-            return spec
-    return None
-
-
 def _is_fp4_kv_token(raw_tok: str) -> bool:
     """Return whether ``raw_tok`` identifies a 4-bit or FP4 KV cache scheme."""
     norm = raw_tok.strip().lower()
-    if norm == "int4_per_token_head":
-        return False
     return canonicalize_kv_dtype(norm) == "fp4" or any(
         tok in norm for tok in ("fp4", "nvfp4", "mxfp4", "int4")
     )
@@ -845,10 +835,12 @@ def _parse_mapping_kv_scheme(
     *,
     allow_fp4: bool = False,
 ) -> tuple[float, str, bool]:
-    """Parse a Mapping kv_cache_scheme entry and enforce 4-bit/FP4 admission."""
-    kv_type = str(
-        raw_kv.get("type") or raw_kv.get("dtype") or raw_kv.get("quant_algo") or ""
-    ).lower()
+    """Parse a Mapping kv_cache_scheme entry and enforce KV cache admission."""
+    kv_type = (
+        str(raw_kv.get("type") or raw_kv.get("dtype") or raw_kv.get("quant_algo") or "")
+        .strip()
+        .lower()
+    )
     kv_bits = _to_int(raw_kv.get("num_bits", 0))
     if _is_fp4_kv_token(kv_type) or kv_bits == FOUR_BITS:
         if allow_fp4:
@@ -856,8 +848,14 @@ def _parse_mapping_kv_scheme(
         msg = f"Unsupported 4-bit/FP4 KV cache scheme: {dict(raw_kv)!r}"
         raise ValueError(msg)
     if "int8" in kv_type:
-        return (FP8_BYTES, "int8", True)
-    if "fp8" in kv_type or kv_bits == EIGHT_BITS:
+        msg = f"Unsupported Mapping kv_cache_scheme: {dict(raw_kv)!r}"
+        raise ValueError(msg)
+    if (
+        canonicalize_kv_dtype(kv_type) == "fp8"
+        or "fp8" in kv_type
+        or "float8" in kv_type
+        or kv_bits == EIGHT_BITS
+    ):
         return (FP8_BYTES, "fp8", True)
     if kv_bits == SIXTEEN_BITS or kv_type in (
         "bfloat16",
@@ -878,7 +876,7 @@ def _parse_kv_cache_scheme(
     *,
     allow_fp4: bool = False,
 ) -> tuple[float, str, bool]:
-    """Parse kv_cache_scheme / kv_cache_dtype, enforcing 4-bit/FP4 admission."""
+    """Parse kv_cache_scheme / kv_cache_dtype, enforcing KV cache admission."""
     raw_kv = (
         qcfg.get("kv_cache_scheme")
         or qcfg.get("kv_cache_dtype")
@@ -889,17 +887,20 @@ def _parse_kv_cache_scheme(
     if isinstance(raw_kv, Mapping):
         return _parse_mapping_kv_scheme(raw_kv, base_b, base_name, allow_fp4=allow_fp4)
 
-    kv_scheme = str(raw_kv).lower()
+    kv_scheme = str(raw_kv).strip().lower()
     if _is_fp4_kv_token(kv_scheme):
         if allow_fp4:
             return (FP4_BYTES, "fp4", True)
         msg = f"Unsupported 4-bit/FP4 KV cache scheme: {raw_kv!r}"
         raise ValueError(msg)
-    if "fp8" in kv_scheme or "8" in kv_scheme:
-        return (FP8_BYTES, kv_scheme, True)
-    if kv_scheme in BASE_DTYPE_BYTES:
-        return (BASE_DTYPE_BYTES[kv_scheme], kv_scheme, True)
-    return (base_b, kv_scheme, True)
+    canonical = canonicalize_kv_dtype(kv_scheme)
+    if canonical == "fp8" or "fp8" in kv_scheme or "float8" in kv_scheme:
+        return (FP8_BYTES, "fp8", True)
+    if canonical == "bf16":
+        dt_name = "bfloat16" if kv_scheme == "auto" else kv_scheme
+        return (BASE_DTYPE_BYTES["bfloat16"], dt_name, True)
+    msg = f"Unsupported kv_cache_scheme: {raw_kv!r}"
+    raise ValueError(msg)
 
 
 def dtypes_from_hf_config(
@@ -911,7 +912,7 @@ def dtypes_from_hf_config(
     tc = _as_mapping(cfg.get("text_config")) or cfg
     scopes = (tc, cfg) if tc is not cfg else (tc,)
     raw_mt = str(_first_non_none(scopes, "model_type") or "").strip().lower()
-    profile = resolve_runtime_profile(_spec_for_model_type(raw_mt), runtime_profile)
+    profile = resolve_runtime_profile(spec_for_model_type(raw_mt), runtime_profile)
     allow_fp4 = "fp4" in profile.kv_dtypes
     qcfg = _as_mapping(_first_non_none(scopes, "quantization_config"))
     nested_q = _as_mapping(qcfg.get("quantization"))

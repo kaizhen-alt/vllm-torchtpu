@@ -132,6 +132,7 @@ __all__ = [
     "format_solve_json",
     "format_submodule_parallelism",
     "frontier_2d_points",
+    "kv_cli_dtype_str",
     "pareto_skyline_by_concurrency",
     "parse_layout",
     "point_launch_args",
@@ -324,12 +325,24 @@ def _servable_model(source: str | None) -> str | None:
     return source
 
 
+def _pool_needs_qwen_hnd(pool: PoolMeshPlan) -> bool:
+    """Return True when a Qwen3.5 Raiden peer requires seq-on-lane HND layout."""
+    if pool.dp > 1 and pool.kv_split > 1:
+        return False
+    if pool.pp == 1 and pool.tp > 1:
+        return True
+    if pool.pp > 1 and pool.pcp > 1:
+        return True
+    return pool.role == "decode" and pool.dp == 1 and pool.pp == 1 and pool.kv_split > 1
+
+
 def _env_prefix(
     pool: PoolMeshPlan,
     *,
     model_id: str = "",
     is_hybrid: bool = False,
     runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
+    force_hnd: bool = False,
 ) -> str:
     """Return validated runtime environment variable prefix for ``pool``."""
     rules = resolve_model_profile(model_id, runtime_profile).parallel
@@ -347,11 +360,7 @@ def _env_prefix(
     if (
         rules.raiden_pair_rule == "qwen_gdn"
         and pool.role in {"prefill", "decode"}
-        and (
-            (pool.dp == 1 and pool.pp == 1 and pool.tp > 1)
-            or (pool.pp > 1 and pool.pcp > 1)
-            or pool.kv_split > 1
-        )
+        and (force_hnd or _pool_needs_qwen_hnd(pool))
     ):
         env_parts.append("VLLM_KV_CACHE_LAYOUT=HND")
     if pool.pp_layer_partition is not None and len(set(pool.pp_layer_partition)) > 1:
@@ -463,6 +472,7 @@ def _format_pool_commands(
     *,
     chip: ChipSpec | None = None,
     model_meta: tuple[str, bool, str] = ("", False, DEFAULT_RUNTIME_PROFILE),
+    force_hnd: bool = False,
 ) -> list[str]:
     """Render single-host or per-host Mode A/B launch commands for one pool."""
     model_id, is_hybrid, runtime_profile = model_meta
@@ -471,6 +481,7 @@ def _format_pool_commands(
         model_id=model_id,
         is_hybrid=is_hybrid,
         runtime_profile=runtime_profile,
+        force_hnd=force_hnd,
     )
     host_args = _multihost_host_arg_lists(pool, base_args, chip)
     is_disagg = pool.role in ("prefill", "decode")
@@ -707,24 +718,33 @@ def point_launch_args(
         if pt.prefill_pool is not None
         else []
     )
+    prefill_pool = pt.prefill_pool
+    decode_pool = pt.decode_pool
+    pair_force_hnd = (
+        rules.raiden_pair_rule == "qwen_gdn"
+        and prefill_pool is not None
+        and (_pool_needs_qwen_hnd(prefill_pool) or _pool_needs_qwen_hnd(decode_pool))
+    )
     commands: list[str] = []
-    if pt.prefill_pool is not None:
+    if prefill_pool is not None:
         commands.extend(
             _format_pool_commands(
-                pt.prefill_pool,
+                prefill_pool,
                 prefill_args,
                 model,
                 chip=chip,
                 model_meta=(model_id, is_hybrid, runtime_profile),
+                force_hnd=pair_force_hnd,
             )
         )
     commands.extend(
         _format_pool_commands(
-            pt.decode_pool,
+            decode_pool,
             decode_args,
             model,
             chip=chip,
             model_meta=(model_id, is_hybrid, runtime_profile),
+            force_hnd=pair_force_hnd,
         )
     )
     return {
@@ -743,15 +763,19 @@ def _plan_dict(plan: ServingPlan) -> dict[str, object]:
     return data
 
 
-def _resolve_emit_kv_dtype(dtypes: Dtypes | None) -> str:
+def kv_cli_dtype_str(
+    dtypes: Dtypes | None,
+    *,
+    default_bf16: str = "auto",
+) -> str:
     """Resolve ``--kv-cache-dtype`` CLI flag string from ``Dtypes``."""
     if dtypes is None:
-        return "auto"
+        return default_bf16
     if canonicalize_kv_dtype(dtypes.kv_dtype) == "fp4" or dtypes.kv <= FP4_BYTES:
         return "fp4"
     if dtypes.kv <= KV_DTYPE_BYTES["fp8"]:
         return "fp8"
-    return "auto"
+    return default_bf16
 
 
 def emit_launch_args(
@@ -763,7 +787,7 @@ def emit_launch_args(
     topologies: Mapping[str, SliceTopology] | None = None,
 ) -> LaunchPayload:
     """Emit ``vllm serve`` CLI flags and commands for the top-ranked L1 candidate."""
-    kv_str = _resolve_emit_kv_dtype(dtypes)
+    kv_str = kv_cli_dtype_str(dtypes)
     eff_chip = chip if chip is not None else CHIPS.get(plan.chip)
     warnings = list(plan.warnings)
     rec = plan.recommended
@@ -1004,7 +1028,7 @@ def build_solve_payload(
     model = opts.get("model")
     top_k = opts.get("top_k", DEFAULT_TOP_K)
     topologies = opts.get("topologies")
-    kv_str = _resolve_emit_kv_dtype(dtypes)
+    kv_str = kv_cli_dtype_str(dtypes)
     top_pts = top_layouts(plan, top_k)
     eff_spec = (
         plan.spec_tokens

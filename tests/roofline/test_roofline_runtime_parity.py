@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import importlib
 import json
+from dataclasses import dataclass
+from operator import methodcaller
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -31,15 +33,22 @@ from vllm_torchtpu.roofline import (
     ParetoPoint,
     PoolMeshPlan,
     PpStageOptions,
+    SeqKvLayout,
     ServingPlan,
     SolveOptions,
+    StepShape,
     TrafficScenario,
+    count_layer_types,
     default_rpa_page_size,
     dtypes_from_hf_config,
     emit_launch_args,
     from_hf_config,
+    hbm_breakdown_per_core_bytes,
     partition_pp_layers,
+    pass_costs,
+    point_launch_args,
     pool_cli_args,
+    resolve_model_profile,
     solve_serving_plan,
     tpu_min_page_size,
 )
@@ -47,6 +56,7 @@ from vllm_torchtpu.roofline.geometry import UnsupportedArchitectureError
 from vllm_torchtpu.roofline.solver import (
     _candidate_decode_parallels,
     _candidate_prefill_parallels,
+    _valid_raiden_kv_pair,
 )
 
 try:
@@ -63,6 +73,9 @@ except ImportError as _exc:
     _torch_tpu_builds_stage_meshes = None
     validate_pipeline_parallel_config = None
     TpuPlatform = None
+    tpu_connector_mod = None
+    TPURaidenConnectorWorker = None
+    derive_gdn_head_geometry = None
     VllmConfigCls = None
     ModelConfigCls = None
     CacheConfigCls = None
@@ -84,6 +97,13 @@ else:
         VllmConfig as VllmConfigCls,
     )
 
+    from vllm_torchtpu.distributed.kv_transfer import (
+        tpu_connector as tpu_connector_mod,
+    )
+    from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+        TPURaidenConnectorWorker,
+    )
+    from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
     from vllm_torchtpu.layers.adapter.attention import (
         PallasAttentionBackend,
         PallasMLAttentionBackend,
@@ -787,3 +807,405 @@ def test_kv_offload_and_hybrid_pp_stage_parity_with_live_tpu_platform(
             ),
         )
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _RaidenTopologySpec:
+    """Worker and mesh parameters for Raiden admission parity tests."""
+
+    architecture: str = "Qwen3_5MoeForConditionalGeneration"
+    is_producer: bool = False
+    tp: int = 1
+    dp: int = 1
+    pp: int = 1
+    pcp: int = 1
+    dcp: int = 1
+    tp_rank: int = 0
+    block_size: int = 128
+    interleave: int = 128
+    extra_config: dict[str, object] | None = None
+
+
+def _glm_admission(worker: object) -> str:
+    """Return runtime GLM Raiden admission topology for a parity worker."""
+    return str(methodcaller("_raiden_glm_admission_topology")(worker))
+
+
+def _qwen35_admission(worker: object) -> str:
+    """Return runtime Qwen3.5 Raiden admission topology for a parity worker."""
+    return str(methodcaller("_raiden_qwen35_admission_topology")(worker))
+
+
+def _make_parity_raiden_worker(spec: _RaidenTopologySpec) -> object:
+    """Construct a TPURaidenConnectorWorker with mocked device/network handles."""
+    assert TPURaidenConnectorWorker is not None
+    cfg = MagicMock()
+    cfg.speculative_config = None
+    cfg.additional_config = {}
+    cfg.kv_transfer_config.kv_connector = "TPURaidenConnector"
+    cfg.kv_transfer_config.kv_role = (
+        "kv_producer" if spec.is_producer else "kv_consumer"
+    )
+    cfg.kv_transfer_config.kv_load_failure_policy = "recompute"
+    cfg.kv_transfer_config.is_kv_producer = spec.is_producer
+    cfg.kv_transfer_config.kv_connector_extra_config = dict(spec.extra_config or {})
+    cfg.cache_config.block_size = spec.block_size
+    cfg.cache_config.enable_prefix_caching = False
+    cfg.model_config.architecture = spec.architecture
+    cfg.parallel_config.data_parallel_rank = 0
+    cfg.parallel_config.data_parallel_size = spec.dp
+    cfg.parallel_config.tensor_parallel_size = spec.tp
+    cfg.parallel_config.pipeline_parallel_size = spec.pp
+    cfg.parallel_config.prefill_context_parallel_size = spec.pcp
+    cfg.parallel_config.decode_context_parallel_size = spec.dcp
+    cfg.parallel_config.cp_kv_cache_interleave_size = spec.interleave
+    conn_mod = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
+    with (
+        patch(f"{conn_mod}.get_tensor_model_parallel_rank", return_value=spec.tp_rank),
+        patch(f"{conn_mod}.get_tensor_model_parallel_world_size", return_value=spec.tp),
+        patch(f"{conn_mod}.dist_utils.get_node_id", return_value=0),
+        patch(f"{conn_mod}.dist_utils.get_host_ip", return_value="127.0.0.1"),
+        patch(f"{conn_mod}.dist_utils.get_kv_transfer_port", return_value=9100),
+    ):
+        return TPURaidenConnectorWorker(cfg)
+
+
+def test_raiden_glm_admission_topology_parity_with_solver() -> None:
+    """Assert _raiden_glm_admission_topology matches _valid_raiden_kv_pair."""
+    _require_runtime()
+    glm_cfg = json.loads((_FIXTURES_DIR / "glm_5_2_fp8.json").read_text("utf-8"))
+    glm_geom = from_hf_config(glm_cfg)
+    conn_mod = "vllm_torchtpu.distributed.kv_transfer.tpu_connector"
+
+    # TP16/DCP16 -> TP16/DCP16 admitted on both runtime and roofline.
+    p_dcp16 = _make_parity_raiden_worker(
+        _RaidenTopologySpec(
+            is_producer=True,
+            architecture="GlmMoeDsaForCausalLM",
+            tp=16,
+            dcp=16,
+            tp_rank=3,
+            block_size=256,
+            interleave=4,
+            extra_config={
+                "destination_decode_context_parallel_size": 16,
+                "destination_cp_kv_cache_interleave_size": 4,
+            },
+        )
+    )
+    d_dcp16 = _make_parity_raiden_worker(
+        _RaidenTopologySpec(
+            is_producer=False,
+            architecture="GlmMoeDsaForCausalLM",
+            tp=16,
+            dcp=16,
+            tp_rank=3,
+            block_size=256,
+            interleave=4,
+        )
+    )
+    with (
+        patch(f"{conn_mod}._raiden_dst_shards", return_value=16),
+        patch("vllm_torchtpu.distributed.dcp.get_dcp_rank", return_value=3),
+    ):
+        assert _glm_admission(p_dcp16) == "tp16dcp16_prefill"
+        assert _glm_admission(d_dcp16) == "tp16dcp16_decode"
+    assert _valid_raiden_kv_pair(
+        glm_geom, Parallel(tp=16, kv_split=16), Parallel(tp=16, kv_split=16)
+    )
+
+    # TP16/DCP1 -> TP16/DCP16 rejected on both.
+    p_dcp1 = _make_parity_raiden_worker(
+        _RaidenTopologySpec(
+            is_producer=True,
+            architecture="GlmMoeDsaForCausalLM",
+            tp=16,
+            dcp=1,
+            block_size=256,
+            interleave=4,
+            extra_config={
+                "destination_decode_context_parallel_size": 16,
+                "destination_cp_kv_cache_interleave_size": 4,
+            },
+        )
+    )
+    with (
+        patch(f"{conn_mod}._raiden_dst_shards", return_value=16),
+        pytest.raises(ValueError, match="pipeline-parallel TP1 producer"),
+    ):
+        _glm_admission(p_dcp1)
+    assert not _valid_raiden_kv_pair(
+        glm_geom, Parallel(tp=16, kv_split=1), Parallel(tp=16, kv_split=16)
+    )
+
+    # TP16/DCP8 -> TP16/DCP8 rejected on both.
+    p_dcp8 = _make_parity_raiden_worker(
+        _RaidenTopologySpec(
+            is_producer=True,
+            architecture="GlmMoeDsaForCausalLM",
+            tp=16,
+            dcp=8,
+            block_size=256,
+            interleave=4,
+            extra_config={
+                "destination_decode_context_parallel_size": 8,
+                "destination_cp_kv_cache_interleave_size": 4,
+            },
+        )
+    )
+    with pytest.raises(ValueError, match="tensor_parallel_size =="):
+        _glm_admission(p_dcp8)
+    assert not _valid_raiden_kv_pair(
+        glm_geom, Parallel(tp=16, kv_split=8), Parallel(tp=16, kv_split=8)
+    )
+
+    # PP8 -> TP16/PP2 rejected on both.
+    d_tp16_pp2 = _make_parity_raiden_worker(
+        _RaidenTopologySpec(
+            is_producer=False,
+            architecture="GlmMoeDsaForCausalLM",
+            tp=16,
+            pp=2,
+            dcp=1,
+            block_size=256,
+        )
+    )
+    with pytest.raises(ValueError, match="consumer tensor_parallel_size=16"):
+        _glm_admission(d_tp16_pp2)
+    assert not _valid_raiden_kv_pair(
+        glm_geom, Parallel(pp=8, tp=1), Parallel(tp=16, pp=2)
+    )
+
+
+def test_raiden_qwen35_admission_and_hnd_emit_parity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Assert Qwen3.5 Raiden admission aligns with solver pairing and HND emission."""
+    _require_runtime()
+    assert tpu_connector_mod is not None
+    qwen_cfg = json.loads((_FIXTURES_DIR / "qwen3_5_397b_fp8.json").read_text("utf-8"))
+    qwen_geom = from_hf_config(qwen_cfg)
+
+    def _pool(role: str, spec: _RaidenTopologySpec) -> PoolMeshPlan:
+        """Build a synthetic Qwen3.5 Raiden pool mesh plan for launch emission."""
+        return PoolMeshPlan(
+            role=role,
+            instances=1,
+            topology="2x2x1",
+            chips_per_instance=4,
+            tp=spec.tp,
+            dp=spec.dp,
+            ep=max(1, spec.tp * spec.dp),
+            pp=spec.pp,
+            pcp=spec.pcp,
+            kv_split=spec.dcp,
+            mesh_axes=(2, 2, 1) if spec.tp > 1 else (1,),
+            hbm_used_gb=20.0,
+            hbm_limit_gb=80.0,
+            moe_dispatch="ag_ep" if spec.tp > 1 else "allreduce",
+        )
+
+    monkeypatch.setattr(tpu_connector_mod, "_raiden_seq_on_lane_layout", lambda: True)
+    expected_pair_commands = 2
+
+    # PP8 -> TP8 admits runtime seq-on-lane decode and emits HND on BOTH pools.
+    assert _valid_raiden_kv_pair(qwen_geom, Parallel(pp=8, tp=1), Parallel(tp=8, dp=1))
+    pp8_spec = _RaidenTopologySpec(is_producer=True, pp=8)
+    tp8_spec = _RaidenTopologySpec(is_producer=False, tp=8)
+    pt_pp8_tp8 = ParetoPoint(
+        concurrency=16,
+        mode="disagg",
+        total_chips=8,
+        prefill_pool=_pool("prefill", pp8_spec),
+        decode_pool=_pool("decode", tp8_spec),
+        est_ttft_ms=100.0,
+        est_tpot_ms=10.0,
+        est_interactivity_tok_s=100.0,
+        output_throughput_per_chip=200.0,
+        token_throughput_per_chip=600.0,
+        p_mixed=0.1,
+        binding="hbm",
+        slo_met=True,
+    )
+    launch_pp8_tp8 = point_launch_args(
+        pt_pp8_tp8,
+        kv_dtype="fp8",
+        model="Qwen/Qwen3.5-397B-A17B-FP8",
+        model_id="qwen3_5_moe",
+        is_hybrid=True,
+    )
+    assert len(launch_pp8_tp8["commands"]) == expected_pair_commands
+    assert all("VLLM_KV_CACHE_LAYOUT=HND" in c for c in launch_pp8_tp8["commands"])
+    w_pp8 = _make_parity_raiden_worker(pp8_spec)
+    w_tp8 = _make_parity_raiden_worker(tp8_spec)
+    assert _qwen35_admission(w_pp8) == "pp8_prefill"
+    assert _qwen35_admission(w_tp8) == "tp8dcp1_decode"
+
+    # PP4 x PCP2 -> TP8 x DCP4 admits runtime seq-on-lane and emits HND on BOTH pools.
+    assert _valid_raiden_kv_pair(
+        qwen_geom, Parallel(pp=4, pcp=2, tp=1), Parallel(tp=8, kv_split=4)
+    )
+    pp4_pcp2_spec = _RaidenTopologySpec(is_producer=True, pp=4, pcp=2)
+    tp8_dcp4_spec = _RaidenTopologySpec(is_producer=False, tp=8, dcp=4)
+    pt_pcp_dcp = ParetoPoint(
+        concurrency=16,
+        mode="disagg",
+        total_chips=8,
+        prefill_pool=_pool("prefill", pp4_pcp2_spec),
+        decode_pool=_pool("decode", tp8_dcp4_spec),
+        est_ttft_ms=100.0,
+        est_tpot_ms=10.0,
+        est_interactivity_tok_s=100.0,
+        output_throughput_per_chip=200.0,
+        token_throughput_per_chip=600.0,
+        p_mixed=0.1,
+        binding="hbm",
+        slo_met=True,
+    )
+    launch_pcp_dcp = point_launch_args(
+        pt_pcp_dcp,
+        kv_dtype="fp8",
+        model="Qwen/Qwen3.5-397B-A17B-FP8",
+        model_id="qwen3_5_moe",
+        is_hybrid=True,
+    )
+    assert len(launch_pcp_dcp["commands"]) == expected_pair_commands
+    assert all("VLLM_KV_CACHE_LAYOUT=HND" in c for c in launch_pcp_dcp["commands"])
+    w_pp4_pcp2 = _make_parity_raiden_worker(pp4_pcp2_spec)
+    w_tp8_dcp4 = _make_parity_raiden_worker(tp8_dcp4_spec)
+    assert _qwen35_admission(w_pp4_pcp2) == "pp4pcp2_prefill"
+    assert _qwen35_admission(w_tp8_dcp4) == "tp8dcp4_decode"
+
+    # TP4 x DP2 x DCP2 fails solver pairing, omits HND, and admits as dp2tp4_decode.
+    assert not _valid_raiden_kv_pair(
+        qwen_geom, Parallel(pp=8, tp=1), Parallel(tp=4, dp=2, kv_split=2)
+    )
+    dp_dcp_spec = _RaidenTopologySpec(is_producer=False, tp=4, dp=2, dcp=2)
+    pt_dp_dcp = ParetoPoint(
+        concurrency=16,
+        mode="disagg",
+        total_chips=8,
+        prefill_pool=_pool("prefill", pp8_spec),
+        decode_pool=_pool("decode", dp_dcp_spec),
+        est_ttft_ms=100.0,
+        est_tpot_ms=10.0,
+        est_interactivity_tok_s=100.0,
+        output_throughput_per_chip=200.0,
+        token_throughput_per_chip=600.0,
+        p_mixed=0.1,
+        binding="hbm",
+        slo_met=True,
+    )
+    launch_dp_dcp = point_launch_args(
+        pt_dp_dcp,
+        kv_dtype="fp8",
+        model="Qwen/Qwen3.5-397B-A17B-FP8",
+        model_id="qwen3_5_moe",
+        is_hybrid=True,
+    )
+    assert not any("VLLM_KV_CACHE_LAYOUT=HND" in c for c in launch_dp_dcp["commands"])
+    w_dp_dcp = _make_parity_raiden_worker(dp_dcp_spec)
+    assert _qwen35_admission(w_dp_dcp) == "dp2tp4_decode"
+
+
+def test_kv_cache_dtype_admission_parity_with_tpu_platform() -> None:
+    """Assert TpuPlatform.is_kv_cache_dtype_supported matches main profile admission."""
+    _require_runtime()
+    assert TpuPlatform is not None
+    qwen_cfg = json.loads((_FIXTURES_DIR / "qwen3_5_397b_fp8.json").read_text("utf-8"))
+    main_prof = resolve_model_profile("qwen3_5_moe", "main")
+    assert set(main_prof.kv_dtypes) == {"bf16", "fp8"}
+    mock_mcfg = MagicMock()
+
+    for supported_tok in ("bfloat16", "fp8"):
+        assert TpuPlatform.is_kv_cache_dtype_supported(supported_tok, mock_mcfg)
+        dt = dtypes_from_hf_config(
+            {
+                **qwen_cfg,
+                "quantization_config": {
+                    **dict(qwen_cfg["quantization_config"]),
+                    "kv_cache_scheme": supported_tok,
+                },
+            },
+            runtime_profile="main",
+        )
+        assert dt.kv_dtype in ("bfloat16", "bf16", "fp8")
+
+    for unsupported_tok in ("fp4", "turboquant_4bit_nc", "int4_per_token_head", "int8"):
+        assert not TpuPlatform.is_kv_cache_dtype_supported(unsupported_tok, mock_mcfg)
+        with pytest.raises(ValueError, match="Unsupported"):
+            dtypes_from_hf_config(
+                {
+                    **qwen_cfg,
+                    "quantization_config": {
+                        **dict(qwen_cfg["quantization_config"]),
+                        "kv_cache_scheme": unsupported_tok,
+                    },
+                },
+                runtime_profile="main",
+            )
+
+
+def test_gdn_state_bytes_parity_with_derive_gdn_head_geometry() -> None:
+    """Assert GDN HBM and I/O bytes match derive_gdn_head_geometry across tp*pcp."""
+    _require_runtime()
+    assert derive_gdn_head_geometry is not None
+    qwen_cfg = json.loads((_FIXTURES_DIR / "qwen3_5_397b_fp8.json").read_text("utf-8"))
+    geom = from_hf_config(qwen_cfg)
+    dt = dtypes_from_hf_config(qwen_cfg)
+    counts = count_layer_types(geom)
+
+    for tp, pcp in ((1, 1), (2, 2), (8, 2), (16, 2), (4, 8), (32, 1)):
+        head_geo = derive_gdn_head_geometry(
+            geom.linear_k_heads, geom.linear_v_heads, tp * pcp
+        )
+        rec_bytes = (
+            float(head_geo.local_num_v_heads * geom.linear_k_dim * geom.linear_v_dim)
+            * dt.state
+        )
+        conv_bytes = (
+            float(
+                head_geo.local_conv_dim(geom.linear_k_dim, geom.linear_v_dim)
+                * max(0, geom.conv_kernel - 1)
+            )
+            * dt.conv
+        )
+        expected_state_per_seq = float(counts.gdn) * (rec_bytes + conv_bytes)
+
+        par = Parallel(tp=tp, pcp=pcp)
+        bd = hbm_breakdown_per_core_bytes(geom, dt, par, SeqKvLayout(1, 8192))
+        assert bd.state == pytest.approx(expected_state_per_seq, rel=1e-12)
+
+        hit_mods = {
+            m.name: m
+            for m in pass_costs(
+                geom,
+                par,
+                StepShape(
+                    batch=0,
+                    rows_per_seq=0,
+                    context=8192,
+                    prefill_tokens=8192,
+                    prefix_hit_rate=0.5,
+                ),
+                dt,
+            )
+        }
+        miss_mods = {
+            m.name: m
+            for m in pass_costs(
+                geom,
+                par,
+                StepShape(
+                    batch=0,
+                    rows_per_seq=0,
+                    context=8192,
+                    prefill_tokens=8192,
+                    prefix_hit_rate=0.0,
+                ),
+                dt,
+            )
+        }
+        assert hit_mods["gdn"].hbm_bytes - miss_mods["gdn"].hbm_bytes == pytest.approx(
+            expected_state_per_seq, rel=1e-12
+        )

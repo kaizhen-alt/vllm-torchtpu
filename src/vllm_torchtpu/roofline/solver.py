@@ -305,6 +305,8 @@ def _valid_glm_mla_raiden_pair(
     """Enforce exact GLM-MLA Raiden P/D pairing rules matching runtime tpu_connector."""
     if prefill_parallel.dp != 1 or prefill_parallel.pcp != 1:
         return False
+    if decode_parallel.pp != 1 or decode_parallel.pcp != 1:
+        return False
     pp_p = prefill_parallel.pp
     tp_p = prefill_parallel.tp
     dcp_p = prefill_parallel.kv_split
@@ -332,16 +334,23 @@ def _valid_raiden_kv_pair(
     decode_parallel: Parallel,
 ) -> bool:
     """Check runtime disaggregated KV cache shard compatibility between P and D."""
-    if geom.num_kv_heads <= 0:
-        return True
     rule = resolve_geom_profile(geom).parallel.raiden_pair_rule
     if rule == "glm_mla":
         return _valid_glm_mla_raiden_pair(prefill_parallel, decode_parallel)
+    if geom.num_kv_heads <= 0:
+        return True
     deg_p = max(1, prefill_parallel.tp * prefill_parallel.pcp)
     deg_d = max(1, decode_parallel.tp * decode_parallel.pcp)
     divisible = deg_p % deg_d == 0 or deg_d % deg_p == 0
     if rule == "qwen_gdn":
-        return prefill_parallel.kv_split == 1 and divisible
+        return (
+            prefill_parallel.kv_split == 1
+            and prefill_parallel.dp == 1
+            and prefill_parallel.pp in (1, 2, 4, 8)
+            and decode_parallel.pp in (1, 2, 4, 8)
+            and not (decode_parallel.dp > 1 and decode_parallel.kv_split > 1)
+            and divisible
+        )
     dcp_match = prefill_parallel.kv_split in {1, decode_parallel.kv_split}
     return dcp_match and divisible
 
@@ -3384,7 +3393,11 @@ def _explain_prefill_rejection(
     prefill_ep = prefill_axes.get("ep", 1)
     prefill_dcp = prefill_axes.get("kv_split", 1)
     if not _pcp_allowed(geom, prefill_pp, prefill_pcp, eff_pre_spec):
-        return "PCP > 1 is not permitted with PP > 1, this profile, or spec_k > 1"
+        return (
+            "PCP > 1 is not permitted with this profile or spec_k > 1"
+            if rules.pcp_allows_pp
+            else "PCP > 1 is not permitted with PP > 1, this profile, or spec_k > 1"
+        )
     n_full_attn = count_full_attn_layers(geom)
     if not _prefill_pp_allowed(
         geom, prefill_pp, n_full_attn, for_disagg=True, spec_k=eff_pre_spec

@@ -1730,3 +1730,131 @@ def test_prefill_dcp_shards_kv_hbm_and_charges_bf16_lse_merge_collectives() -> N
     kv_split_sixteen = 16.0
     assert kv_hbm_16 == pytest.approx(kv_hbm_1 / kv_split_sixteen, rel=1e-12)
     _assert_decode_dcp_retention(geom, par16, dt, attn_names[0])
+
+
+def test_gdn_state_clamps_k_heads_when_tp_times_pcp_exceeds_k_heads() -> None:
+    """Verify GDN state HBM and I/O clamp K-head sharding when tp * pcp > k_heads."""
+    cfg_path = Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    geom = from_hf_config(cfg)
+    dt = dtypes_from_hf_config(cfg)
+    counts = count_layer_types(geom)
+    expected_state_per_seq = 6_036_480.0
+
+    for tp, pcp in ((16, 2), (4, 8), (32, 1)):
+        par = Parallel(tp=tp, pcp=pcp)
+        bd = hbm_breakdown_per_core_bytes(geom, dt, par, SeqKvLayout(1, 8192))
+        assert bd.state == pytest.approx(expected_state_per_seq, rel=1e-12)
+
+        hit_mods = {
+            m.name: m
+            for m in pass_costs(
+                geom,
+                par,
+                StepShape(
+                    batch=0,
+                    rows_per_seq=0,
+                    context=8192,
+                    prefill_tokens=8192,
+                    prefix_hit_rate=0.5,
+                ),
+                dt,
+            )
+        }
+        miss_mods = {
+            m.name: m
+            for m in pass_costs(
+                geom,
+                par,
+                StepShape(
+                    batch=0,
+                    rows_per_seq=0,
+                    context=8192,
+                    prefill_tokens=8192,
+                    prefix_hit_rate=0.0,
+                ),
+                dt,
+            )
+        }
+        assert hit_mods["gdn"].hbm_bytes - miss_mods["gdn"].hbm_bytes == pytest.approx(
+            expected_state_per_seq, rel=1e-12
+        )
+
+    assert compute_w_rec(geom, dt, Parallel(tp=16, pcp=2), counts) == pytest.approx(
+        compute_w_rec(geom, dt, Parallel(tp=16, pcp=1), counts), rel=1e-12
+    )
+
+
+def test_mixed_chunked_and_push_dcp_collectives() -> None:
+    """Verify mixed chunked ag_rs emits one combined merge and push handles both."""
+    cfg_path = Path(__file__).resolve().parent / "fixtures" / "glm_5_2_fp8.json"
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    geom = from_hf_config(cfg)
+    dt = dtypes_from_hf_config(cfg)
+
+    tp = 16
+    dcp_group = 16
+    nq = geom.num_heads // tp
+    f32_bytes = 4
+    bf16_bytes = 2
+    batch = 8
+    prefill_tokens = 256
+
+    mixed_shape = StepShape(
+        batch=batch,
+        rows_per_seq=1,
+        context=8192,
+        prefill_tokens=prefill_tokens,
+        prefix_hit_rate=0.0,
+    )
+    par_ag_rs = Parallel(tp=tp, kv_split=dcp_group)
+    mods_ag = {m.name: m for m in pass_costs(geom, par_ag_rs, mixed_shape, dt)}
+    attn_names = tuple(name for name in ("mla", "dsa") if name in mods_ag)
+    assert attn_names
+    for name in attn_names:
+        unique_colls = mods_ag[name].unique_collectives
+        assert unique_colls is not None
+        lse_colls = [c for c, _ in unique_colls if c.name == "dcp_lse_ag"]
+        out_colls = [c for c, _ in unique_colls if c.name == "dcp_out_rs"]
+        q_colls = [c for c, _ in unique_colls if c.name == "dcp_q_ag"]
+        assert len(lse_colls) == 1
+        assert len(out_colls) == 1
+        assert len(q_colls) == 1
+        assert q_colls[0].payload == pytest.approx(
+            float(batch * dcp_group * nq * geom.kv_lora_rank * bf16_bytes), rel=1e-12
+        )
+        assert lse_colls[0].payload == pytest.approx(
+            float(dcp_group * (batch + prefill_tokens) * dcp_group * nq * f32_bytes),
+            rel=1e-12,
+        )
+        assert out_colls[0].payload == pytest.approx(
+            float(
+                batch * dcp_group * nq * geom.kv_lora_rank * f32_bytes
+                + prefill_tokens * dcp_group * nq * geom.kv_lora_rank * bf16_bytes
+            ),
+            rel=1e-12,
+        )
+
+    par_push = Parallel(tp=tp, kv_split=dcp_group, kv_merge="push")
+    dec_shape = StepShape(batch=batch, rows_per_seq=1, context=8192, prefill_tokens=0)
+    pre_shape = StepShape(
+        batch=0,
+        rows_per_seq=0,
+        context=8192,
+        prefill_tokens=prefill_tokens,
+        prefix_hit_rate=0.0,
+    )
+    for shape, expected_rows in (
+        (dec_shape, batch + 1),
+        (pre_shape, prefill_tokens),
+        (mixed_shape, (batch + 1) + prefill_tokens),
+    ):
+        mods_push = {m.name: m for m in pass_costs(geom, par_push, shape, dt)}
+        u_colls = mods_push[attn_names[0]].unique_collectives
+        assert u_colls is not None
+        merge_colls = [c for c, _ in u_colls if c.name == "merge_xchg"]
+        assert len(merge_colls) == 1
+        assert merge_colls[0].payload == pytest.approx(
+            float((dcp_group - 1) * expected_rows * nq * geom.kv_lora_rank * f32_bytes),
+            rel=1e-12,
+        )

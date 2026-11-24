@@ -36,6 +36,7 @@ from .constants import (
     RuntimeProfile,
     resolve_model_profile,
     resolve_runtime_profile,
+    spec_for_model_type,
 )
 
 __all__ = [
@@ -197,9 +198,6 @@ class ModelIdentity:
     hf_repo: str | None = None
 
 
-_MODEL_TYPE_TO_SPEC: dict[str, ModelSpec] = {
-    mt: spec for spec in SUPPORTED_MODELS.values() for mt in spec.model_types
-}
 _VALID_INDEXER_TYPES: frozenset[str] = frozenset({"full", "shared"})
 _MLP_LAYER_TYPE_MAP: dict[str, str] = {"dense": "dense", "sparse": "moe", "moe": "moe"}
 
@@ -581,7 +579,7 @@ def resolve_model_identity(
         )
         raise UnsupportedArchitectureError(msg)
 
-    spec = _MODEL_TYPE_TO_SPEC.get(model_type)
+    spec = spec_for_model_type(model_type)
     if spec is None:
         msg = (
             f"Unrecognized or unsupported model_type {model_type!r}; fails closed. "
@@ -645,9 +643,12 @@ def supports(
     cfg: Mapping[str, object],
     *,
     model_ref: str | None = None,
+    runtime_profile: str = DEFAULT_RUNTIME_PROFILE,
 ) -> None:
     """Validate canonical identity and modeled attention/recurrence/FFN families."""
-    identity = resolve_model_identity(cfg, model_ref=model_ref)
+    identity = resolve_model_identity(
+        cfg, model_ref=model_ref, runtime_profile=runtime_profile
+    )
     _validate_structural_support(cfg)
     text_cfg = _validate_text_config(cfg)
     raw_layers = text_cfg.get("num_hidden_layers")

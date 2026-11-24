@@ -312,6 +312,8 @@ _KV_DTYPE_ALIASES: Mapping[str, str] = MappingProxyType(
         "fp8": "fp8",
         "fp8_e4m3": "fp8",
         "fp8_e5m2": "fp8",
+        "fp8_e4m3fn": "fp8",
+        "fp8_e5m2fn": "fp8",
         "float8_e4m3fn": "fp8",
         "float8_e5m2": "fp8",
         "fp4": "fp4",
@@ -472,6 +474,19 @@ def canonicalize_kv_dtype(raw: str) -> str:
     """Map KV cache dtype aliases to canonical buckets, preserving unknown tokens."""
     norm = raw.strip().lower()
     return _KV_DTYPE_ALIASES.get(norm, norm)
+
+
+_MODEL_TYPE_TO_SPEC: Mapping[str, ModelSpec] = MappingProxyType(
+    {mt: spec for spec in SUPPORTED_MODELS.values() for mt in spec.model_types}
+)
+
+
+def spec_for_model_type(model_type: str) -> ModelSpec | None:
+    """Return the registered ``ModelSpec`` matching ``model_type``, if any."""
+    norm = model_type.strip().lower()
+    if not norm:
+        return None
+    return _MODEL_TYPE_TO_SPEC.get(norm)
 
 
 def resolve_runtime_profile(

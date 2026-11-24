@@ -512,22 +512,24 @@ def _attn_layer_collectives(
     if spec.is_full_attention and parallel.kv_split > 1:
         g = parallel.kv_split
         dec_rows = spec.batch * spec.rows_per_seq
-        if dec_rows > 0:
+        total_rows = dec_rows + spec.extra_rows
+        if total_rows > 0:
             if parallel.kv_merge == "ag_rs":
-                colls.append(
-                    _make_coll(
-                        "dcp_q_ag",
-                        "ag",
-                        float(dec_rows * g * spec.nq * spec.head_dim * 2),
-                        g,
-                        parallel,
+                if dec_rows > 0:
+                    colls.append(
+                        _make_coll(
+                            "dcp_q_ag",
+                            "ag",
+                            float(dec_rows * g * spec.nq * spec.head_dim * 2),
+                            g,
+                            parallel,
+                        )
                     )
-                )
                 colls.append(
                     _make_coll(
                         "dcp_lse_ag",
                         "ag",
-                        float(g * dec_rows * g * spec.nq * 4),
+                        float(g * total_rows * g * spec.nq * FP32_BYTES),
                         g,
                         parallel,
                     )
@@ -536,43 +538,28 @@ def _attn_layer_collectives(
                     _make_coll(
                         "dcp_out_rs",
                         "rs",
-                        float(dec_rows * g * spec.nq * spec.head_dim * 4),
+                        float(
+                            dec_rows * g * spec.nq * spec.head_dim * FP32_BYTES
+                            + spec.extra_rows
+                            * g
+                            * spec.nq
+                            * spec.head_dim
+                            * ACTIVATION_BYTES_BF16
+                        ),
                         g,
                         parallel,
                     )
                 )
             else:
-                per_peer = float(
-                    (spec.batch + 1) * spec.rows_per_seq * spec.nq * spec.head_dim * 4
+                merge_rows = (
+                    (spec.batch + 1) * spec.rows_per_seq + spec.extra_rows
+                    if dec_rows > 0
+                    else spec.extra_rows
                 )
+                per_peer = float(merge_rows * spec.nq * spec.head_dim * FP32_BYTES)
                 colls.append(
                     _make_coll("merge_xchg", "push", (g - 1) * per_peer, g, parallel)
                 )
-        if spec.extra_rows > 0:
-            colls.append(
-                _make_coll(
-                    "dcp_lse_ag",
-                    "ag",
-                    float(g * spec.extra_rows * g * spec.nq * FP32_BYTES),
-                    g,
-                    parallel,
-                )
-            )
-            colls.append(
-                _make_coll(
-                    "dcp_out_rs",
-                    "rs",
-                    float(
-                        spec.extra_rows
-                        * g
-                        * spec.nq
-                        * spec.head_dim
-                        * ACTIVATION_BYTES_BF16
-                    ),
-                    g,
-                    parallel,
-                )
-            )
     if spec.is_full_attention and parallel.pcp > 1 and spec.extra_rows > 0:
         kv_payload_per_tok = (
             spec.kv_bytes_per_tok
@@ -1694,6 +1681,7 @@ def _compute_gdn_cost(
 ) -> ModuleCost:
     """Compute ModuleCost for GDN linear attention."""
     tp = parallel.tp
+    state_div = max(1, tp * max(1, parallel.pcp))
     n_eff = n_gdn * eval_context.pp_scale
     key_heads = max(1, geom.linear_k_heads // tp) if geom.linear_k_heads > 0 else 0
     value_heads = max(1, geom.linear_v_heads // tp) if geom.linear_v_heads > 0 else 0
@@ -1706,21 +1694,26 @@ def _compute_gdn_cost(
     gdn_aux_elems = float(
         n_eff * (geom.hidden * (2 * value_heads) + qkv_rank_width * geom.conv_kernel)
     )
-    rec_state = (
-        float(n_eff * value_heads * geom.linear_k_dim * geom.linear_v_dim) * dt.state
+    state_k_heads = (
+        max(1, geom.linear_k_heads // state_div) if geom.linear_k_heads > 0 else 0
     )
-    conv_state = float(n_eff * qkv_rank_width * max(0, geom.conv_kernel - 1)) * dt.conv
+    state_v_heads = (
+        max(1, geom.linear_v_heads // state_div) if geom.linear_v_heads > 0 else 0
+    )
+    state_qkv_width = (
+        2 * state_k_heads * geom.linear_k_dim + state_v_heads * geom.linear_v_dim
+    )
+    rec_state = (
+        float(n_eff * state_v_heads * geom.linear_k_dim * geom.linear_v_dim) * dt.state
+    )
+    conv_state = float(n_eff * state_qkv_width * max(0, geom.conv_kernel - 1)) * dt.conv
     dec_state_io = float(eval_context.batch * (1 + eval_context.state_writes))
     pre_state_io = (
         float((1 if eval_context.cached_prefix > 0 else 0) + 1)
         if eval_context.eff_prefill > 0
         else 0.0
     )
-    gdn_state_bytes = (
-        (dec_state_io + pre_state_io)
-        * (rec_state + conv_state)
-        / float(max(1, parallel.pcp))
-    )
+    gdn_state_bytes = (dec_state_io + pre_state_io) * (rec_state + conv_state)
     dense_buckets = _route_matmul_flops(
         eval_context.rows,
         gdn_dense_elems,
@@ -1816,6 +1809,7 @@ def _compute_kda_cost(
 ) -> ModuleCost:
     """Compute ModuleCost for KDA linear attention."""
     tp = parallel.tp
+    state_div = max(1, tp * max(1, parallel.pcp))
     nq = max(1, geom.num_heads // tp) if geom.num_heads > 0 else 0
     n_eff = n_kda * eval_context.pp_scale
     key_heads = max(1, (geom.linear_k_heads or geom.num_heads) // tp)
@@ -1827,16 +1821,15 @@ def _compute_kda_cost(
         n_eff
         * (geom.hidden * proj_rank_width + (value_heads * v_head_dim) * geom.hidden)
     )
-    kda_rec = float(n_eff * value_heads * k_head_dim * v_head_dim) * dt.state
+    state_v_heads = max(1, (geom.linear_v_heads or geom.num_heads) // state_div)
+    kda_rec = float(n_eff * state_v_heads * k_head_dim * v_head_dim) * dt.state
     dec_state_io = float(eval_context.batch * (1 + eval_context.state_writes))
     pre_state_io = (
         float((1 if eval_context.cached_prefix > 0 else 0) + 1)
         if eval_context.eff_prefill > 0
         else 0.0
     )
-    kda_state_bytes = (
-        (dec_state_io + pre_state_io) * kda_rec / float(max(1, parallel.pcp))
-    )
+    kda_state_bytes = (dec_state_io + pre_state_io) * kda_rec
     kda_buckets = _route_matmul_flops(
         eval_context.rows,
         kda_w_elems,
