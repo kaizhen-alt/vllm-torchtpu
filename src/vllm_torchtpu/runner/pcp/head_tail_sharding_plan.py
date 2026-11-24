@@ -39,7 +39,8 @@ from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.pcp.sharding_plan import (
     PcpShardingPlan,
-    grow_host_token_buffers,
+    PcpShardingPlanName,
+    assert_host_token_buffer_capacity,
     round_up_to_bucket,
 )
 
@@ -359,16 +360,14 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         # The step's `PcpMetadata` fields except the block tables, as int32 host
         # arrays; None when attention needs no `PcpMetadata`.
         self.host_metadata: dict[str, np.ndarray] | None = None
-        # `host_metadata` uploaded once for every KV cache group of the step,
-        # and host tensors outliving their non-blocking uploads.
+        # `host_metadata` uploaded once for every KV cache group of the step.
         self._staged: dict[str, torch.Tensor] | None = None
-        self._keepalive: list[torch.Tensor] = []
 
-    @property
-    def local_reqs_per_req(self) -> int:
-        # A split prefill is two DualChunkSwap chunks on every rank, each its
-        # own local request; a decode is one.
-        return 2
+    # A split prefill is two DualChunkSwap chunks on every rank, each its own
+    # local request; a decode is one.
+    plan_name = PcpShardingPlanName.HEADTAIL
+    local_reqs_per_req = 2
+    uses_pcp_metadata = True
 
     @property
     def max_local_num_tokens(self) -> int:
@@ -393,6 +392,15 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
             self.num_ws_pages,
             self.num_ws_pages * self.virtual_page_size,
         )
+
+    def configure_kv_cache(
+        self, kv_cache_config: Any, kernel_block_size: int | None = None
+    ) -> None:
+        # Deferred: `manager` imports this module.
+        from vllm_torchtpu.runner.pcp.manager import mla_kv_page_size
+
+        del kernel_block_size
+        self.set_page_size(mla_kv_page_size(kv_cache_config))
 
     def _rep_window_size(self, target_num_reqs: int) -> int:
         """Decode window rows: `min(target_num_reqs, max_num_seqs)` rounded up
@@ -473,7 +481,7 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
 
         # Pack every rank's rows rank-major; this rank reads its own slice.
         num_packed = local_padded * self.pcp_size
-        grow_host_token_buffers(runner, num_packed)
+        assert_host_token_buffer_capacity(runner, num_packed)
         gather_idx = torch.as_tensor(plan.padded_gather_idx, dtype=torch.long)
         valid = torch.as_tensor(plan.gathered_valid, dtype=torch.bool)
         packed_ids = torch.where(valid, global_input_ids.index_select(0, gather_idx), 0)
@@ -523,13 +531,10 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         self.local_num_tokens = plan.per_rank_num_tokens[self.pcp_rank]
         self.local_padded_num_tokens = local_padded
         self.logits_indices_cpu = torch.from_numpy(logits_indices.astype(np.int32))
-        # Upload now, before the runner records its input staging fence: the
-        # next step's prepare waits only on that fence before it drops these
-        # host tensors.
-        hosts = (torch.from_numpy(logits_local), torch.from_numpy(owner_mask))
-        self._keepalive.extend(hosts)
-        self.logits_local_indices, self.logits_owner_mask = (
-            t.to(runner.device, non_blocking=True) for t in hosts
+        self._stage_logits_selection(
+            runner.device,
+            torch.from_numpy(logits_local),
+            torch.from_numpy(owner_mask),
         )
         self.logits_all_local = logits_all_local
         self.request_major_to_local = request_major_to_local

@@ -109,6 +109,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.platforms.pcp_validation import PcpShardingPlanName
 from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -869,6 +870,9 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
 
 
 class PallasAttentionBackendImpl(AttentionImpl):
+    supported_pcp_sharding_plans: ClassVar[frozenset[PcpShardingPlanName]] = frozenset(
+        {PcpShardingPlanName.INTERLEAVED}
+    )
     layer_idx: int
     _kernel_instance_counter = 0
     # Registry of shared custom ops keyed to avoid registering duplicate Pallas
