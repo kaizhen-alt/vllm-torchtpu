@@ -25,6 +25,8 @@ import gc
 import glob
 import hashlib
 import importlib.util
+import inspect
+import io
 import json
 import os
 import pickle
@@ -32,7 +34,7 @@ import re
 import shutil
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
@@ -42,6 +44,11 @@ import torch._guards
 import torch.fx as fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch_tpu._internal.compile._backend import TpuBackend
+from torch_tpu._internal.compile.split_compiler import _SplitCompiledExecutable
+from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+    NoOpCompiledArtifact,
+    TorchTpuCompiledExecutable,
+)
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
@@ -145,6 +152,216 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
     with contextlib.suppress(AttributeError, TypeError):
         entry.__deepcopy__ = lambda _memo: entry
     return deserialize_bundled_cache_entry(entry)
+
+
+# The arguments `TorchTpuCompiledExecutable.__init__` takes, in the order
+# `__reduce__` saves them. `_ExecutableKeepingUnpickler` rebuilds each leaf from
+# exactly these, so a torch_tpu that adds, drops or renames one makes
+# `_rebuild_sharing_executables` refuse rather than build an incomplete leaf.
+_TORCH_TPU_EXEC_INIT_PARAMS = (
+    "self",
+    "executable",
+    "reconstruct_fx_outputs_fn",
+    "updates_default_generator_state",
+    "dynamic_outputs",
+    "unique_output_indices",
+)
+_TORCH_TPU_EXEC_INIT_MATCHES = (
+    tuple(inspect.signature(TorchTpuCompiledExecutable.__init__).parameters)
+    == _TORCH_TPU_EXEC_INIT_PARAMS
+)
+
+
+class _ExecutableKeepingPickler(pickle.Pickler):
+    """Pickles an entry, but keeps each TPU leaf's loaded executable aside.
+
+    A `TorchTpuCompiledExecutable` is written as its constructor arguments,
+    with the executable replaced by its index in `executables`. Subclasses
+    keep their own `__reduce__`.
+    """
+
+    def __init__(self, file: io.BytesIO, executables: list[Any]):
+        super().__init__(file, protocol=pickle.HIGHEST_PROTOCOL)
+        self._executables = executables
+        self._indices: dict[int, int] = {}
+
+    def persistent_id(self, obj: Any) -> Any:
+        if type(obj) is not TorchTpuCompiledExecutable:
+            return None
+        index = self._indices.get(id(obj))
+        if index is None:
+            index = self._indices[id(obj)] = len(self._executables)
+            self._executables.append(obj._executable)
+        # The arguments `TorchTpuCompiledExecutable.__reduce__` saves, but the
+        # index of the executable instead of its serialized bytes.
+        return (
+            index,
+            obj._reconstruct_fx_outputs_fn,
+            obj._updates_default_generator_state,
+            obj._dynamic_outputs,
+            obj._unique_output_indices,
+        )
+
+
+class _ExecutableKeepingUnpickler(pickle.Unpickler):
+    """Reads back `_ExecutableKeepingPickler` output: each TPU leaf is a new
+    one, built as `_unpickle_compiled_executable` builds it, around the same
+    loaded executable."""
+
+    def __init__(self, file: io.BytesIO, executables: list[Any]):
+        super().__init__(file)
+        self._executables = executables
+        self._leaves: dict[int, Any] = {}
+
+    def persistent_load(self, pid: Any) -> Any:
+        index, reconstruct, updates_generator, dynamic_outputs, unique_outputs = pid
+        if index not in self._leaves:
+            self._leaves[index] = TorchTpuCompiledExecutable(
+                executable=self._executables[index],
+                reconstruct_fx_outputs_fn=reconstruct,
+                updates_default_generator_state=updates_generator,
+                dynamic_outputs=dynamic_outputs,
+                unique_output_indices=unique_outputs,
+            )
+        return self._leaves[index]
+
+
+def _rebuild_sharing_executables(entry: Any) -> Callable[..., Any]:
+    """Rebuild the runnable `_replay` would, from the in-process `entry`, but
+    on the TPU executables `entry` already holds.
+
+    `entry` takes the same pickle round trip as the artifact `_replay` reads,
+    so the aot_autograd wrapper, the leaves and their fast runners are all
+    new and nothing of the in-process compile result stays reachable. Only
+    the loaded executable of each leaf is carried over, instead of being
+    serialized and loaded again: `load_serialized_executable` does not go
+    through torch_tpu's Tier-1 cache, which keeps the executable the backend
+    returned, so a reload would leave the rank holding two copies of it.
+
+    Raises `TypeError` when `TorchTpuCompiledExecutable.__init__` no longer
+    takes `_TORCH_TPU_EXEC_INIT_PARAMS`, so the caller replays the artifact
+    instead of building leaves that miss a constructor argument.
+    """
+    if not _TORCH_TPU_EXEC_INIT_MATCHES:
+        init = inspect.signature(TorchTpuCompiledExecutable.__init__)
+        raise TypeError(
+            f"TorchTpuCompiledExecutable.__init__ takes {tuple(init.parameters)}, "
+            f"expected {_TORCH_TPU_EXEC_INIT_PARAMS}"
+        )
+    executables: list[Any] = []
+    buffer = io.BytesIO()
+    _ExecutableKeepingPickler(buffer, executables).dump(entry)
+    buffer.seek(0)
+    copied = _ExecutableKeepingUnpickler(buffer, executables).load()
+    return _deserialize_entry(copied)
+
+
+# The artifacts whose references `_release_compiled_graph_cycles` knows: once
+# it has dismantled them, the in-process compile result holds no cycle left
+# for anything but a Gen-0 sweep.
+_KNOWN_COMPILED_ARTIFACTS = (
+    _SplitCompiledExecutable,
+    TorchTpuCompiledExecutable,
+    NoOpCompiledArtifact,
+)
+
+
+def _break_fx_graph_cycles(gm: fx.GraphModule, preserved_ids: set[int]) -> None:
+    """Sever the `GraphModule <-> Graph` and node links of `gm` and of every
+    GraphModule under it, except those in `preserved_ids`.
+
+    Node `meta` dicts are left as they are: one may be shared with a graph
+    that is still in use, and dropping the node drops its reference anyway.
+    """
+    for mod in gm.modules():
+        if not isinstance(mod, fx.GraphModule) or id(mod) in preserved_ids:
+            continue
+        preserved_ids.add(id(mod))
+        graph = mod.graph
+        for node in graph.nodes:
+            node.args = ()
+            node.kwargs = {}
+        for node in reversed(list(graph.nodes)):
+            graph.erase_node(node)
+        graph._owning_module = None
+
+
+def _release_compiled_graph_cycles(
+    compiled_fn: Any,
+    entry: Any,
+    *,
+    preserve: Collection[Any] = (),
+) -> bool:
+    """Dismantle the FX graph cycles of an in-process compile result about to
+    be dropped, so refcounting frees it. True if a Gen-0 sweep then suffices.
+
+    Pickling the entry in `_save_handle` allocates enough to trigger Gen-0 and
+    Gen-1 passes, which can promote `_SplitCompiledExecutable._split_gm`
+    (`GraphModule <-> Graph`) to Gen-2, where only a full `gc.collect()` --
+    seconds over a loaded model's heap, per bucket -- would find it. With the
+    cycles cut, `_split_gm`, its constants and its leaf wrappers go as soon
+    as the last reference does. Leaf executables are not touched: the rebuilt
+    runnable shares them.
+
+    Visits `entry.compiled_fw` / `compiled_bw` results and the backend's
+    `compiled_artifacts` closure list (which it empties). GraphModules under
+    `preserve` -- the caller's graphs -- are left intact. Returns False, so
+    the caller runs a full collection, when `entry` has no forward artifact
+    or holds an artifact of a type it does not know (e.g. an
+    `AsyncCompiledArtifact`), which may keep cycles of its own.
+    """
+    preserved_ids = {
+        id(mod)
+        for root in preserve
+        if isinstance(root, torch.nn.Module)
+        for mod in root.modules()
+    }
+    seen: set[int] = set()
+
+    def visit(artifact: Any) -> bool:
+        if artifact is None or id(artifact) in seen:
+            return True
+        seen.add(id(artifact))
+        if not isinstance(artifact, _SplitCompiledExecutable):
+            return isinstance(artifact, _KNOWN_COMPILED_ARTIFACTS)
+        # Read before `_split_gm` is dismantled; its children stay attached.
+        known = all([visit(sub) for sub in artifact.compiled_executables])
+        recompile_fn = artifact.recompile_fn
+        if recompile_fn is not None:
+            for arg in getattr(recompile_fn, "args", ()):
+                if isinstance(arg, fx.GraphModule):
+                    _break_fx_graph_cycles(arg, preserved_ids)
+            artifact.recompile_fn = None
+        artifact._graph_module_str = None
+        _break_fx_graph_cycles(artifact._split_gm, preserved_ids)
+        return known
+
+    known = getattr(entry, "compiled_fw", None) is not None
+    for attr in ("compiled_fw", "compiled_bw"):
+        loadable = getattr(entry, attr, None)
+        if loadable is not None:
+            known = visit(getattr(loadable, "result", None)) and known
+
+    freevars = getattr(getattr(compiled_fn, "__code__", None), "co_freevars", ())
+    closure = getattr(compiled_fn, "__closure__", None) or ()
+    for name, cell in zip(freevars, closure):
+        if name == "compiled_artifacts" and isinstance(cell.cell_contents, list):
+            known = all([visit(item) for item in cell.cell_contents]) and known
+            cell.cell_contents.clear()
+    return known
+
+
+def _collect_dropped_result(gen0_suffices: bool) -> None:
+    """Collect what is left of an in-process compile result just dropped.
+
+    A Gen-0 sweep when `_release_compiled_graph_cycles` dismantled all of it,
+    instead of a full collection over a loaded model's heap; a full one when
+    it met an artifact it does not know.
+    """
+    if gen0_suffices:
+        gc.collect(0)
+    else:
+        gc.collect()
 
 
 _TPU_COMPILE_ENV_IGNORED = {
@@ -699,6 +916,34 @@ class TpuCompilerAdaptor(CompilerInterface):
                 os.remove(tmp_path)
             return False
 
+    def _rebuild_saved(
+        self,
+        entry: Any,
+        path: str,
+        graph: fx.GraphModule,
+        was_wrapped: bool,
+        fingerprint: str | None,
+    ) -> Callable[..., Any] | None:
+        """The runnable to run instead of the in-process compile result whose
+        `entry` was just saved to `path`, or None to keep that result.
+
+        Rebuilt from `entry` on the executable this rank already holds (see
+        `_rebuild_sharing_executables`). If that fails, replayed from `path`
+        as a warm start would, which loads a second copy of the executable.
+        """
+        try:
+            return _rebuild_sharing_executables(entry)
+        except Exception as e:
+            # Log the message, not the exception: a handler that keeps the
+            # record would keep its traceback, and through it `entry`.
+            logger.warning(
+                "[TpuCompilerAdaptor] Could not rebuild the runnable on its "
+                "loaded executable, replaying %s instead: %s",
+                path,
+                str(e),
+            )
+        return self._replay(path, graph, was_wrapped, fingerprint)
+
     def _replay(
         self,
         path: str,
@@ -917,7 +1162,8 @@ class TpuCompilerAdaptor(CompilerInterface):
         # first because _ensure_tuple_output rewrites the output node in place
         # and vLLM keeps its own reference to `graph`. Only the output node
         # moves, so the placeholder signature is unaffected.
-        graph = copy.deepcopy(graph)
+        orig_graph = graph
+        graph = copy.deepcopy(orig_graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         save_path = (
@@ -963,12 +1209,15 @@ class TpuCompilerAdaptor(CompilerInterface):
                 shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
             return compiled_fn, handle
 
-        compiled_fn, entry = self._run_backend(graph, example_inputs)
+        backend_fn, entry = self._run_backend(graph, example_inputs)
 
-        if was_wrapped:
-            # Undo _ensure_tuple_output on the result side, so callers see the
-            # single tensor the original graph returned.
-            compiled_fn = self._unwrap_compiled_fn(compiled_fn)
+        # Undo _ensure_tuple_output on the result side, so callers see the
+        # single tensor the original graph returned. `backend_fn` stays the
+        # backend's own runnable, whose closure `_release_compiled_graph_cycles`
+        # reads.
+        compiled_fn = (
+            self._unwrap_compiled_fn(backend_fn) if was_wrapped else backend_fn
+        )
 
         # Persist torch's bundled AOTAutograd entry -- the aot_autograd wrapper
         # metadata and the compiled executable as one object. It has to be one
@@ -989,16 +1238,6 @@ class TpuCompilerAdaptor(CompilerInterface):
                 key, save_path, entry, graph, was_wrapped, fingerprint
             ):
                 handle = (key, save_path, was_wrapped)
-        del entry
-        # Under peer replay, other ranks of the host may be waiting for this
-        # artifact: say so when it will not come, so they compile it now.
-        if fingerprint is not None:
-            assert key is not None
-            if handle is None:
-                self._mark_failed(key, fingerprint)
-            else:
-                self._clear_failed(key)
-
         # Run the artifact just saved, not the in-process compile result: the
         # latter keeps device tensors alive once it has run, which a runnable
         # rebuilt from the artifact does not. That HBM would otherwise count
@@ -1008,15 +1247,32 @@ class TpuCompilerAdaptor(CompilerInterface):
         # replay, and between a cold start and the warm start after it, whose
         # different block counts then give the backbone a different
         # compile-cache key. The rebuilt runnable is what replaying ranks and
-        # warm starts run.
-        if handle is not None:
-            reloaded = self._replay(handle[1], graph, was_wrapped, fingerprint)
-            if reloaded is not None:
-                compiled_fn = (
-                    self._unwrap_compiled_fn(reloaded) if was_wrapped else reloaded
-                )
-                # The in-process result holds reference cycles.
-                gc.collect()
+        # warm starts run; `_rebuild_saved` builds it on the executable this
+        # rank already holds rather than loading a second copy from the file.
+        reloaded = (
+            None
+            if handle is None
+            else self._rebuild_saved(entry, handle[1], graph, was_wrapped, fingerprint)
+        )
+        # Dismantle the in-process result while `entry` still reaches it.
+        gen0_suffices = reloaded is not None and _release_compiled_graph_cycles(
+            backend_fn, entry, preserve=(graph, orig_graph)
+        )
+        del entry, backend_fn
+        # Under peer replay, other ranks of the host may be waiting for this
+        # artifact: say so when it will not come, so they compile it now.
+        if fingerprint is not None:
+            assert key is not None
+            if handle is None:
+                self._mark_failed(key, fingerprint)
+            else:
+                self._clear_failed(key)
+
+        if reloaded is not None:
+            compiled_fn = (
+                self._unwrap_compiled_fn(reloaded) if was_wrapped else reloaded
+            )
+            _collect_dropped_result(gen0_suffices)
 
         # Offer this bucket to later traces of the same model, so a graph that
         # refuses it reuses this runnable instead of building a second
@@ -1061,7 +1317,8 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
         # artifact is checked against is shaped the way it was when saved.
-        graph = copy.deepcopy(graph)
+        orig_graph = graph
+        graph = copy.deepcopy(orig_graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         compiled_fn = self._replay(path, graph, was_wrapped)
@@ -1077,15 +1334,21 @@ class TpuCompilerAdaptor(CompilerInterface):
                 and not self._disable_cache
                 and self._save_handle(key, path, entry, graph, was_wrapped, fingerprint)
             )
+            # As in `compile`: run the artifact just saved, not the
+            # in-process result, so a start that recompiled a stale
+            # artifact holds no extra HBM either.
+            reloaded = (
+                self._rebuild_saved(entry, path, graph, was_wrapped, fingerprint)
+                if saved
+                else None
+            )
+            gen0_suffices = reloaded is not None and _release_compiled_graph_cycles(
+                compiled_fn, entry, preserve=(graph, orig_graph)
+            )
             del entry
-            if saved:
-                # As in `compile`: run the artifact just saved, not the
-                # in-process result, so a start that recompiled a stale
-                # artifact holds no extra HBM either.
-                reloaded = self._replay(path, graph, was_wrapped, fingerprint)
-                if reloaded is not None:
-                    compiled_fn = reloaded
-                    gc.collect()
+            if reloaded is not None:
+                compiled_fn = reloaded
+                _collect_dropped_result(gen0_suffices)
 
         if was_wrapped:
             compiled_fn = self._unwrap_compiled_fn(compiled_fn)
