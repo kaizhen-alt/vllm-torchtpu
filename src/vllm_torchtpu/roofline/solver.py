@@ -3538,25 +3538,33 @@ class _ExplainOptions(TypedDict, total=False):
 
 
 def _explain_mixed_instance_budget(
-    decode_axes: Mapping[str, int],
+    layout: Mapping[str, Mapping[str, int]],
     decode_topologies: Sequence[SliceTopology],
     options: SolveOptions,
 ) -> str | None:
     """Return budget rejection reason when explicit Nx mixed instances exceed limits."""
-    instances = decode_axes.get("instances")
-    if instances is None or options.mode == "disagg":
+    if "prefill" in layout or options.mode == "disagg":
         return None
-    if options.max_instances is not None and instances > options.max_instances:
+    decode_axes = layout["decode"]
+    instances = decode_axes.get("instances")
+    if instances is None or instances <= 1:
+        return None
+    if options.max_chips is None:
         return (
-            f"requested {instances}x instances exceeds "
-            f"max_instances={options.max_instances}"
+            f"requested {instances}x mixed instances requires max_chips to exceed "
+            "1 instance"
         )
+    max_cap = (
+        options.max_instances
+        if options.max_instances is not None
+        else DEFAULT_MAX_INSTANCES
+    )
+    if instances > max_cap:
+        return f"requested {instances}x instances exceeds max_instances={max_cap}"
     needed_cores = decode_axes.get("tp", 1) * decode_axes.get("dp", 1)
     matching_topos = [t for t in decode_topologies if t.num_cores == needed_cores]
-    if (
-        options.max_chips is not None
-        and matching_topos
-        and all(instances * t.num_chips > options.max_chips for t in matching_topos)
+    if matching_topos and all(
+        instances * t.num_chips > options.max_chips for t in matching_topos
     ):
         return f"{instances}x slice footprint exceeds max_chips={options.max_chips}"
     return None
@@ -3606,9 +3614,7 @@ def explain_layout_rejection(
     if decode_reason is not None:
         return decode_reason
 
-    instance_reason = _explain_mixed_instance_budget(
-        layout["decode"], decode_topologies, options
-    )
+    instance_reason = _explain_mixed_instance_budget(layout, decode_topologies, options)
     if instance_reason is not None:
         return instance_reason
 

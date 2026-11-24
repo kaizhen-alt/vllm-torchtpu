@@ -741,9 +741,17 @@ def reference_layout_report(
     if found:
         best_candidate = max(
             matching_candidates,
-            key=lambda candidate: candidate.token_throughput_per_chip,
+            key=lambda candidate: (
+                effective_slo_verdict(candidate) != SLO_VERDICT_RULED_OUT,
+                candidate.token_throughput_per_chip,
+            ),
         )
         diag_point = best_candidate
+        if effective_slo_verdict(best_candidate) == SLO_VERDICT_RULED_OUT:
+            ruled_out = True
+            final_rejection_reason = _format_ruled_out_reason(best_candidate, plan)
+        else:
+            final_rejection_reason = ""
         peer_candidates = [
             candidate
             for candidate in plan.candidates
@@ -779,7 +787,6 @@ def reference_layout_report(
             for candidate in top_points
         )
         candidate_point_dict: Mapping[str, object] | None = asdict(best_candidate)
-        final_rejection_reason = ""
     else:
         num_candidates = len(
             {_point_struct_key(candidate) for candidate in plan.candidates}

@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import asdict
 from dataclasses import replace as dc_replace
+from operator import methodcaller
 from pathlib import Path
 from typing import Literal
 
@@ -55,6 +57,7 @@ from vllm_torchtpu.roofline import (
     emit_launch_args,
     explain_layout_rejection,
     floor_throughput_per_chip,
+    format_parallelism,
     from_hf_config,
     hbm_breakdown_per_core_bytes,
     hbm_footprint_per_core_bytes,
@@ -84,6 +87,7 @@ from vllm_torchtpu.roofline.crossover import (
     _CrossoverPlanner,
     _derive_winner_range_and_crossover,
     _eval_grid_disagg_ttft,
+    _kv_parts_for_pool,
     _pool_sig,
     ep_z_unit,
     eval_grid_mix_candidates,
@@ -4033,3 +4037,188 @@ def test_reference_layout_report_diagnoses_ruled_out_and_family_skyline() -> Non
     assert ref_fam["ruled_out"] is False
     assert ref_fam["family_in_skyline_k"] is True
     assert "DCP8" in str(ref_fam["skyline_family_peer"])
+
+
+def test_reference_layout_report_flags_all_ruled_out_matching_candidate() -> None:
+    """Flag ruled_out=True when all matching candidates miss SLO."""
+    geom = rf.from_hf_config(SMALL_HYBRID_MOE_CFG)
+    dt = rf.dtypes_from_hf_config(SMALL_HYBRID_MOE_CFG)
+    chip = CHIPS["tpu7x"]
+    scen = dc_replace(
+        build_example_scenario("chat-8k1k"),
+        ttft_slo_ms=0.01,
+        tpot_slo_ms=0.01,
+        concurrencies=(8,),
+    )
+    plan = solve_serving_plan(
+        geom, dt, chip, scen, SolveOptions(mode="mixed", max_chips=4)
+    )
+    assert plan.recommended is None
+    assert plan.candidates
+    assert all(pt.slo_verdict == SLO_VERDICT_RULED_OUT for pt in plan.candidates)
+
+    cand = plan.candidates[0]
+    ref = reference_layout_report(
+        plan,
+        top_layouts(plan, 5),
+        format_parallelism(asdict(cand.decode_pool)),
+        "not enumerated",
+    )
+    assert ref["found"] is True
+    assert ref["ruled_out"] is True
+    assert ref["slo_verdict"] == SLO_VERDICT_RULED_OUT
+    assert ref["rejected_by"]
+    assert ref["rejection_reason"] == ref["rejected_by"]
+    assert "exceeds" in str(ref["rejected_by"])
+
+
+def test_crossover_uniform_pp_stage_floor_matches_solver_ttft() -> None:
+    """Resolve uniform PP partitions in crossover planner matching solver floor."""
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    cfg = json.loads((fixtures / "qwen3_5_397b_fp8.json").read_text(encoding="utf-8"))
+    geom = from_hf_config(cfg)
+    dt = dtypes_from_hf_config(cfg)
+    chip = CHIPS["tpu7x"]
+    scen = TrafficScenario(
+        name="q35-pp4-pcp2",
+        isl=4096,
+        osl=256,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(8,),
+        kv_working_set_turns=1.0,
+    )
+    plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scen,
+        SolveOptions(
+            mode="disagg",
+            prefill_topology="2x2x1",
+            decode_topology="2x2x1",
+            max_chips=16,
+        ),
+    )
+    expected_pp = 4
+    expected_pcp = 2
+    pp4_pcp2_pts = [
+        pt
+        for pt in (*plan.candidates, *plan.ruled_out_candidates)
+        if pt.prefill_pool is not None
+        and pt.prefill_pool.pp == expected_pp
+        and pt.prefill_pool.pcp == expected_pcp
+        and pt.prefill_pool.pp_layer_partition is None
+    ]
+    assert pp4_pcp2_pts
+    pt = pp4_pcp2_pts[0]
+    assert pt.prefill_pool is not None
+
+    planner = _CrossoverPlanner(geom, dt, chip, scen)
+    p_pid = planner.get_pool_id(pt.prefill_pool)
+    topo, par, pp_part = planner.pool_plans[p_pid]
+    assert pp_part == (15, 15, 15, 15)
+
+    shape = StepShape(
+        batch=0,
+        rows_per_seq=0,
+        context=0,
+        state_writes=0,
+        prefill_tokens=scen.isl,
+        prefix_hit_rate=scen.prefix_hit_rate,
+    )
+    opts = FloorOptions(dt=dt, topology=topo)
+    stage_sf = methodcaller("_eval_stage_or_step_floor", par, shape, opts, pp_part)(
+        planner
+    )
+    solver_stage_sf = scale_pp_stage_floor(
+        geom, chip, par, (shape, opts), (15, 15, 15, 15)
+    )
+    assert stage_sf.hard_floor_s == pytest.approx(
+        solver_stage_sf.hard_floor_s, rel=1e-12
+    )
+    ms_per_s = 1000.0
+    assert stage_sf.hard_floor_s * ms_per_s <= pt.bound_ttft_ms + 1e-9
+    assert planner.compute_pre_sf(
+        p_pid, pt.prefill_pool, scen.prefix_hit_rate
+    ) == pytest.approx(solver_stage_sf.serial_estimate_s, rel=1e-12)
+
+    pools, eval_ctx = setup_crossover_sweep(geom, dt, chip, scen, [pt])
+    state = CandidateState()
+    _eval_grid_disagg_ttft(
+        scen.prefix_hit_rate, scen, pools.dis_ttft_groups, eval_ctx, state
+    )
+    chosen = state.near_slo[0] if state.near_slo else state.near_all[0]
+    assert chosen[0] == pytest.approx(pt.token_throughput_per_chip, rel=1e-6)
+
+
+def test_explain_mixed_instance_budget_guards() -> None:
+    """Apply mixed instance budget checks only when no prefill pool is specified."""
+    geom = rf.from_hf_config(SMALL_HYBRID_MOE_CFG)
+    topos = tuple(TOPOLOGIES.values())
+
+    no_max_chips = explain_layout_rejection(
+        geom,
+        {"decode": {"instances": 2, "tp": 8}},
+        topos,
+        SolveOptions(mode="auto", max_chips=None),
+    )
+    assert "max_chips" in no_max_chips
+
+    over_default_inst = explain_layout_rejection(
+        geom,
+        {"decode": {"instances": 20, "tp": 8}},
+        topos,
+        SolveOptions(mode="mixed", max_chips=256, max_instances=None),
+    )
+    assert "max_instances=16" in over_default_inst
+
+    over_chip_budget = explain_layout_rejection(
+        geom,
+        {"decode": {"instances": 3, "tp": 8}},
+        topos,
+        SolveOptions(mode="mixed", max_chips=8),
+    )
+    assert "max_chips=8" in over_chip_budget
+
+    disagg_auto = explain_layout_rejection(
+        geom,
+        {"prefill": {"pp": 2}, "decode": {"instances": 2, "tp": 8}},
+        topos,
+        SolveOptions(mode="auto", max_chips=None),
+    )
+    assert "mixed instances" not in disagg_auto
+
+
+def test_crossover_uniform_pp_kv_parts_matches_stage_peak() -> None:
+    """Resolve uniform PP stage KV via max-stage peak rather than layer average."""
+    geom = from_hf_config(QWEN35_CFG)
+    dt = Dtypes()
+    chip = CHIPS["tpu7x"]
+    pool = PoolMeshPlan(
+        role="prefill",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=1,
+        dp=1,
+        ep=1,
+        pp=4,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(4,),
+        hbm_used_gb=20.0,
+        hbm_limit_gb=80.0,
+        moe_dispatch="allreduce",
+        pp_layer_partition=None,
+    )
+    par = Parallel(tp=1, pp=4, ranks_per_chip=chip.cores_per_chip)
+    uniform_part = (geom.num_layers // pool.pp,) * pool.pp
+    expected_lin, expected_fix = rf.pp_stage_kv_parts(
+        geom, dt, par, (uniform_part, 2048), chip=chip
+    )
+    got_lin, got_fix = _kv_parts_for_pool(geom, dt, chip, pool, 2048)
+    assert got_lin == pytest.approx(4096.0)
+    assert got_lin == pytest.approx(expected_lin)
+    assert got_fix == pytest.approx(expected_fix)

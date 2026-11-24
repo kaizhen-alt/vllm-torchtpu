@@ -345,6 +345,19 @@ def _valid_uneven_pp(
     return part
 
 
+def _resolve_pp_partition(
+    pool: PoolMeshPlan,
+    num_layers: int,
+) -> tuple[int, ...] | None:
+    """Return validated uneven or uniform stage partition for ``pool.pp > 1``."""
+    uneven = _valid_uneven_pp(pool, num_layers)
+    if uneven is not None:
+        return uneven
+    if pool.pp > 1 and num_layers % pool.pp == 0:
+        return (num_layers // pool.pp,) * pool.pp
+    return None
+
+
 def _kv_parts_for_pool(
     geom: ModelGeometry,
     dtypes: Dtypes,
@@ -360,9 +373,9 @@ def _kv_parts_for_pool(
         kv_split=pool.kv_split,
         ranks_per_chip=chip.cores_per_chip,
     )
-    uneven = _valid_uneven_pp(pool, geom.num_layers)
-    if uneven is not None:
-        return pp_stage_kv_parts(geom, dtypes, par_k, (uneven, ctx_len), chip=chip)
+    pp_part = _resolve_pp_partition(pool, geom.num_layers)
+    if pp_part is not None:
+        return pp_stage_kv_parts(geom, dtypes, par_k, (pp_part, ctx_len), chip=chip)
     return kv_bytes_per_core_parts(geom, dtypes, par_k, ctx_len, chip=chip)
 
 
@@ -1148,7 +1161,7 @@ class _CrossoverPlanner:
             parallel = _pool_parallel(
                 pool, topo, default_ranks=self.chip.cores_per_chip
             )
-            uneven_part = _valid_uneven_pp(pool, self.geom.num_layers)
+            uneven_part = _resolve_pp_partition(pool, self.geom.num_layers)
             self.pool_plans.append((topo, parallel, uneven_part))
         return pid
 
