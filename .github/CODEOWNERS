@@ -183,6 +183,9 @@
 
 # Models: Qwen4 Experimental
 /src/vllm_torchtpu/models/qwen4_exp/ @kyuyeunk @BirdsOfAFthr
+# Entry shared by the supported and experimental tiers (register()).
+/src/vllm_torchtpu/models/qwen4_exp/__init__.py @kyuyeunk @BirdsOfAFthr @caojx-google
+/tests/models/qwen4_exp/test_registration.py @kyuyeunk @BirdsOfAFthr @caojx-google
 
 # Models: Qwen4 Experimental (experimental tier)
 /src/vllm_torchtpu/models/qwen4_exp/experimental/ @caojx-google @DRZDONG @benliangw @mshrihari3
