@@ -53,7 +53,7 @@ EXPECTED_VECTOR_LOAD_CAP_TEXT = (
 )
 
 
-SHIPPED_PRESET_COUNT = 4
+SHIPPED_PRESET_COUNT = 5
 NEGATIVE_CONTROL_SNAPSHOTS = frozenset({"kimi-k3.1-pro", "qwen3.8-2.4t", "deepseek-v3"})
 HF_CONFIG_DIR = Path(__file__).resolve().parent / "data" / "advisor" / "hf_configs"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1250,6 +1250,7 @@ def test_shipped_presets_are_the_three_validated_models() -> None:
         "kimi-k3",
         "glm-5.2",
         "qwen3.8-flash-next",
+        "deepseek-v4.1-flash",
     }
     expected_aliases = {
         "qwen3.5-397b": "qwen3.5-397b",
@@ -1262,6 +1263,8 @@ def test_shipped_presets_are_the_three_validated_models() -> None:
         "qwen3.8-flash-next": "qwen3.8-flash-next",
         "qwen3.8-flash-next-fp8": "qwen3.8-flash-next",
         "qwen3.8-flash": "qwen3.8-flash-next",
+        "deepseek-v4.1-flash": "deepseek-v4.1-flash",
+        "deepseek-v41-flash": "deepseek-v4.1-flash",
     }
     assert set(models.MODEL_PRESETS) == expected_presets
     assert dict(models.REGISTERED_MODEL_ALIASES) == expected_aliases
@@ -1271,6 +1274,7 @@ def test_shipped_presets_are_the_three_validated_models() -> None:
         "kimi-k3",
         "glm-5.2",
         "qwen3.8-flash-next",
+        "deepseek-v4.1-flash",
     ):
         snapshot = json.loads(
             (HF_CONFIG_DIR / f"{preset_name}.json").read_text(encoding="utf-8")
@@ -1287,6 +1291,7 @@ def test_authentic_kept_configs_resolve_to_shipped_presets() -> None:
         "kimi-k3",
         "glm-5.2",
         "qwen3.8-flash-next",
+        "deepseek-v4.1-flash",
     ):
         snapshot = json.loads(
             (HF_CONFIG_DIR / f"{preset_name}.json").read_text(encoding="utf-8")
@@ -1302,6 +1307,7 @@ def test_unsupported_authentic_config_fails_closed() -> None:
         "moonshotai/Kimi-K3",
         "zai-org/GLM-5.2-FP8",
         "Qwen/Qwen3.8-Flash-Next-FP8",
+        "deepseek-ai/DeepSeek-V4.1-Flash",
     )
     for neg_name in ("kimi-k3.1-pro", "qwen3.8-2.4t", "deepseek-v3"):
         snapshot = json.loads(
@@ -1326,6 +1332,7 @@ def test_perturbed_supported_config_fails_closed() -> None:
         "kimi-k3",
         "glm-5.2",
         "qwen3.8-flash-next",
+        "deepseek-v4.1-flash",
     ):
         snapshot = json.loads(
             (HF_CONFIG_DIR / f"{preset_name}.json").read_text(encoding="utf-8")

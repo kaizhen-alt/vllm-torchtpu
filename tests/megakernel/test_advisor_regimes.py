@@ -2089,6 +2089,7 @@ def test_cli_list_models_explicit_tiers(
         "kimi-k3": "declared",
         "qwen3.5-397b": "declared",
         "qwen3.8-flash-next": "declared",
+        "deepseek-v4.1-flash": "priced_only",
     }
     assert set(expected_tiers) == set(advisor.MODEL_PRESETS)
 

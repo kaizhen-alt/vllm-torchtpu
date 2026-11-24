@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "model_id": "deepseek_v41",
+  "hf_repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+  "runtime_profile": "dsv41-epic",
+  "reference_branch": "pr3533",
+  "reference_commit": "0b81350ba2c59d745c065ea2b3edf52cb8ffca8b",
+  "served_provenance": "served dashboard commits unavailable on GitHub; reference_commit is closest readable descendant",
+  "served_execution": "ced",
+  "served_log_facts": [
+    "resolved serving policy: {'execution': <ExecutionMode.CED: 'ced'>, 'moe': <MoEBackend.FUSED_EP_W4A8: 'fused_ep_w4a8'>}",
+    "CED bounded replay enabled: encoder layers=20, decoder layers=20, window=128"
+  ],
+  "not_enumerated": [
+    "tp > 1 at dp == 1 (upstream/Engram/MoE guards unverified outside reference branch)",
+    "dcp > 1 (unsupported)",
+    "disagg pairs (unsupported)"
+  ],
+  "rules": [
+    {
+      "id": 1,
+      "summary": "fused_ep_w4a8 requires --enable-expert-parallel and FP4 expert weights",
+      "file": "src/vllm_torchtpu/models/vllm/deepseek_v41/config.py",
+      "lines": "199-202"
+    },
+    {
+      "id": 2,
+      "summary": "CED requires prefill-context-parallel-size == 1",
+      "file": "src/vllm_torchtpu/models/vllm/deepseek_v41/config.py",
+      "lines": "225-227"
+    },
+    {
+      "id": 3,
+      "summary": "CED with prefix caching requires --swa-bounded-replay",
+      "file": "src/vllm_torchtpu/models/vllm/deepseek_v41/config.py",
+      "lines": "228-232",
+      "verbatim": "raise ValueError(\"CED with prefix caching requires --swa-bounded-replay\")"
+    },
+    {
+      "id": 4,
+      "summary": "ced_boundary = num_hidden_layers // 2 (20); encoder runs 0..19 and publishes layer 20 global KV; decoder_stage runs layers 20..39 on replay rows",
+      "file": "src/vllm_torchtpu/models/vllm/deepseek_v41/v2/model.py",
+      "lines": "83-102, 1181-1204, 1347-1350, 1480-1482",
+      "verbatim": "ced_boundary = hf_config.num_hidden_layers // 2"
+    },
+    {
+      "id": 5,
+      "summary": "PP must be 1",
+      "file": "src/vllm_torchtpu/models/vllm/deepseek_v41/v2/model.py",
+      "lines": "1612-1618",
+      "verbatim": "raise NotImplementedError(\"V4.1 TPU currently requires PP1\")"
+    },
+    {
+      "id": 6,
+      "summary": "DP > 1 requires TP == 1, expert parallel, Engram CPU offload, and node-local Engram groups",
+      "file": "src/vllm_torchtpu/models/vllm/deepseek_v41/v2/model.py",
+      "lines": "1619-1634"
+    },
+    {
+      "id": 7,
+      "summary": "Indexer cache dtype must be fp8, record width 132 bytes, rejects external KV transfer and external KV offload",
+      "file": "src/vllm_torchtpu/models/vllm/deepseek_v41/v2/indexer_cache.py",
+      "lines": "30-56, 120-128",
+      "verbatim": "raise ValueError(\"Packed FP8 Index-K does not support external KV offload\")"
+    },
+    {
+      "id": 8,
+      "summary": "Sliding-window pages hold 64 tokens of BF16 (SWA_PAGE_BYTES = 64 * 512 * 2); compressed row is ROW_WORDS * 4 bytes",
+      "file": "src/vllm_torchtpu/models/vllm/deepseek_v41/v2/cache.py",
+      "lines": "10-18"
+    },
+    {
+      "id": 9,
+      "summary": "CED replay keeps tokens at or after max(0, prompt - window, hit)",
+      "file": "src/vllm_torchtpu/models/vllm/deepseek_v41/v2/ced.py",
+      "lines": "76-84"
+    },
+    {
+      "id": 10,
+      "summary": "Index owners above candidate_source_layer_id (20) use sparse_logits / fp8_gathered_mqa_logits capped at candidate_topk_blocks * candidate_block_size (2048 * 8 = 16384 records)",
+      "file": "src/vllm_torchtpu/models/vllm/deepseek_v41/v2/sparse_mqa_indexer.py",
+      "lines": "64-72",
+      "secondary_file": "src/vllm_torchtpu/models/vllm/deepseek_v41/v2/indexer_fp8.py",
+      "secondary_lines": "34-36, 94-97"
+    },
+    {
+      "id": 11,
+      "summary": "TPU_DEEPSEEK_V41_ENGRAM_HBM in {auto, off, first, all}; auto enables first for EP >= 16; each DP rank holds 1/dp_local of resident Engram table (~11.8 GiB/rank on 8-rank node), requires TP == 1 and DP > 1",
+      "file": "src/vllm_torchtpu/models/vllm/deepseek_v41/common/engram_hbm.py",
+      "lines": "5-25, 45-48, 60-95"
+    }
+  ]
+}

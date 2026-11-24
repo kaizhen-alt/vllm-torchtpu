@@ -307,6 +307,29 @@
           }
         }
       ]
+    },
+    "deepseek-v4.1-flash": {
+      "source": "DeepSeek-V4.1-Flash colocated serving layout: TP1 x DP8 x EP8 decode and prefill with 5 speculative tokens, CED execution at layer 20, and modular W4A8 FP4 expert dispatch (no megakernel declared)",
+      "prefill_windows": [
+        1024
+      ],
+      "unmodeled_notes": [
+        "3-layer MoE dspark draft stack (128 experts top-3, shared mtp.0.main_proj, markov_head rank 256)",
+        "Optional layer-1 Engram HBM switch (TPU_DEEPSEEK_V41_ENGRAM_HBM=first, selectable via host_table_hbm_overrides)",
+        "Push-mode fused expert exchange kernel (MOE_FUSED_EP_KERNEL_IMPL=push)",
+        "Host scheduling gap between device steps"
+      ],
+      "decode": {
+        "tp": 1,
+        "dp": 8,
+        "ep": 8,
+        "spec_tokens": 5
+      },
+      "prefill": {
+        "tp": 1,
+        "dp": 8,
+        "ep": 8
+      }
     }
   }
 }
